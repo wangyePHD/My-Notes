@@ -1,0 +1,223 @@
+% ============================================================
+% UniGRPO 论文笔记
+% 论文：UniGRPO: Unified Policy Optimization for Reasoning-Driven Visual Generation
+% 机构：ByteDance Seed & CUHK
+% ============================================================
+
+\section{UniGRPO：推理驱动视觉生成的统一策略优化}
+
+\begin{conceptbox}
+\textbf{核心问题：} 现代多模态生成模型走向交错生成（Interleaved Generation）：文本用自回归（AR）生成，图像用 Flow Matching 生成。两个模态的 RL 训练方式完全不同，如何\key{统一}在一个 RL 框架里联合优化？\\[4pt]
+\textbf{解法：} 把"先推理、再生图"的整个过程建模为\key{单个 MDP}，用 GRPO 同时优化文本推理策略和图像生成策略。
+\end{conceptbox}
+
+% -------------------- 框架概览 --------------------
+\subsection{整体框架}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{imgs/fig1_overview_p2.png}
+  \caption{UniGRPO 整体框架：文本 token 预测与图像去噪步骤统一在同一个 GRPO 优化循环中。}
+\end{figure}
+
+生成流程：
+
+\begin{center}
+\begin{tabular}{c}
+用户 Prompt \\
+$\downarrow$ \\
+LLM 推理（Text GRPO）\\
+\texttt{<think>} 分析构图、颜色、细节\ldots \texttt{</think>} + 优化后的详细 Prompt \\
+$\downarrow$ \\
+Flow Matching 生图（Flow GRPO）\\
+$\downarrow$ \\
+最终图像 $\to$ 奖励信号（稀疏，只在最后一步给）\\
+$\downarrow$ \\
+联合更新两个策略 \\
+\end{tabular}
+\end{center}
+
+% -------------------- MDP 形式化 --------------------
+\subsection{MDP 形式化}
+
+\subsubsection{整体轨迹结构}
+
+UniGRPO 把文本推理和图像去噪\textbf{拼成一条完整轨迹}，和 LLM 里一句话的 token 序列是同一个概念：
+
+\[
+\underbrace{o_1,\; o_2,\; \ldots,\; o_N}_{\text{文本推理（离散 token）}},\quad
+\underbrace{x_T,\; x_{T-1},\; \ldots,\; x_0}_{\text{图像去噪（连续 latent）}}
+\]
+
+两段都满足 MDP 的要求，可以无缝拼接：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.5cm}p{4.5cm}p{4.5cm}}
+\hline
+ & \textbf{文本推理部分} & \textbf{图像去噪部分} \\
+\hline
+动作空间 & 离散（词表） & 连续（latent 空间） \\
+当前状态 $s$ & 已生成的 token 序列 & 当前 latent $x_{t_k}$ + 时间步 \\
+动作 $a$ & 预测下一个 token & 预测下一步 latent $x_{t_{k-1}}$ \\
+状态转移 & 追加 token 到序列 & 推进去噪一步 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+两段拼在一起，构成一个\key{混合离散 + 连续动作空间的 MDP}。
+
+\subsubsection{奖励设计：稀疏终端奖励}
+
+\textbf{核心设计：奖励只在图像完全生成后给一次，中间所有步骤奖励为 0：}
+
+\begin{center}
+\begin{tabular}{p{13.5cm}}
+$o_1 \;\to\; o_2 \;\to\; \cdots \;\to\; o_N \;\to\; x_T \;\to\; \cdots \;\to\; x_0 \;\to\; R$ \\[2pt]
+$\underbrace{\quad 0 \qquad\;\; 0 \qquad\quad \cdots \qquad\;\; 0 \qquad\;\; 0 \qquad \cdots \qquad\;\; 0}_{\text{中间步全为 0}} \qquad \uparrow_{\text{只在此给}}$
+\end{tabular}
+\end{center}
+
+\paragraph{主实验：RewardDance（可微分打分器）}
+
+主实验用 RewardDance 只是为了和 ReFL 等\key{需要可微分奖励}的 baseline 公平比较。
+
+\paragraph{也支持黑盒奖励}
+
+GRPO 的一大优势是\key{不需要可微分奖励}，可以直接用 VLM 作为黑盒打分器（如 GPT-4V），主实验用 RewardDance 只是为了公平对比。
+
+\subsubsection{奖励如何训练文本推理}
+
+奖励只看最终图像质量，但 GRPO 会把这个奖励\textbf{反向分配给整条轨迹}（包括推理 token）：
+
+\begin{center}
+\begin{tabular}{p{13.5cm}}
+\texttt{<think>} 分析颜色、构图\ldots\texttt{</think>} $\to$ 生成了更好的图 $\to$ \good{奖励高} \\
+\texttt{<think>} 随便说几句 \texttt{</think>} $\to$ 生成了差的图 $\to$ \bad{奖励低} \\
+\end{tabular}
+\end{center}
+
+GRPO 用\key{组内相对比较}：同一 prompt 生成 $G$ 条完整轨迹，奖励高的轨迹里所有步骤（包括推理 token）都被鼓励，奖励低的都被抑制。
+
+\begin{intubox}
+\textbf{直觉：} 文本推理部分虽然没有中间奖励，但最终图像质量的好坏会\key{隐式地告诉模型：你的推理写得好不好}。LLM 自然学到：更好的推理 $\to$ 更好的图 $\to$ 更高的奖励。
+\end{intubox}
+
+% -------------------- 联合优化目标 --------------------
+\subsection{联合优化目标}
+
+\[
+J = \underbrace{J_\text{Text}}_{\text{Text GRPO}} + \lambda\,\underbrace{J_\text{Flow}}_{\text{Flow GRPO}}, \qquad \lambda = 1
+\]
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Text GRPO}：标准 GRPO，对推理 token 序列做重要性采样裁剪
+  \item \textbf{Flow GRPO}：FlowGRPO，对 SDE 去噪步做重要性采样裁剪
+  \item 两个目标\key{共享同一组奖励信号}，一次前向同时更新两个策略
+\end{itemize}
+
+% -------------------- 两个关键改进 --------------------
+\subsection{相比 FlowGRPO 的两个关键改进}
+
+\subsubsection{改进 1：去掉 CFG（Classifier-Free Guidance）}
+
+\textbf{原来的问题：} CFG 需要同时做有条件和无条件两次前向传播：
+
+\[
+v_\text{CFG} = v_\text{uncond} + s\,(v_\text{cond} - v_\text{uncond})
+\]
+
+多轮交错生成时条件数量增加，计算量爆炸，且难以扩展到多条件编辑场景。
+
+\textbf{UniGRPO 的做法：} 训练时直接去掉 CFG（\code{cfg\_scale=1}），保持单次有条件前向传播。
+
+\begin{summarybox}
+实验证明去掉 CFG 对训练效果无明显负面影响，却大幅降低复杂度，是简洁且有效的工程决策。
+\end{summarybox}
+
+\subsubsection{改进 2：KL 惩罚 → MSE 速度场惩罚}
+
+\textbf{FlowGRPO 的 KL 惩罚：}
+
+\[
+\mathcal{L}_\text{KL} = \frac{\|\mu_\theta - \mu_\text{ref}\|^2}{2\sigma_{t_k}^2}
+\]
+
+\textbf{问题：} 分母 $\sigma_{t_k}^2$ 随时间步变化，导致各步惩罚力度严重不均匀：
+
+\begin{center}
+{\small
+\begin{tabular}{p{5cm}p{7.5cm}}
+\hline
+\textbf{时间步} & \textbf{问题} \\
+\hline
+高噪声步（$\sigma_{t_k}$ 大） & 惩罚极小，模型可随意偏离 $\to$ 被 RL 利用（reward hacking） \\
+低噪声步（$\sigma_{t_k}$ 小） & 惩罚极大，过度约束模型更新 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\textbf{UniGRPO 的改进——直接对速度场做 MSE：}
+
+\[
+\mathcal{L}_\text{MSE} = \bigl\|v_\theta(x_{t_k}, t_k, y) - v_\text{ref}(x_{t_k}, t_k, y)\bigr\|^2
+\]
+
+去掉时间步相关的权重，\key{所有时间步惩罚强度一致}，没有"漏洞"可钻，更有效防止 reward hacking。
+
+\begin{intubox}
+\textbf{直觉：} KL 惩罚本质是约束"生成路径不要偏离参考模型太远"。速度场 $v_\theta$ 直接决定每步的移动方向，MSE 约束速度场就是在最根本的层面约束路径偏离，且不受噪声尺度影响。
+\end{intubox}
+
+% -------------------- 实验结果 --------------------
+\subsection{实验结果}
+
+基础模型：\textbf{Bagel}（支持交错生成的多模态模型），流程：预训练 $\to$ SFT $\to$ RL（UniGRPO）。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{1.8cm}p{2.2cm}p{2cm}}
+\hline
+\textbf{方法} & \textbf{Thinking} & \textbf{TA Score} & \textbf{GenEval} \\
+\hline
+Bagel（原始） & \bad{✗} & 0.681 & 0.78 \\
+SFT & \bad{✗} & 0.749 & 0.83 \\
+FlowGRPO & \bad{✗} & 0.811 & 0.88 \\
+TextGRPO & \good{✓} & 0.808 & 0.88 \\
+\textbf{UniGRPO（本文）} & \good{✓} & \good{\textbf{0.838}} & \good{\textbf{0.90}} \\
+UniFPO（PPO 版） & \good{✓} & \bad{训练崩溃} & — \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item UniGRPO 同时优化推理和生图，指标\key{均优于}单独优化任一模态
+  \item UniFPO（基于 PPO 的类似方案）直接训练崩溃，说明 GRPO 的稳定性优势
+\end{itemize}
+
+% -------------------- 与 FlowGRPO 对比 --------------------
+\subsection{与 FlowGRPO 的关系对比}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4.5cm}p{5cm}}
+\hline
+ & \textbf{FlowGRPO} & \textbf{UniGRPO} \\
+\hline
+生图策略 & Flow GRPO（SDE） & Flow GRPO（SDE），去掉 CFG \\
+文本推理 & 无 & Text GRPO（标准 GRPO） \\
+KL 正则 & $\|\mu_\theta - \mu_\text{ref}\|^2 / \sigma_t^2$ & 速度场 MSE（无时间步权重） \\
+优化目标 & 仅对齐图像生成 & 联合优化推理 + 生图 \\
+扩展性 & 单模态 & 可扩展到多轮交错生成 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+% -------------------- 总结 --------------------
+\begin{summarybox}
+\textbf{一句话：} UniGRPO 把"先推理、再生图"统一建模为一个 MDP，用 GRPO 同时训练 LLM 推理策略和 Flow Matching 生图策略；通过\key{去掉 CFG} 和\key{改用速度场 MSE 正则}，让框架更稳定、更易扩展到未来的多轮交错生成场景。
+\end{summarybox}

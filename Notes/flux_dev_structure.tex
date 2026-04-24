@@ -1,0 +1,725 @@
+% ============================================================
+% FLUX.1-dev 结构学习笔记
+% 日期：2026/04/19
+% ============================================================
+
+\section{FLUX.1-dev 结构学习笔记}
+
+\begin{conceptbox}
+\textbf{从整体主链、双流/单流、Modulation 到 RoPE 实现 · 2026/04/19}\\
+目标：帮助复习时快速重建 FLUX.1-dev 的主链结构，尤其是双流/单流切换、\code{vec} 与 modulation 的关系，以及 RoPE 在源码里的接线方式。
+\end{conceptbox}
+
+% ============================================================
+\subsection{这份笔记的目标}
+% ============================================================
+
+这份笔记的目的不是把 FLUX.1-dev 的源码逐行背下来，而是帮助回顾时快速回答下面几个核心问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item FLUX.1-dev 的整体主链是什么？
+  \item 为什么它是 \key{先双流、后单流} 的结构？
+  \item 输入里的 \code{img/txt/timesteps/y/guidance} 各自扮演什么角色？
+  \item \key{modulation} 到底是什么，为什么双流和单流阶段不一样？
+  \item \key{RoPE} 在 FLUX 里到底是怎么接进去的？
+  \item 如果面试官问「FLUX 里的 RoPE 是怎么实现的」，应该怎么答？
+\end{itemize}
+
+\begin{intubox}
+\textbf{阅读目标：}\\
+这篇笔记优先建立「主链 + 模块职责 + 面试答法」三个层次，而不是只记住零散函数名。
+\end{intubox}
+
+% ============================================================
+\subsection{一句话总览}
+% ============================================================
+
+\begin{conceptbox}
+\textbf{一句话：} FLUX.1-dev 是一个先双流、后单流的多模态 diffusion transformer。前半段保留文本流和图像流各自的专属处理空间，但 attention 已经是联合的；后半段再把两种 token 合并成统一序列，进入共享单流主干共同演化。
+\end{conceptbox}
+
+% ============================================================
+\subsection{整体结构哲学}
+% ============================================================
+
+\subsubsection{为什么 FLUX 不是纯双流，也不是纯单流}
+
+FLUX 的设计不是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 全程文本一套塔、图像一套塔，最后才很晚融合；
+  \item 也不是一开始就让文本和图像彻底共用所有主干参数。
+\end{itemize}
+
+它采用的是一种折中设计：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{前半段双流}：保留模态专属处理能力；
+  \item \key{后半段单流}：让文本和图像在共享主干里共同演化。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{结构直觉：}\\
+模型早期，文本 token 和图像 token 的统计分布、结构属性、语义角色差异都很大，因此先保留一段模态专属处理空间更稳；等两边状态更接近后，再进入统一主干更省参数，也更利于深层共享。
+\end{summarybox}
+
+\subsubsection{一句话记住 FLUX 的主链}
+
+\begin{quote}
+先把图像和文本 token 投影到同一 hidden space，再用 timestep、全局文本摘要和 guidance 构造统一调制向量 \code{vec}，前半段通过 \code{DoubleStreamBlock} 做「分开更新、联合 attention」，后半段通过 \code{SingleStreamBlock} 做统一序列建模，最后只保留图像 token 做输出预测。
+\end{quote}
+
+% ============================================================
+\subsection{从输入到输出：主链流程}
+% ============================================================
+
+\subsubsection{模型输入}
+
+在 FLUX 的 \code{forward} 里，最核心的输入对象有：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{img}：图像 token 序列，不是原始图片
+  \item \code{txt}：文本 token 特征序列，不是原始字符串
+  \item \code{img\_ids}：图像 token 的位置坐标
+  \item \code{txt\_ids}：文本 token 的位置坐标
+  \item \code{timesteps}：当前扩散时间步
+  \item \code{y}：全局条件向量
+  \item \code{guidance}：guidance-distilled 版本里额外使用的控制量
+\end{itemize}
+
+\subsubsection{先把图像和文本投到统一 hidden space}
+
+模型一开始会分别做：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{img = img\_in(img)}
+  \item \code{txt = txt\_in(txt)}
+\end{itemize}
+
+语义上等价于：
+
+\begin{quote}
+图像 token 和文本 token 先被投影到统一的主干维度，这样后续同一个 Transformer 系统才能处理两种模态。
+\end{quote}
+
+\subsubsection{\code{vec}：统一全局控制向量}
+
+FLUX 有一条非常关键的旁路控制信号：
+
+\[
+\code{vec} = \code{time\_in}(\code{timestep\_embedding}(t)) + \code{vector\_in}(y) + \code{guidance\_in}(g)
+\]
+
+这里的结构语义是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 时间步条件：告诉模型当前处于哪个扩散阶段
+  \item 全局文本摘要条件：告诉模型整个 prompt 的全局语义
+  \item guidance 条件：在 distilled 版本里进一步控制生成行为
+\end{itemize}
+
+\begin{conceptbox}
+\textbf{\code{vec} 的本质：}\\
+它不是 token 内容，而是一个供所有 block 共享读取的\key{全局调制信号}。
+\end{conceptbox}
+
+\subsubsection{\code{y} 到底是什么}
+
+\code{txt} 和 \code{y} 都和文本条件有关，但它们不是同一种东西：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{txt}：token-level 文本语义，保留逐 token 的细粒度语言信息
+  \item \code{y}：global-level 文本摘要，通常可理解为 pooled prompt embedding
+\end{itemize}
+
+\begin{summarybox}
+\textbf{一句话记忆：}\\
+\code{txt} 负责句子内部的局部语义和组合结构，\code{y} 负责整个 prompt 的全局摘要和整体风格条件。
+\end{summarybox}
+
+\subsubsection{位置坐标进入统一位置编码器}
+
+在进入 attention 前，FLUX 会先把位置坐标拼起来：
+
+\[
+\code{ids} = \operatorname{concat}(\code{txt\_ids}, \code{img\_ids})
+\]
+
+然后送入 \code{EmbedND} 生成统一位置相关旋转规则 \code{pe}。
+
+% ============================================================
+\subsection{DoubleStreamBlock：先双流}
+% ============================================================
+
+\subsubsection{最容易误解的点}
+
+\code{DoubleStreamBlock} 不是两个完全独立的塔。它真正做的是：
+
+\begin{quote}
+图像流和文本流各自保留专属的 norm / modulation / MLP，但 attention 是联合做的。
+\end{quote}
+
+所以它更准确地说是：
+
+\begin{quote}
+分开做模态专属预处理和残差更新，但中间通过 joint attention 交流。
+\end{quote}
+
+\subsubsection{内部逻辑}
+
+一个 \code{DoubleStreamBlock} 的流程可以概括成：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 图像 token 先经过自己的 norm 和 modulation
+  \item 文本 token 也先经过自己的 norm 和 modulation
+  \item 图像流生成自己的 \code{q/k/v}
+  \item 文本流也生成自己的 \code{q/k/v}
+  \item 然后把图像和文本的 \code{q/k/v} 拼起来做一次联合 attention
+  \item 再把 attention 输出切回文本部分和图像部分
+  \item 最后各自走各自的 residual 和 MLP 更新
+\end{enumerate}
+
+\subsubsection{为什么这样设计}
+
+因为在模型前期：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本 token 更偏语言结构和语义组合
+  \item 图像 token 更偏视觉状态和空间局部
+\end{itemize}
+
+如果太早完全共用一套 block，训练稳定性和模态特化能力可能不够。所以 FLUX 选择：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 先保留模态专属处理空间
+  \item 但不阻断两者交流
+  \item 等状态更接近后再进入彻底共享的单流主干
+\end{itemize}
+
+% ============================================================
+\subsection{SingleStreamBlock：后单流}
+% ============================================================
+
+\subsubsection{什么时候开始单流}
+
+经过若干个 \code{DoubleStreamBlock} 后，FLUX 会把文本 token 和图像 token 真正拼成同一条序列，再进入 \code{SingleStreamBlock}。这一步意味着：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本不再有自己专属的 block
+  \item 图像也不再有自己专属的 block
+  \item 所有 token 彻底进入共享主干
+\end{itemize}
+
+\subsubsection{SingleStreamBlock 的结构直觉}
+
+单流块和双流块最大的区别，不只是「少一条流」，而是：
+
+\begin{quote}
+它把 attention 分支和 MLP 分支并行地从同一个调制后输入中算出来，最后合并成一次统一更新。
+\end{quote}
+
+也就是说，在单流块里：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 不再有「attention 更新一次 + MLP 更新一次」这种双重独立 residual
+  \item 而是 attention 与 MLP 并行，最后合成为一次 gated residual 写回
+\end{itemize}
+
+\subsubsection{为什么最后切掉文本 token}
+
+单流主干跑完后，文本 token 仍然存在于序列里，但最终只保留图像 token 输出。原因很简单：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本 token 的职责是参与联合建模
+  \item 最终需要预测的对象仍然是图像 token
+\end{itemize}
+
+\begin{summarybox}
+\textbf{结论：}\\
+文本 token 参与深层条件建模，但不是最终输出对象。
+\end{summarybox}
+
+% ============================================================
+\subsection{Modulation：它到底是什么}
+% ============================================================
+
+\subsubsection{最短定义}
+
+\textbf{modulation layer} 不是主干本身，而是一个很小的条件翻译器。它的职责是：
+
+\begin{quote}
+把全局控制向量 \code{vec} 翻译成 block 真正能使用的 \code{shift / scale / gate}。
+\end{quote}
+
+\subsubsection{Modulation 的输入和输出}
+
+输入：
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{vec}
+\end{itemize}
+
+输出：
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{shift}
+  \item \code{scale}
+  \item \code{gate}
+\end{itemize}
+
+语义分别是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{shift}：对归一化后的 hidden states 做平移
+  \item \key{scale}：对归一化后的 hidden states 做缩放
+  \item \key{gate}：控制这次子层更新写回 residual 的强度
+\end{itemize}
+
+\subsubsection{为什么双流里有两套 mod，而单流只有一套}
+
+这是 FLUX 结构理解里的关键点。
+
+\paragraph{双流块}
+
+在 \code{DoubleStreamBlock} 里，每条流内部有两次不同性质的更新：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item attention 子层更新
+  \item MLP 子层更新
+\end{itemize}
+
+因此每条流需要两套 modulation：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 第一套给 attention 子层
+  \item 第二套给 MLP 子层
+\end{itemize}
+
+所以图像流有两套，文本流也有两套。
+
+\paragraph{单流块}
+
+在 \code{SingleStreamBlock} 里，attention 和 MLP 分支是并行计算、最后合并成一次统一更新的。因此：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 一套 \code{shift/scale} 足够调制它们共享的输入
+  \item 一套 \code{gate} 足够控制最终统一输出的写回
+\end{itemize}
+
+\begin{summarybox}
+\textbf{一句话记住：}\\
+双流块里每条流有两次独立更新，所以要两套 mod；单流块里 attention/MLP 最后合成一次更新，所以一套 mod 就够了。
+\end{summarybox}
+
+% ============================================================
+\subsection{RoPE 的宏观理解}
+% ============================================================
+
+\subsubsection{不要先想代码，先想 attention 的需求}
+
+attention 本身如果没有位置，就只知道：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 这个 token 是什么
+  \item 另一个 token 是什么
+\end{itemize}
+
+但不知道：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它们谁在前谁在后
+  \item 它们谁和谁更近
+  \item 文本顺序和图像空间到底是什么关系
+\end{itemize}
+
+所以 attention 必须有位置感。
+
+\subsubsection{普通位置编码 vs RoPE}
+
+\textbf{普通位置编码} 更像：
+\begin{itemize}[leftmargin=1.5em]
+  \item 给 token 附加一个位置标签
+\end{itemize}
+
+\textbf{RoPE} 更像：
+\begin{itemize}[leftmargin=1.5em]
+  \item 根据位置，让 attention 里的 \code{q/k} 发生旋转
+\end{itemize}
+
+所以普通位置编码更偏：
+\begin{itemize}[leftmargin=1.5em]
+  \item 把位置混进内容
+\end{itemize}
+
+而 RoPE 更偏：
+\begin{itemize}[leftmargin=1.5em]
+  \item 让位置直接进入 token 间的匹配关系
+\end{itemize}
+
+\subsubsection{RoPE 的一句话本质}
+
+\begin{quote}
+RoPE 不是给 token 再加一段位置向量，而是根据位置，让 attention 中的 \code{q/k} 在很多二维平面里按不同角度旋转，从而把相对位置信息直接注入匹配关系。
+\end{quote}
+
+% ============================================================
+\subsection{FLUX 中 RoPE 的接线方式}
+% ============================================================
+
+\subsubsection{主链}
+
+FLUX 中 RoPE 的主链是：
+
+\[
+\code{txt\_ids, img\_ids} \rightarrow \code{EmbedND} \rightarrow \code{pe} \rightarrow \code{apply\_rope}(q, k, pe)
+\]
+
+要点是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{txt\_ids / img\_ids} 是位置坐标
+  \item \code{EmbedND} 把位置坐标变成旋转规则
+  \item \code{pe} 不是 token embedding，而是旋转规则张量
+  \item \code{apply\_rope} 最终把这些规则作用到 \code{q/k}
+\end{itemize}
+
+\subsubsection{为什么作用在 \code{q/k} 上，而不是直接加到 token 上}
+
+因为在 attention 里：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item token embedding 更偏「内容」
+  \item \code{q/k} 更偏「关系匹配」
+\end{itemize}
+
+RoPE 想影响的不是内容本身，而是：
+
+\begin{quote}
+谁和谁更匹配、谁更该被关注、相对位置如何进入 attention。
+\end{quote}
+
+因此它最自然的作用位置就是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{q}
+  \item \code{k}
+\end{itemize}
+
+而不是直接改 token 内容，也不是去改 \code{v}。
+
+% ============================================================
+\subsection{EmbedND：逐轴生成旋转规则}
+% ============================================================
+
+\subsubsection{它在做什么}
+
+\code{EmbedND} 的作用可以一句话概括为：
+
+\begin{quote}
+把每个 token 的多维位置坐标，按轴拆开分别做 RoPE，再拼成完整的 rotary 旋转规则张量。
+\end{quote}
+
+\subsubsection{为什么叫 ND}
+
+因为位置不是一个数字，而是一个多维坐标：
+
+\[
+\code{id} = (id_1, id_2, id_3, \dots)
+\]
+
+在 FLUX 中，文本和图像 token 共用同一套多轴位置坐标体系，因此位置不是单维 index，而是多维 index。
+
+\subsubsection{EmbedND 的流程}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 取出某一根位置轴上的坐标
+  \item 对这一根轴调用 \code{rope(pos, dim, theta)}
+  \item 得到这一根轴的旋转规则块
+  \item 对所有轴重复
+  \item 最后把所有轴的旋转规则块拼起来
+\end{enumerate}
+
+% ============================================================
+\subsection{RoPE 的底层实现}
+% ============================================================
+
+\subsubsection{第一步：为什么通道必须两两分组}
+
+RoPE 本质上做的是二维旋转。二维旋转天然定义在一个平面里，因此高维向量必须拆成很多个二维小平面。
+
+所以如果某个向量是：
+
+\[
+[x_1, x_2, x_3, x_4, x_5, x_6]
+\]
+
+RoPE 会把它看成：
+
+\[
+(x_1, x_2),\ (x_3, x_4),\ (x_5, x_6)
+\]
+
+每一对通道就是一个可以旋转的二维小向量。
+
+\subsubsection{第二步：\code{rope(pos, dim, theta)} 在算什么}
+
+\code{rope} 的输入是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 某根位置轴上的位置值 \code{pos}
+  \item 这一根轴分到的 rotary 维度 \code{dim}
+  \item 控制频率分布的超参数 \code{theta}
+\end{itemize}
+
+它做的事情是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 把 \code{dim} 拆成若干对通道
+  \item 给每一对通道分配一个不同的旋转频率
+  \item 用「位置 $\times$ 频率」计算该通道对的旋转角度
+  \item 再把这个角度变成 $\cos$ 和 $\sin$ 形式的旋转规则
+\end{enumerate}
+
+核心数学形式可以简化理解成：
+
+\[
+\omega_i = \theta^{-2i / \code{dim}}
+\]
+
+\[
+\phi_{p,i} = pos \cdot \omega_i
+\]
+
+然后对每一对通道，构造二维旋转矩阵：
+
+\[
+R(\phi)=
+\begin{bmatrix}
+\cos \phi & -\sin \phi \\
+\sin \phi & \cos \phi
+\end{bmatrix}
+\]
+
+\subsubsection{第三步：\code{rope()} 的输出是什么}
+
+\code{rope()} 的输出不是普通 embedding，而是：
+
+\begin{quote}
+对每个 token、每对通道，该怎么旋转的一组规则。
+\end{quote}
+
+更形象地说，它输出的是很多个小型 $2 \times 2$ 旋转矩阵参数。
+
+\subsubsection{第四步：\code{apply\_rope(q, k, pe)} 在做什么}
+
+等 \code{EmbedND} 把所有轴的旋转规则拼成 \code{pe} 后，\code{apply\_rope} 就会真正把这些规则作用到 \code{q/k} 上。它做的事可以概括成：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 把 \code{q} 的最后一维两两分组
+  \item 把 \code{k} 的最后一维也两两分组
+  \item 对每一对通道，用对应的 $2 \times 2$ 旋转矩阵进行变换
+  \item 再把所有对拼回去
+\end{enumerate}
+
+所以 \code{apply\_rope} 本质上不是「加法」，而是：
+
+\begin{quote}
+对 \code{q/k} 的每一对通道做位置相关的二维旋转。
+\end{quote}
+
+\subsubsection{为什么不作用在 \code{v} 上}
+
+因为：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{q/k} 决定 attention 权重和匹配关系
+  \item \code{v} 负责传递内容
+\end{itemize}
+
+RoPE 想影响的是「谁看谁」「谁更匹配」，所以它自然作用在 \code{q/k} 上，而不是去改 \code{v} 的内容。
+
+% ============================================================
+\subsection{为什么 RoPE 比直接加位置 embedding 更适合 attention}
+% ============================================================
+
+\subsubsection{内容 vs 关系}
+
+这是理解 RoPE 的最关键区分：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item token embedding 更偏「内容」
+  \item RoPE 更偏「关系」
+\end{itemize}
+
+普通位置 embedding 更像是：
+\begin{itemize}[leftmargin=1.5em]
+  \item 把位置混进 token 内容里
+\end{itemize}
+
+RoPE 更像是：
+\begin{itemize}[leftmargin=1.5em]
+  \item 让位置直接影响 token 间的 attention 匹配
+\end{itemize}
+
+\subsubsection{为什么 attention 天然适合 RoPE}
+
+attention 的核心是：
+
+\[
+\text{score} = q \cdot k
+\]
+
+RoPE 对 \code{q/k} 的方向进行位置相关旋转后，相对位置信息就会更自然地进入：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 匹配分数
+  \item 关注关系
+  \item 相对位置建模
+\end{itemize}
+
+\begin{summarybox}
+\textbf{RoPE 的核心优势：}\\
+它不是把位置塞进内容里，而是把位置直接放进关系里。
+\end{summarybox}
+
+% ============================================================
+\subsection{面试答法}
+% ============================================================
+
+\subsubsection{30 秒回答版本}
+
+\begin{quote}
+FLUX 里的 RoPE 不是直接加到 token embedding 上，而是先把文本和图像 token 的位置 id 拼成统一的多维位置坐标，再通过 \code{EmbedND} 按每个位置轴分别生成 rotary 位置规则。随后在 attention 里，通过 \code{apply\_rope} 把 \code{q/k} 的最后一维两两分组，并按位置相关的 $\cos/\sin$ 旋转规则逐对旋转。这样位置信息就直接进入了 attention 的匹配关系，而不是先混进 token 内容里。
+\end{quote}
+
+\subsubsection{2 分钟回答版本}
+
+\begin{quote}
+FLUX 用的是多轴 RoPE。模型里文本 token 和图像 token 都有自己的位置 id，先把 \code{txt\_ids} 和 \code{img\_ids} 拼成统一序列，再交给 \code{EmbedND}。\code{EmbedND} 会按每根位置轴分别调用 \code{rope(pos, dim, theta)}，把这根轴上的位置值编码成一部分 rotary 规则，最后拼成完整的 \code{pe}。这里 \code{rope} 不是生成普通 embedding，而是根据位置和频率，为每一对通道生成 $\cos/\sin$ 形式的二维旋转规则。然后在 \code{apply\_rope} 中，把 \code{q/k} 的最后一维两两分组，并对每一对通道执行对应的二维旋转。这样相对位置信息就会直接进入 attention 的 \code{q\cdot k} 匹配关系，因此比普通绝对位置 embedding 更适合统一建模文本顺序和图像空间结构。
+\end{quote}
+
+\subsubsection*{高频追问}
+
+\paragraph{Q1：为什么不直接把位置编码加到 embedding 上？}
+
+\begin{quote}
+因为那样更像把位置混进 token 内容里，而 RoPE 想做的是让位置信息直接影响 attention 的匹配关系。位置更适合进入 \code{q/k}，而不是先当作内容特征再让模型自己学关系。
+\end{quote}
+
+\paragraph{Q2：为什么要两两分组？}
+
+\begin{quote}
+因为 RoPE 本质上做的是二维旋转，二维旋转天然定义在一个平面里，所以必须把通道两两分组，把每一对通道看成一个二维向量。
+\end{quote}
+
+\paragraph{Q3：\code{pe} 到底是什么？}
+
+\begin{quote}
+\code{pe} 不是普通 token embedding，而是一组位置相关的旋转规则，可以理解为每个 token 对应的一批小型 $2 \times 2$ 旋转矩阵参数。
+\end{quote}
+
+\paragraph{Q4：\code{txt} 和 \code{y} 有什么区别？}
+
+\begin{quote}
+\code{txt} 是 token-level 的文本语义条件，保留逐 token 的细粒度信息；\code{y} 是 pooled/global-level 的文本摘要条件，用于提供整个 prompt 的全局语义和风格概括。
+\end{quote}
+
+% ============================================================
+\subsection{最容易混淆的点}
+% ============================================================
+
+\begin{warnbox}
+\textbf{误区 1：} 双流就是两个完全独立的塔。\\
+\bad{错误。} 双流块里，文本和图像各自有专属的 norm / modulation / MLP，但 attention 是联合做的。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 2：} \code{y} 和 \code{txt} 是重复信息。\\
+\bad{错误。} \code{txt} 是逐 token 的文本语义，\code{y} 是全局摘要条件，粒度不同。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 3：} modulation 就是给 token 再加一个条件向量。\\
+\bad{不够准确。} 更准确地说，modulation 是把全局控制向量翻译成 block 可使用的 \code{shift/scale/gate}。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 4：} RoPE 是普通位置 embedding。\\
+\bad{错误。} RoPE 不是把位置向量加到 token 上，而是根据位置生成旋转规则，再作用到 attention 的 \code{q/k} 上。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 5：} RoPE 直接处理的是位置 id 本身。\\
+\bad{不够准确。} 位置 id 只是输入条件，真正被旋转的是 \code{q/k} 特征向量。
+\end{warnbox}
+
+% ============================================================
+\subsection{一页速记卡}
+% ============================================================
+
+\subsubsection{5 句记住 FLUX.1-dev}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item FLUX 是先双流、后单流的 diffusion transformer。
+  \item 图像和文本先投到统一 hidden space，再由 timestep、全局文本摘要和 guidance 构造统一调制向量 \code{vec}。
+  \item 双流块里模态专属处理和联合 attention 并存；单流块里所有 token 进入共享主干共同演化。
+  \item modulation 是全局条件到 \code{shift/scale/gate} 的翻译器。
+  \item RoPE 在 FLUX 里不是普通位置 embedding，而是对 \code{q/k} 的多轴 rotary 旋转规则。
+\end{enumerate}
+
+\subsubsection{\code{txt} vs \code{y}}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{txt}：token-level 文本语义
+  \item \code{y}：global-level 文本摘要
+\end{itemize}
+
+\subsubsection{双流 vs 单流}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 双流：分开预处理，联合 attention，分开更新
+  \item 单流：统一序列，共享 block，并行 attention/MLP，合成一次更新
+\end{itemize}
+
+\subsubsection{RoPE 最短记忆版}
+
+\begin{summarybox}
+\code{ids} 提供位置坐标，\code{EmbedND} 按轴生成旋转规则，\code{pe} 是旋转规则张量，\code{apply\_rope} 用这些规则去旋转 attention 里的 \code{q/k}。
+\end{summarybox}
+
+% ============================================================
+\subsection{适合自测的问题}
+% ============================================================
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 为什么 FLUX 不是纯双流，也不是纯单流？
+  \item \code{txt} 和 \code{y} 的区别是什么？
+  \item \code{vec} 是由哪些条件构成的？
+  \item 为什么双流块不是两个完全独立的塔？
+  \item 为什么双流块有两套 modulation，而单流块只有一套？
+  \item modulation layer 的本质是什么？
+  \item 为什么 RoPE 要对通道两两分组？
+  \item \code{rope()} 的输入和输出分别是什么？
+  \item \code{pe} 更像普通 embedding，还是更像旋转规则张量？
+  \item 为什么 RoPE 作用在 \code{q/k} 上而不是 \code{v} 上？
+\end{enumerate}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begin{itemize}[leftmargin=1.5em]
+  \item FLUX 官方仓库：\url{https://github.com/black-forest-labs/flux}
+  \item FLUX 官方 \code{model.py}：\url{https://github.com/black-forest-labs/flux/blob/main/src/flux/model.py}
+  \item FLUX 官方 \code{layers.py}：\url{https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py}
+  \item FLUX 官方 \code{math.py}：\url{https://github.com/black-forest-labs/flux/blob/main/src/flux/math.py}
+  \item diffusers 文档：\url{https://huggingface.co/docs/diffusers/en/api/models/flux_transformer}
+  \item 周弈帆博客（FLUX 代码解读）：\url{https://zhouyifan.net/2024/09/03/20240809-flux1/}
+\end{itemize}
+
+% ============================================================
+\subsection{最后的总结}
+% ============================================================
+
+\begin{conceptbox}
+\textbf{最后一段话：}\\
+FLUX.1-dev 的关键不只是「先双流、后单流」，而是它把文本 token、图像 token、全局条件向量和多轴位置结构放进了一个统一的 attention 系统中。前半段保留模态专属处理，后半段最大化共享主干；\code{vec} 通过 modulation 控制 block 的工作方式；RoPE 则不再把位置当成普通内容，而是通过旋转 \code{q/k} 让位置信息直接进入 attention 的匹配关系。这是 FLUX 作为现代多模态 diffusion transformer 的结构核心。
+\end{conceptbox}

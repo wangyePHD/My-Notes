@@ -1,0 +1,474 @@
+% ============================================================
+% BAGEL 模型架构笔记
+% 论文：BAGEL: Bootstrapped Autoregressive Generation with Efficient Latents
+% 依赖宏包（导言区需添加）：
+%   \usepackage{tikz}
+%   \usetikzlibrary{arrows.meta, positioning, fit}
+% ============================================================
+
+\section{BAGEL 模型架构}
+
+\begin{conceptbox}
+\textbf{一句话：} BAGEL 的 LLM 底座 = 在标准 Qwen2 式堆叠之上，\key{按 token 类型切换两套权重}的同一个深度网络：文本走默认支路，图像 latent 走 \code{moe\_gen} 支路，注意力始终跨两类 token 全局混合。
+\end{conceptbox}
+
+% -------------------- 核心设计思想 --------------------
+\subsection{核心设计思想：一条序列，两套算子}
+
+把模型想成在处理\textbf{一条很长的 token 序列}（像一篇文档，但每个"字"可能是文字或一小块图像 latent）。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{LLM 本体}仍是熟悉的多层 Transformer：每层「先自注意力，再 MLP」
+  \item \textbf{特殊点}：序列里不同性质的 token，在同一层里用\key{不同的 Q/K/V/MLP}，但注意力仍在\key{整条序列上一起算}——文字和图像 latent 能互相看见对方
+\end{itemize}
+
+\begin{summarybox}
+\textbf{记住一句话：} 一条序列、一套层数、两套「算子」按位置切换。
+\end{summarybox}
+
+\subsubsection{两套算子的分工}
+
+\begin{center}
+{\small
+\begin{tabular}{p{5cm}p{4cm}p{4.5cm}}
+\hline
+\textbf{位置上的 token} & \textbf{用哪套算子} & \textbf{参数名} \\
+\hline
+普通文本（prompt、特殊符号等） & 理解支路（A 套） & \code{q\_proj}、\code{mlp}（无后缀） \\
+图像 latent（VAE 空间的 patch） & 生成支路（B 套） & \code{q\_proj\_moe\_gen}、\code{mlp\_moe\_gen} \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{不是}两个独立模型前后拼接，而是\textbf{同一层、同一次注意力里}，每个位置用自己那套矩阵算出 Q/K/V，再\key{扔进同一个注意力大锅}里搅在一起。
+\end{intubox}
+
+\subsubsection{与纯文本 LLM 的对比}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{10cm}}
+\hline
+\textbf{纯 Qwen2} & 所有 token 共用一套 Q/K/V/MLP \\
+\textbf{BAGEL 底座} & 文本 token 用 A 套，图像 latent 用 B 套；层数、隐藏维、注意力形状仍是一个大 Transformer \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+SigLIP、VAE 可以理解为进 LLM 之前的\textbf{翻译器}（像素 $\leftrightarrow$ patch、latent $\leftrightarrow$ LLM 维度），不在底座核心逻辑里。
+
+% -------------------- 论文描述与代码实现 --------------------
+\subsection{论文「复制一份 Transformer」与代码的对应}
+
+论文描述：\textbf{为生成单独准备一套 Transformer 式模块}。
+
+代码实现：在同一层里用 \code{*\_moe\_gen} 实现这套「副本」，和 \code{q\_proj}/\code{mlp} 并列，由 token 类型选用，并\key{共享一次全局注意力}。
+
+\begin{warnbox}
+\textbf{关键区别：} 「复制」的是\key{每一层的模块参数}，\bad{不是}再堆一个完整、独立的前向网络。\\
+深度（层数）没有变成两倍，而是\key{每一层变「宽」成两套并联权重}。
+\end{warnbox}
+
+% -------------------- MoT 层结构 --------------------
+\subsection{MoT 一层的结构（Mixture of Transformers）}
+
+\subsubsection{架构示意}
+
+% 依赖宏包：\usepackage{tikz}  \usetikzlibrary{arrows.meta, positioning, fit}
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.6cm and 1.2cm,
+  box/.style={draw, rounded corners, minimum width=3.2cm, minimum height=0.7cm,
+              align=center, font=\small},
+  bigbox/.style={draw, rounded corners, minimum width=7.6cm, minimum height=0.7cm,
+                 align=center, font=\small},
+  seqbox/.style={draw, dashed, rounded corners, minimum width=8.8cm,
+                 minimum height=0.7cm, align=center, font=\small},
+  arr/.style={-{Stealth}, thick},
+]
+
+% 顶部：序列
+\node[seqbox] (seq) {同一条序列：$o_1,\ldots,o_N$ （文本 token）\quad $x_T,\ldots,x_0$ （latent token）};
+
+% 分叉标签
+\node[below=0.4cm of seq, xshift=-2.2cm, font=\small] (lbl_und) {文本位};
+\node[below=0.4cm of seq, xshift=+2.2cm, font=\small] (lbl_gen) {latent 位};
+
+% A 套（理解支路）
+\node[box, below=0.3cm of lbl_und] (norm_a)   {Norm};
+\node[box, below=0.3cm of norm_a]  (qkv_a)    {\code{q/k/v\_proj}};
+
+% B 套（生成支路）
+\node[box, below=0.3cm of lbl_gen] (norm_b)   {Norm\_gen};
+\node[box, below=0.3cm of norm_b]  (qkv_b)    {\code{q/k/v\_proj\_moe\_gen}};
+
+% Attention
+\node[bigbox, below=0.7cm of qkv_a, xshift=2.2cm] (attn)
+      {一次 Self-Attention\\（所有位置互相可见）};
+
+% O + MLP 左右
+\node[box, below=0.7cm of attn, xshift=-2.2cm] (o_a)   {\code{o\_proj}\\Post-Norm\\MLP};
+\node[box, below=0.7cm of attn, xshift=+2.2cm] (o_b)   {\code{o\_proj\_moe\_gen}\\Post-Norm\_gen\\MLP\_moe\_gen};
+
+% 残差输出
+\node[seqbox, below=0.7cm of o_a, xshift=2.2cm] (out) {残差相加 $\to$ 下一层输入};
+
+% 箭头：序列 -> 分叉
+\draw[arr] (seq.south) -- ++(0,-0.25) -| (norm_a.north);
+\draw[arr] (seq.south) -- ++(0,-0.25) -| (norm_b.north);
+
+% A套内部
+\draw[arr] (norm_a) -- (qkv_a);
+\draw[arr] (norm_b) -- (qkv_b);
+
+% QKV -> Attention
+\draw[arr] (qkv_a.south) -- ++(0,-0.2) -| (attn.north);
+\draw[arr] (qkv_b.south) -- ++(0,-0.2) -| (attn.north);
+
+% Attention -> 两套 O+MLP
+\draw[arr] (attn.south) -- ++(0,-0.2) -| (o_a.north);
+\draw[arr] (attn.south) -- ++(0,-0.2) -| (o_b.north);
+
+% 两套 -> 残差
+\draw[arr] (o_a.south) -- ++(0,-0.2) -| (out.north);
+\draw[arr] (o_b.south) -- ++(0,-0.2) -| (out.north);
+
+\end{tikzpicture}
+\end{center}
+
+\subsubsection{伪代码}
+
+\begin{lstlisting}[language=Python, caption=MoT 一层（训练模式，语义精简版）]
+def one_mot_layer(x, und_i, gen_i, attn_mask):
+    # Pre-Norm：按位置选不同 Norm
+    h = zeros_like(x)
+    h[und_i] = input_layernorm(x[und_i])
+    h[gen_i] = input_layernorm_moe_gen(x[gen_i])
+
+    # Q/K/V：同一位置只走「理解」或「生成」其中一套
+    Q[und_i] = q_proj(h[und_i])
+    Q[gen_i] = q_proj_moe_gen(h[gen_i])
+    # K, V 同理 ...
+
+    # Attention：整条序列一起算，文本 <-> latent 互相可见
+    attn_out = flash_attention(Q, K, V, mask=attn_mask)
+
+    # Output 投影：按位置拆回两套
+    out[und_i] = o_proj(attn_out[und_i])
+    out[gen_i] = o_proj_moe_gen(attn_out[gen_i])
+    x = x + out   # 残差
+
+    # FFN：同样两套 Post-Norm + MLP
+    r = x
+    y[und_i] = mlp(post_attention_layernorm(x[und_i]))
+    y[gen_i] = mlp_moe_gen(post_attention_layernorm_moe_gen(x[gen_i]))
+    return r + y
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{记住三句话：}\\
+1. \textbf{Norm / QKV / O / MLP} 都\key{按 und/gen 分叉成两套参数}\\
+2. \textbf{Attention 只做一次}，输入是整段 Q、K、V（已按位置用不同矩阵算好）\\
+3. \textbf{残差连接}仍是标准 Transformer 写法
+\end{summarybox}
+
+\subsubsection{训练 vs 推理的 index 命名}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4cm}p{4cm}p{2.5cm}}
+\hline
+\textbf{模式} & \textbf{理解侧 index} & \textbf{生成侧 index} & \textbf{对应代码} \\
+\hline
+训练 & \code{packed\_und\_token\_indexes} & \code{packed\_gen\_token\_indexes} & \code{forward\_train} \\
+推理生图 & \code{packed\_text\_indexes} & \code{packed\_vae\_token\_indexes} & \code{forward\_inference} \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+规则一致：\textbf{文本位置走无后缀，latent 位置走 \code{moe\_gen}}。
+
+% -------------------- forward_train --------------------
+\subsection{\texttt{forward\_train}：训练时的 MoT 前向}
+
+\subsubsection{角色定义}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.5cm}p{5cm}}
+\hline
+\textbf{侧} & \textbf{数据来源} & \textbf{index 变量} \\
+\hline
+理解侧 & 文本 token + ViT patch & \code{packed\_und\_token\_indexes} \\
+生成侧 & VAE latent token & \code{packed\_gen\_token\_indexes} \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{进层：Pre-LN（各用一套归一化参数）}
+
+理解与生成侧各自归一化，\textbf{还没有信息混合}：
+
+\begin{lstlisting}[language=Python]
+packed_sequence_[packed_und_token_indexes] = self.input_layernorm(
+    packed_sequence[packed_und_token_indexes])
+packed_sequence_[packed_gen_token_indexes] = self.input_layernorm_moe_gen(
+    packed_sequence[packed_gen_token_indexes])
+\end{lstlisting}
+
+\subsubsection{Self-Attention（MoT 核心）}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Q/K/V 分叉}：理解侧用 \code{q/k/v\_proj}，生成侧用 \code{q/k/v\_proj\_moe\_gen}
+\begin{lstlisting}[language=Python]
+packed_query_states[packed_und_token_indexes] = self.q_proj(packed_sequence_und)
+packed_query_states[packed_gen_token_indexes] = self.q_proj_moe_gen(packed_sequence_gen)
+# K, V 同理
+\end{lstlisting}
+
+  \item \textbf{按原序列位置拼回完整序列}，供 RoPE 和 Attention 使用
+
+  \item \textbf{一次 \code{flex\_attention}}：理解侧 Q 可 attend 生成侧 K/V，生成侧 Q 也可 attend 理解侧 K/V，\key{跨侧的语义交换唯一发生在这里}，由 \code{block\_mask} 控制：
+\begin{lstlisting}[language=Python]
+packed_attn_output = flex_attention(
+    packed_query_states_.unsqueeze(0),
+    packed_key_states_.unsqueeze(0),
+    packed_value_states.unsqueeze(0),
+    enable_gqa=True,
+    block_mask=attention_mask,
+)
+\end{lstlisting}
+
+  \item \textbf{O proj 分叉}：输出再按位置拆回两套：
+\begin{lstlisting}[language=Python]
+packed_attn_output_[packed_und_token_indexes] = self.o_proj(
+    packed_attn_output[packed_und_token_indexes])
+packed_attn_output_[packed_gen_token_indexes] = self.o_proj_moe_gen(
+    packed_attn_output[packed_gen_token_indexes])
+\end{lstlisting}
+\end{enumerate}
+
+\subsubsection{出层：Post-LN + FFN（各一套参数）}
+
+\begin{lstlisting}[language=Python]
+packed_sequence_[packed_und_token_indexes] = self.mlp(
+    self.post_attention_layernorm(packed_sequence[packed_und_token_indexes]))
+packed_sequence_[packed_gen_token_indexes] = self.mlp_moe_gen(
+    self.post_attention_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes]))
+\end{lstlisting}
+
+FFN 同样理解/生成各一套；\textbf{理解↔生成的混合仅来自上面那一次 attention，FFN 不做跨侧交互}。
+
+\begin{summarybox}
+\textbf{训练一句话：} MoT = 理解/生成在 Norm、QKV、O、MLP 上各用一套权重；理解与生成的语义交互 = 同一次 \code{flex\_attention} + mask，不是两次分开的 attention。
+\end{summarybox}
+
+% -------------------- forward_inference --------------------
+\subsection{\texttt{forward\_inference}：推理时的 MoT 前向}
+
+推理用 \code{mode} 区分阶段，含义与训练侧完全对应：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.5cm}p{4.5cm}p{6cm}}
+\hline
+\code{mode} & \textbf{理解侧} & \textbf{生成侧} \\
+\hline
+\code{"und"} & 整段全是理解（文本/ViT） & 无生成侧，单分支前向 \\
+\code{"gen"} & 文本位置（\code{packed\_text\_indexes}） & VAE latent 位置（\code{packed\_vae\_token\_indexes}） \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{\texttt{mode = "und"}（纯理解）}
+
+整段 query 全是理解 token，Norm/QKV/O/MLP 全部走无后缀支路，\key{不调用任何 \code{*\_moe\_gen}}。等价于普通 LLM 推理。
+
+\subsubsection{\texttt{mode = "gen"}（生图去噪）}
+
+\paragraph{Pre-LN}
+\begin{lstlisting}[language=Python]
+packed_query_sequence_[packed_text_indexes] = self.input_layernorm(
+    packed_query_sequence[packed_text_indexes])          # 文本 -> 理解侧
+packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(
+    packed_query_sequence[packed_vae_token_indexes])     # latent -> 生成侧
+\end{lstlisting}
+
+\paragraph{Attention}
+
+文本位置用理解塔 QKV，VAE 位置用生成塔 QKV；当前步 K/V 与 \textbf{KV cache 合并}后，\key{\code{flash\_attn\_varlen\_func} 算一次}——理解与生成（含历史 cache）仍在同一次注意力里交互，由因果与布局约束控制。
+
+\paragraph{O + MLP}
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本位置：\code{o\_proj} + \code{post\_attention\_layernorm} + \code{mlp}
+  \item VAE 位置：\code{o\_proj\_moe\_gen} + \code{post\_attention\_layernorm\_moe\_gen} + \code{mlp\_moe\_gen}
+\end{itemize}
+
+\subsubsection{去噪时「query 只有 latent」的情况}
+
+去噪步中当前步新增的 query 主要只有 latent：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{当前步新计算}：几乎只走生成支路（\code{moe\_gen}）
+  \item \textbf{注意力}：仍 attend KV cache 里的文本 K/V（由理解支路写入）
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} 去噪时「画画」靠生成支路，但文本条件由理解支路在 KV cache 里提供——两个支路\key{分工合作}，跨侧交互通过 attention + cache 实现，缺一不可。
+\end{intubox}
+
+% -------------------- 对照表 --------------------
+\subsection{训练 vs 推理对照}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4.5cm}p{4.5cm}}
+\hline
+\textbf{环节} & \textbf{理解侧} & \textbf{生成侧} \\
+\hline
+训练时角色 & 文本 + ViT & VAE latent \\
+投影与 FFN & 无 \code{\_moe\_gen} 后缀 & \code{*\_moe\_gen} \\
+理解↔生成互通 & \multicolumn{2}{l}{同一次 attention（训练 \code{flex} / 推理 \code{flash}+cache）} \\
+推理 \code{gen} 理解侧 & 文本（\code{packed\_text\_indexes}） & — \\
+推理 \code{gen} 生成侧 & — & VAE latent（\code{packed\_vae\_token\_indexes}） \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+% -------------------- RL 训练时的梯度 --------------------
+\subsection{Flow-GRPO 训练时：梯度主要在动谁？}
+
+Flow-GRPO 只训 \code{moe\_gen} 时：
+
+\begin{center}
+{\small
+\begin{tabular}{p{5cm}p{8cm}}
+\hline
+\textbf{支路} & \textbf{状态} \\
+\hline
+B 套（\code{moe\_gen}，画 latent）& \good{主要更新}，梯度正常回传 \\
+A 套（\code{q\_proj}，处理文字） & 基本冻结，条件仍在，不（或少）更新 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+推理时文字仍走 A 套，条件依然有效；但 RL 阶段\key{只优化生图能力}，不动理解能力。
+
+% -------------------- 代码对应 --------------------
+\subsection{代码结构对应}
+
+\begin{center}
+{\small
+\begin{tabular}{p{5cm}p{8.5cm}}
+\hline
+\textbf{模块} & \textbf{真实位置} \\
+\hline
+Q/K/V 分叉 & \code{PackedAttentionMoT.forward\_train} \\
+O proj 分叉 & \code{PackedAttentionMoT.forward\_train}，\code{o\_proj} / \code{o\_proj\_moe\_gen} \\
+层 Norm + MLP 分叉 & \code{Qwen2MoTDecoderLayer.forward\_train} \\
+推理生图文本/vae 分叉 & \code{PackedAttentionMoT.forward\_inference}，\code{mode=="gen"} 分支 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+% -------------------- 总结 --------------------
+\begin{summarybox}
+\textbf{BAGEL MoT 架构三要素：}\\
+\key{① 一条序列}：文本 token + 图像 latent token 打包在一起\\
+\key{② 两套权重}：理解支路（无后缀）/ 生成支路（\code{moe\_gen}），按 token 类型二选一\\
+\key{③ 一次注意力}：所有 token 全局互相可见，文字条件自然注入图像生成
+\end{summarybox}
+
+% -------------------- 推理接口 --------------------
+\subsection{推理接口：\texttt{Bagel.chat} vs \texttt{InterleaveInferencer}}
+
+\subsubsection{定位对比}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.5cm}p{5.5cm}}
+\hline
+ & \textbf{\code{Bagel.chat}} & \textbf{\code{InterleaveInferencer}} \\
+\hline
+所在文件 & \code{bagel.py}，模型上的方法 & \code{inferencer.py}，独立类，持有 \code{model / vae / tokenizer / 两套 transform} \\
+用途 & 固定的「多图理解 + 单 prompt + 只出文本」评测链路 & 可交织的多模态上下文 + 出文或出图 + CFG / GRPO 训练式调用 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{\texttt{Bagel.chat} 的流程（逻辑固定）}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 对每个 \code{image}：只走 ViT：\code{prepare\_vit\_images} $\to$ \code{forward\_cache\_update\_vit}
+  \item 一个 \code{prompt}：\code{prepare\_prompts} $\to$ \code{forward\_cache\_update\_text}
+  \item \code{prepare\_start\_tokens} $\to$ \code{generate\_text}
+  \item 用 \code{tokenizer.decode} 截特殊标记，返回字符串
+\end{enumerate}
+
+\begin{warnbox}
+\code{chat} 里\bad{没有} VAE 进 cache，\bad{没有} \code{generate\_image}。参数是 \code{images} 列表 + 单个 \code{prompt}，\bad{不能}表达「先一句再一张图再一句」这种交织顺序。
+\end{warnbox}
+
+\subsubsection{\texttt{InterleaveInferencer} 的流程}
+
+\paragraph{上下文管理}
+
+\code{init\_gen\_context()} 显式维护 \code{past\_key\_values + kv\_lens + ropes}，可在外部跨多步复用（\code{gen\_text} 内部对 \code{gen\_context} 做 \code{deepcopy}，避免 decode 时改坏外层上下文）。
+
+\paragraph{上下文追加}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{update\_context\_text}：追加文本
+  \item \code{update\_context\_image}：追加图像，可选 \code{vae} / \code{vit}（两者均可）
+\end{itemize}
+
+\paragraph{\texttt{interleave\_inference} 主流程}
+
+按 \code{input\_lists} 里 \code{str} 与 \code{Image} 的任意顺序循环 \code{update\_*}，再选择：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{9.5cm}}
+\hline
+\code{gen\_text} & 理解 / 思考，自回归出文本 \\
+\code{gen\_image} & 接 \code{prepare\_vae\_latent} + 双份 CFG precontext，可选 \code{generate\_image\_learn}（GRPO），最终 \code{decode\_image} + VAE 得到 PIL 图 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{能力对比}
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{4cm}p{4.5cm}}
+\hline
+\textbf{能力} & \textbf{\code{chat}} & \textbf{\code{InterleaveInferencer}} \\
+\hline
+多图理解 & \good{✓} & \good{✓} \\
+交织文图输入 & \bad{✗} & \good{✓} \\
+生图（\code{generate\_image}） & \bad{✗} & \good{✓}（含 CFG） \\
+GRPO learn 路径 & \bad{✗} & \good{✓}（\code{generate\_image\_learn}） \\
+可分叉上下文 & \bad{✗} & \good{✓}（\code{deepcopy gen\_context}） \\
+Think / und 输出 & \bad{✗} & \good{✓} \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{一句话：}\\
+\code{chat} = 官方 demo 式「ViT 吃多张图 $\to$ 吃一段 prompt $\to$ 自回归出文」\\
+\code{InterleaveInferencer} = 产品/实验用的「显式 KV 上下文 + 文图任意顺序喂入 + 可出文或出图（含 CFG/GRPO）」\\[4pt]
+底层真正算 KV 的仍是 \code{Bagel} 的 \code{prepare\_* / forward\_cache\_update\_* / generate\_*}；区别在\key{谁在编排顺序、是否暴露 \code{gen\_context}、是否接生图与 CFG}。
+\end{summarybox}

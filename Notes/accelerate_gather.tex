@@ -1,0 +1,187 @@
+% ============================================================
+% accelerator.gather 笔记
+% 参考：https://huggingface.co/docs/accelerate/package_reference/accelerator
+% ============================================================
+
+\section{\texttt{accelerator.gather}：分布式训练的全量汇聚}
+
+\begin{conceptbox}
+\textbf{一句话：} \code{accelerator.gather} 将所有 GPU 上的局部 tensor \key{按 rank 顺序拼接}成完整 tensor，且\key{每个 GPU 都能看到完整结果}（底层是 NCCL 的 \texttt{all\_gather}）。\\
+\textbf{典型用途：} reward 汇总、advantage 全局归一化、wandb 日志记录、per-prompt 统计。
+\end{conceptbox}
+
+% -------------------- 场景动机 --------------------
+\subsection{为什么需要 gather？}
+
+4 个 GPU 并行训练时，每个 GPU 只处理自己那批数据：
+
+\begin{center}
+\begin{tabular}{cccc}
+\hline
+GPU 0 & GPU 1 & GPU 2 & GPU 3 \\
+\hline
+\texttt{[0.72, 0.65]} & \texttt{[0.81, 0.44]} & \texttt{[0.59, 0.90]} & \texttt{[0.33, 0.77]} \\
+\hline
+\end{tabular}
+\end{center}
+
+每个 GPU 只看到局部数据，\bad{无法计算全局均值}，无法做 per-prompt 归一化，无法记录完整 reward 分布。
+
+% -------------------- gather 底层原理 --------------------
+\subsection{底层原理：NCCL all\_gather}
+
+\begin{lstlisting}[language=Python]
+gathered = accelerator.gather(local_tensor)
+\end{lstlisting}
+
+三步执行过程：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{每个进程持有局部 tensor：} rank 0 $\to$ \texttt{[a,b]}，rank 1 $\to$ \texttt{[c,d]}，...
+  \item \textbf{NCCL 通过 NVLink / InfiniBand 在所有 GPU 间广播：} all\_gather 操作
+  \item \textbf{每个 GPU 都得到拼接结果：} \texttt{[a, b, c, d, e, f, g, h]}
+\end{enumerate}
+
+\begin{center}
+\begin{tabular}{p{12.5cm}}
+\hline
+拼接结果（所有 GPU 均持有）：\\
+\texttt{[a, b,\ \ \ c, d,\ \ \ e, f,\ \ \ g, h]}\\
+$\underbrace{\phantom{xx}}_{\text{GPU0}}$
+$\underbrace{\phantom{xx}}_{\text{GPU1}}$
+$\underbrace{\phantom{xx}}_{\text{GPU2}}$
+$\underbrace{\phantom{xx}}_{\text{GPU3}}$\\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{all\_gather vs gather 的区别：}\\
+\code{accelerator.gather} 底层调用 \code{all\_gather}——\key{所有进程都拿到完整结果}。\\
+而普通 \code{dist.gather} 只有 rank 0 收到数据，其他进程什么都拿不到。
+\end{intubox}
+
+% -------------------- 实际代码 --------------------
+\subsection{实际代码示例（来自 Flow-GRPO 训练脚本）}
+
+\begin{lstlisting}[language=Python, caption=reward gather 与日志记录]
+# 采样阶段：每个 GPU 计算自己那批的 reward
+local_rewards = torch.tensor(rewards, device=accelerator.device)
+# local_rewards.shape = (batch_size,)，例如 [0.72, 0.65]
+
+# gather：汇聚所有 GPU 的 reward
+gathered_rewards = accelerator.gather(local_rewards)
+# gathered_rewards.shape = (num_gpus * batch_size,)
+# = [0.72, 0.65, 0.81, 0.44, 0.59, 0.90, 0.33, 0.77]
+
+# 只有主进程负责记录日志
+if accelerator.is_main_process:
+    wandb.log({"reward/mean": gathered_rewards.mean().item()})
+\end{lstlisting}
+
+% -------------------- gather vs gather_for_metrics --------------------
+\subsection{\texttt{gather} vs \texttt{gather\_for\_metrics}}
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.5cm}p{4.5cm}p{4.5cm}}
+\hline
+ & \textbf{\texttt{gather}} & \textbf{\texttt{gather\_for\_metrics}} \\
+\hline
+用途 & 拼接 tensor，用于计算 & 专为 metric 日志设计 \\
+去重 & \bad{不去重（含 padding）} & \good{自动去掉末尾 padding} \\
+返回 & 所有进程都拿到 & 所有进程都拿到 \\
+典型场景 & reward 计算、advantage 归一化 & 最终 accuracy / F1 统计 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{为什么会有 padding 重复？}\\
+假设数据集有 \textbf{7 条}，4 个 GPU 每个处理 2 条（共需 8 个 slot），最后一张卡不够用，\\
+GPU 3 会用 \texttt{sample\_6} 填充两次：\texttt{[sample\_6, sample\_6]}。\\
+\code{gather} 把重复的 \texttt{sample\_6} 一并带入；\code{gather\_for\_metrics} 会自动去掉它。
+\end{warnbox}
+
+% -------------------- advantage 归一化完整流程 --------------------
+\subsection{完整流程：GRPO Advantage 归一化}
+
+这是 GRPO / Flow-GRPO 训练中最典型的 gather 使用场景：
+
+\begin{center}
+\begin{tabular}{c}
+\hline \\
+每个 GPU 独立采样 $\longrightarrow$ 本地 rewards \\
+$\downarrow$ \code{accelerator.gather} \\
+全局 rewards（所有 GPU 可见）\\
+$\downarrow$ 计算全局统计量 \\
+$\mu = 0.663,\quad \sigma = 0.175$ \\
+$\downarrow$ 每个 GPU 各自归一化 \\
+$\hat{A}_i = (r_i - \mu) / \sigma$ \\
+$\downarrow$ \\
+各 GPU 用 advantage 更新梯度 \\
+\\ \hline
+\end{tabular}
+\end{center}
+
+\begin{lstlisting}[language=Python, caption=advantage 归一化（全局统计，局部计算）]
+local_r = torch.tensor(my_rewards, device=device)   # (B,)
+all_r   = accelerator.gather(local_r)                # (num_gpus * B,)
+
+mean = all_r.mean()
+std  = all_r.std() + 1e-8
+
+# 每个 GPU 只归一化自己那份，用的是全局统计量
+local_adv = (local_r - mean) / std
+\end{lstlisting}
+
+% -------------------- 常见陷阱 --------------------
+\subsection{常见陷阱}
+
+\subsubsection{陷阱 1：在非 tensor 上直接 gather}
+
+\begin{lstlisting}[language=Python]
+# 错误：字符串不能直接 gather
+all_captions = accelerator.gather(["a cat", "a dog"])
+
+# 正确：用 dist.all_gather_object 收集 Python 对象
+import torch.distributed as dist
+captions_list = [None] * dist.get_world_size()
+dist.all_gather_object(captions_list, local_captions)
+all_captions = [c for sublist in captions_list for c in sublist]
+\end{lstlisting}
+
+\subsubsection{陷阱 2：shape 不一致}
+
+\begin{lstlisting}[language=Python]
+# 错误：GPU 0 shape (3,)，GPU 1 shape (4,) -> 报错！
+# gather 要求所有进程的 tensor shape 完全相同
+
+# 正确：先 pad 到相同长度
+padded  = accelerator.pad_across_processes(local_tensor, dim=0)
+gathered = accelerator.gather(padded)
+\end{lstlisting}
+
+\subsubsection{陷阱 3：忘记 gather 导致全局统计错误}
+
+\begin{lstlisting}[language=Python]
+# 错误：每个 GPU 只看到自己的数据，std 被低估
+advantages = (local_rewards - local_rewards.mean()) / local_rewards.std()
+
+# 正确：使用全局统计量
+all_rewards = accelerator.gather(local_rewards)
+advantages  = (local_rewards - all_rewards.mean()) / all_rewards.std()
+\end{lstlisting}
+
+% -------------------- 总结 --------------------
+\begin{summarybox}
+\textbf{\texttt{accelerator.gather} 核心要点：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{语义}：把所有 GPU 的零件装进同一个箱子，每个 GPU 都能看到完整的箱子
+  \item \key{底层}：NCCL all\_gather，通过 NVLink / InfiniBand 在 GPU 间传输
+  \item \key{顺序}：按 rank 0, 1, 2, ... 拼接，shape 从 \texttt{(B,)} 变为 \texttt{(num\_gpus * B,)}
+  \item \key{区别}：需要去重 padding 时用 \code{gather\_for\_metrics}，否则用 \code{gather}
+  \item \key{典型场景}：reward 汇总、advantage 全局归一化、wandb 日志记录
+\end{itemize}
+\end{summarybox}

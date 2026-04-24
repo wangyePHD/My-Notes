@@ -1,0 +1,626 @@
+% ============================================================
+% Z-Image 结构笔记
+% 日期：2026/04/19
+% ============================================================
+
+\section{Z-Image 结构笔记}
+
+\begin{conceptbox}
+\textbf{从输入到输出理解单流文生图基模型 · 2026/04/19}\\
+目标：快速重建 Z-Image 的核心设计逻辑，尤其是 single-stream、两个 refiner、统一位置编码，以及 timestep modulation 各自解决了什么问题。
+\end{conceptbox}
+
+% ============================================================
+\subsection{这份笔记的目标}
+% ============================================================
+
+这份笔记不是把 Z-Image 的所有配置项背下来，而是帮助回顾时快速回答下面几个问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Z-Image 到底想解决什么问题？
+  \item 它为什么不是普通的「文本编码器 + DiT」？
+  \item 它为什么强调 \key{single-stream}？
+  \item 两个 \key{refiner} 到底在做什么？
+  \item 统一位置编码为什么是核心而不是细节？
+  \item timestep modulation 为什么是\key{层级控制信号}而不是普通内容输入？
+\end{itemize}
+
+\begin{intubox}
+\textbf{阅读目标：}\\
+这篇笔记优先帮助你建立「从输入到输出」的结构感，而不是记忆零散模块名。
+\end{intubox}
+
+% ============================================================
+\subsection{一句话总览}
+% ============================================================
+
+\begin{conceptbox}
+\textbf{一句话：} Z-Image 的核心思想是：先把文本和图像都变成可统一处理的 token，再在一条共享的、受 timestep 调制的 \key{single-stream diffusion transformer} 中共同演化。
+\end{conceptbox}
+
+它不是把文本当外挂条件、图像当唯一主角，而是让下面四件事共同构成一个统一的生成动力系统：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本语义 token
+  \item 图像 noisy latent token
+  \item 统一位置编码
+  \item 扩散时间步控制
+\end{itemize}
+
+% ============================================================
+\subsection{模型整体哲学}
+% ============================================================
+
+\subsubsection{Z-Image 不只是「文本编码器 + DiT」}
+
+如果只是普通的「文本编码器 + DiT」，通常更像这样：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本编码器先产生条件向量；
+  \item 图像 latent 进入一个以图像为主的生成器；
+  \item 文本作为外部条件，通过 cross-attention 或其他注入方式影响图像分支。
+\end{itemize}
+
+但 Z-Image 更激进一些。它在结构上想表达的是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本不是单纯外挂条件；
+  \item 图像也不是唯一主干状态；
+  \item 文本 token 和图像 token 都要进入统一主干；
+  \item Transformer 处理的是一条统一的多模态 token 流。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{核心直觉：}\\
+Z-Image 想做的不是「文本控制图像」，而是让文本语义和图像去噪在同一条 token 流中共同演化。
+\end{summarybox}
+
+\subsubsection{为什么强调 single-stream}
+
+很多传统多模态生成器的基本想法是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本一条流；
+  \item 图像一条流；
+  \item 中间通过交叉注意力或双流 block 互动。
+\end{itemize}
+
+Z-Image 的单流哲学则是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 尽快把不同模态整理成统一 token 形式；
+  \item 尽快进入共享 backbone；
+  \item 最大化参数共享；
+  \item 在更少的参数和计算下实现更强的模态交互。
+\end{itemize}
+
+\begin{conceptbox}
+\textbf{single-stream 不是简单 concat。}\\
+它要求在 \key{token 形式}、\key{位置体系}、\key{主干计算} 和 \key{扩散阶段控制} 上都统一。
+\end{conceptbox}
+
+% ============================================================
+\subsection{从输入到输出：一次完整前向过程}
+% ============================================================
+
+\subsubsection{输入端：Prompt 先被增强}
+
+用户输入 prompt 后，Z-Image 不是直接把原始文本送进 diffusion 主干。它前面有一个系统级 Prompt Enhancer，用来：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把原始 prompt 扩写；
+  \item 把短、弱、模糊的描述改写成更适合图像生成的提示；
+  \item 在系统层面增强结构化表达和细节表达。
+\end{itemize}
+
+\subsubsection{文本侧：Prompt 变成文本 token 表示}
+
+增强后的文本送入文本编码器。公开实现使用的是 Qwen 系列文本编码器。输出不是一句自然语言，而是一串\key{文本语义 token 表示}：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它们来自语言模型空间；
+  \item 语义强、组合性强；
+  \item 但还不一定适合直接让 diffusion 主干使用。
+\end{itemize}
+
+\subsubsection{图像侧：生成从 noisy latent 开始}
+
+Z-Image 工作在 VAE latent 空间，而不是像素空间。推理时图像分支的起点是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 在 latent 空间采样一个噪声张量；
+  \item 得到 noisy latent；
+  \item 再对 noisy latent 做 patchify；
+  \item 最终形成图像 token 序列。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{高频误区：}\\
+不要把流程说成「先 patchify，再加噪」或「从像素噪声图开始」。更准确的理解是：\key{先有 noisy latent，再把它 token 化}。
+\end{warnbox}
+
+\subsubsection{合流前：两条模态各自先过 refiner}
+
+文本 token 和图像 token 不会一上来就直接扔进统一主干，而是分别先经过：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{Context Refiner}
+  \item \key{Noise Refiner}
+\end{itemize}
+
+\subsubsection{统一主干：进入 single-stream DiT}
+
+经过各自 refiner 后：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本 token 被整理为稳定语义条件；
+  \item 图像 token 被整理为当前 timestep 下可处理的视觉状态；
+  \item 二者在统一位置编码下形成一个共享 token 流；
+  \item 进入 single-stream 主干做 self-attention + FFN 的联合建模。
+\end{itemize}
+
+\subsubsection{输出端：主干不是直接输出图像}
+
+single-stream 主干输出的仍然是图像 patch 级别的更新表示，而不是直接输出 RGB 图像。之后还需要：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 图像 patch tokens 经过 \key{unpatchify}；
+  \item 还原成 latent feature map；
+  \item 再由 VAE decoder 解码成最终图像。
+\end{itemize}
+
+% ============================================================
+\subsection{为什么需要两个 Refiner}
+% ============================================================
+
+\subsubsection{Context Refiner：整理稳定语义条件}
+
+Context Refiner 的输入是文本编码器输出的语言表示。这些表示本来是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 语言模型空间里的 hidden states；
+  \item 语义很强；
+  \item 但还不是最适合 diffusion 主干直接消费的条件形式。
+\end{itemize}
+
+\begin{conceptbox}
+\textbf{Context Refiner 的职责：}\\
+把语言模型空间里的文本表示，整理成生成主干可使用的\key{稳定语义条件}。它更像一个文本条件适配器，而不是泛泛地「加强语义」。
+\end{conceptbox}
+
+\subsubsection{Noise Refiner：整理当前阶段的噪声图像状态}
+
+Noise Refiner 的输入是 noisy latent patchify 之后的图像 token。这些 token 本来是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 来自噪声状态的视觉 token；
+  \item 含有空间结构，但语义不稳定；
+  \item 而且在不同 timestep 下，含义不同。
+\end{itemize}
+
+\begin{conceptbox}
+\textbf{Noise Refiner 的职责：}\\
+把 noisy image tokens 整理成当前 timestep 下更适合统一主干处理的\key{视觉状态表示}。
+\end{conceptbox}
+
+\subsubsection{为什么不能一上来直接 concat}
+
+因为两边 token 的分布差异太大：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本侧是语言语义条件；
+  \item 图像侧是当前扩散阶段下的噪声视觉状态。
+\end{itemize}
+
+如果不先整理，统一主干一上来就要同时承担：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 语言条件适配；
+  \item 噪声状态整形；
+  \item 图文交互；
+  \item 图像去噪。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{两个 Refiner 的一句话分工：}\\
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{Context Refiner}：整理稳定语义条件
+  \item \key{Noise Refiner}：整理当前 timestep 下的噪声图像状态
+\end{itemize}
+\end{summarybox}
+
+% ============================================================
+\subsection{Noise Refiner 与 Timestep Modulation}
+% ============================================================
+
+\subsubsection{Noise Refiner 的结构骨架}
+
+Noise Refiner 不是一个小 U-Net，也不是单独的大分支或特殊 cross-attention 适配器。它本质上就是：
+
+\begin{conceptbox}
+\textbf{若干层带 timestep 调制的 Transformer block。}
+\end{conceptbox}
+
+如果只看结构骨架，它和普通 Transformer block 很像：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 归一化；
+  \item self-attention；
+  \item 残差；
+  \item 归一化；
+  \item FFN；
+  \item 残差。
+\end{itemize}
+
+真正的不同点在于：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它吃 timestep；
+  \item 它的每一层都被时间条件调制；
+  \item 它不是纯内容变换器，而是带阶段感知的视觉状态整理器。
+\end{itemize}
+
+\subsubsection{它为什么必须吃 timestep}
+
+因为 noisy image tokens 的语义解释会随扩散阶段变化：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 早期：更像混乱无序的噪声；
+  \item 中期：开始包含布局与结构；
+  \item 后期：更多对应细节、纹理与边界修复。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉上：}\\
+同一个 block 在不同 timestep 下，工作的重点不同。它不是在同一种任务上重复计算，而是在不同扩散阶段切换自己的行为模式。
+\end{intubox}
+
+\subsubsection{实现上的核心：time embedding 走控制旁路}
+
+timestep 不作为普通 token 拼进序列，而是走一条旁路控制路径：
+
+\begin{align*}
+t &\rightarrow \text{sinusoidal embedding} \\
+  &\rightarrow \text{MLP} \\
+  &\rightarrow c
+\end{align*}
+
+其中 $c$ 是时间条件向量。然后每个 modulated block 再用线性层把 $c$ 映射成四组控制量：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item attention 输入 scale
+  \item attention 输出 gate
+  \item MLP 输入 scale
+  \item MLP 输出 gate
+\end{itemize}
+
+\begin{lstlisting}[language=Python]
+c = TimeMLP(t)
+s_attn, g_attn, s_mlp, g_mlp = Linear(c)
+
+x = x + tanh(g_attn) * Attn(Norm(x) * (1 + s_attn))
+x = x + tanh(g_mlp)  * MLP (Norm(x) * (1 + s_mlp))
+\end{lstlisting}
+
+\subsubsection{如何理解 scale 和 gate}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{scale}：控制这层如何读输入，哪些特征更强调、哪些更抑制
+  \item \key{gate}：控制这层如何写输出，这次更新有多少被写回 residual
+\end{itemize}
+
+\begin{summarybox}
+\textbf{结论：}\\
+timestep 在这里不是内容补充，而是\key{层级控制信号}。它控制的是「当前阶段这一层该怎么工作」，不是「额外告诉模型一点内容」。
+\end{summarybox}
+
+\subsubsection{哪些模块吃 timestep}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{Noise Refiner}：吃 timestep
+  \item \key{single-stream 主干}：也吃 timestep
+  \item \key{Context Refiner}：不吃 timestep
+\end{itemize}
+
+原因也很统一：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 参与噪声图像状态更新的模块，需要知道当前扩散阶段；
+  \item 只负责稳定语义条件整理的模块，不需要跟着扩散阶段变化。
+\end{itemize}
+
+% ============================================================
+\subsection{统一位置编码：为什么它是核心}
+% ============================================================
+
+\subsubsection{single-stream 不是简单 concat}
+
+很多人第一次看 Z-Image，会说：
+
+\begin{quote}
+single-stream 不就是把文本 token 和图像 token 连接起来吗？
+\end{quote}
+
+这句话不够准确。concat 只是把 token 放在一起，真正的问题是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本本来是 1D 顺序对象；
+  \item 图像本来是 2D 空间对象；
+  \item 如果没有统一位置体系，Transformer 不知道二者在同一几何框架里该如何解释。
+\end{itemize}
+
+\subsubsection{文本位置编码怎么理解}
+
+文本 token 被放进统一三维坐标系中，但它只有第一维在变化。一个最小例子：
+
+\begin{align*}
+\texttt{a}   &\rightarrow (1,0,0) \\
+\texttt{red} &\rightarrow (2,0,0) \\
+\texttt{cat} &\rightarrow (3,0,0)
+\end{align*}
+
+意思是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 第一维表达文本内部顺序；
+  \item 后两维固定为零；
+  \item 文本没有二维空间，但仍被嵌进统一三维坐标系里。
+\end{itemize}
+
+\subsubsection{图像位置编码怎么理解}
+
+图像 token 来自 patch 网格，因此天然具有二维空间关系。一个最小的 $2 \times 2$ patch 例子：
+
+\begin{align*}
+\texttt{img\_1} &\rightarrow (4,0,0) \\
+\texttt{img\_2} &\rightarrow (4,0,1) \\
+\texttt{img\_3} &\rightarrow (4,1,0) \\
+\texttt{img\_4} &\rightarrow (4,1,1)
+\end{align*}
+
+这里：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 第一维表示这些 token 属于文本之后的图像区域；
+  \item 后两维表达图像内部空间结构；
+  \item 所以上下左右关系不会被压扁成纯序列顺序。
+\end{itemize}
+
+\subsubsection{如果没有统一位置编码，会出什么问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本顺序还可以勉强用 1D 序列表达；
+  \item 但图像 patch 的二维空间关系会被错误压平；
+  \item 「谁在左边」「谁在上方」「谁是对角」会被扭曲成单纯前后顺序；
+  \item Transformer 处理的只是一串混杂 token，而不是统一几何世界中的多模态 token。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{一句话速记：}\\
+concat 只是把 token 放在一起；\key{统一位置编码}才是让它们处在同一个世界里。
+\end{summarybox}
+
+% ============================================================
+\subsection{single-stream 的真正含义}
+% ============================================================
+
+single-stream 的真正含义不只是共享 attention，还包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本 token 和图像 token 在统一 token 空间里表达；
+  \item 二者共享一套位置体系；
+  \item 二者进入同一条 self-attention 主干；
+  \item 二者共享大部分深层参数；
+  \item 文本语义和图像状态共同演化，而不是一方只是控制另一方。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{单流的好处：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 参数共享更充分
+  \item 模态交互更直接
+  \item 小模型下更节省容量
+  \item 更适合追求 consumer hardware 友好的高效路线
+\end{itemize}
+\end{summarybox}
+
+% ============================================================
+\subsection{Z-Image-Edit 的关键思路}
+% ============================================================
+
+\subsubsection{编辑任务和纯文生图的不同}
+
+编辑任务相比纯文生图，多了一层根本性约束：
+
+\begin{quote}
+不仅要改对，还要保对。
+\end{quote}
+
+也就是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 该改的内容要跟随指令修改；
+  \item 不该改的身份、背景、姿态、局部结构要尽量保持。
+\end{itemize}
+
+\subsubsection{为什么参考图不是普通图像 token}
+
+参考图不是「要被生成出来的目标」，而是条件锚点。它提供的是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 原始内容；
+  \item 需要保留的身份、背景和布局；
+  \item 改动相对于谁发生。
+\end{itemize}
+
+\subsubsection{SigLIP 的作用}
+
+在编辑或 omni 变体里，SigLIP 分支提供参考图的高层视觉语义。它和 VAE token 形成互补：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item VAE token 更偏低层重建和外观信息；
+  \item SigLIP 更偏高层语义与视觉概念。
+\end{itemize}
+
+\subsubsection{为什么必须区分 noisy target 和 clean reference}
+
+因为二者在扩散里的角色完全不同：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{noisy target tokens}：要被逐步去噪和生成出来
+  \item \key{clean reference tokens}：是稳定条件，不该被当成噪声目标一起去噪
+\end{itemize}
+
+\begin{warnbox}
+\textbf{如果不区分：}\\
+模型会混淆谁应该改、谁应该保、谁是目标、谁是条件，编辑任务最关键的「改对且保住」就会被破坏。
+\end{warnbox}
+
+% ============================================================
+\subsection{Z-Image 与 FLUX 的结构取舍}
+% ============================================================
+
+\subsubsection{FLUX 不是纯单流}
+
+公开实现里，FLUX 采用的是混合结构：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 先过一段 \key{double-stream blocks}
+  \item 再进入 \key{single-stream blocks}
+\end{itemize}
+
+这意味着 FLUX 的哲学更像：
+
+\begin{quote}
+先让文本和图像保留一段各自的专属处理空间，再逐步统一。
+\end{quote}
+
+\subsubsection{Z-Image 的取舍}
+
+Z-Image 则更激进：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它不在深层 backbone 里长期保留双流；
+  \item 它只在合流前使用轻量的两个 refiner；
+  \item 之后尽快进入共享的 single-stream backbone。
+\end{itemize}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.5cm}p{4.5cm}}
+\hline
+\textbf{模型} & \textbf{融合路径} & \textbf{核心取舍} \\
+\hline
+\textbf{FLUX} & 先双流后单流 & 更稳健、更保守 \\
+\textbf{Z-Image} & 浅分流、深单流 & 更强调效率、共享和小模型可用性 \\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+% ============================================================
+\subsection{最容易混淆的点}
+% ============================================================
+
+\begin{warnbox}
+\textbf{误区 1：} Z-Image 就是简单 concat 文本和图像。\\
+\bad{错误。} concat 只是序列排布，真正关键的是统一位置体系和统一主干。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 2：} 图像是先 patchify 再加噪。\\
+\bad{错误。} 更准确是：先有 noisy latent，再 token 化。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 3：} Context Refiner 只是增强语义。\\
+\bad{不够准确。} 更准确地说，它是把文本编码器输出的语言表示整理成生成主干可用的稳定语义条件。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 4：} Noise Refiner 就是再过几层 Transformer。\\
+\bad{不够准确。} 它本质上是带 timestep 调制的浅层图像状态整理器。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 5：} timestep 只是一个额外 embedding。\\
+\bad{错误。} timestep 更像层级控制信号，而不是普通内容条件。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{误区 6：} 主干输出后直接得到图像。\\
+\bad{错误。} 主干输出的是 patch 级图像表示，需要先 unpatchify，再经 VAE decode。
+\end{warnbox}
+
+% ============================================================
+\subsection{一页速记卡}
+% ============================================================
+
+\subsubsection{5 句记住 Z-Image}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Z-Image 的目标不是把文本当外挂条件，而是让文本 token 和图像 token 进入同一个生成系统。
+  \item 它在合流前用两个轻量 refiner，先分别整理文本条件和噪声图像状态。
+  \item 它的 backbone 是 single-stream DiT，强调大部分深层参数共享。
+  \item 它之所以能单流，不只是因为 concat，而是因为统一了 token 位置体系。
+  \item 它的 timestep 不是内容，而是控制每一层在不同扩散阶段如何工作的信号。
+\end{enumerate}
+
+\subsubsection{三个一句话}
+
+\begin{summarybox}
+\textbf{两个 Refiner：}\\
+\key{Context Refiner} 整理稳定语义条件；\key{Noise Refiner} 整理当前 timestep 下的噪声图像状态。
+\end{summarybox}
+
+\begin{summarybox}
+\textbf{统一位置编码：}\\
+文本靠第一维保序，图像靠后两维保空间，统一位置编码让两者处在同一个几何世界里。
+\end{summarybox}
+
+\begin{summarybox}
+\textbf{与 FLUX 的区别：}\\
+FLUX 是先双流再单流；Z-Image 是浅分流、深单流。
+\end{summarybox}
+
+% ============================================================
+\subsection{适合自我检查的问题}
+% ============================================================
+
+如果下次复习 Z-Image 时，能独立回答下面几个问题，说明理解已经比较稳：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 为什么 Z-Image 不是普通的「文本编码器 + DiT」？
+  \item 为什么 single-stream 不只是 concat？
+  \item 为什么合流前必须有两个 refiner？
+  \item Noise Refiner 为什么必须吃 timestep？
+  \item 为什么 timestep 更适合作为 scale/gate，而不是普通 embedding？
+  \item 没有统一位置编码，图像 token 的空间关系会出现什么问题？
+  \item 为什么编辑模型里必须区分 noisy target 和 clean reference？
+  \item Z-Image 和 FLUX 在模态融合上的哲学差别是什么？
+\end{enumerate}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Z-Image 论文页：\url{https://huggingface.co/papers/2511.22699}
+  \item Z-Image 官方仓库：\url{https://github.com/Tongyi-MAI/Z-Image}
+  \item Z-Image 模型卡：\url{https://huggingface.co/Tongyi-MAI/Z-Image}
+  \item Z-Image-Turbo 模型卡：\url{https://huggingface.co/Tongyi-MAI/Z-Image-Turbo}
+  \item diffusers 中的 ZImageTransformer2DModel：\url{https://huggingface.co/docs/diffusers/api/models/z_image_transformer2d}
+  \item FLUX 官方仓库：\url{https://github.com/black-forest-labs/flux}
+  \item FLUX Transformer 文档：\url{https://huggingface.co/docs/diffusers/en/api/models/flux_transformer}
+\end{itemize}
+
+% ============================================================
+\subsection{最后的总结}
+% ============================================================
+
+\begin{conceptbox}
+\textbf{最后一段话：}\\
+Z-Image 的真正创新，不在于把文本接到图像生成器前面，而在于它试图把文本语义、图像噪声状态、统一位置体系和扩散时间控制放进同一个 token-level 生成系统里。两个 refiner 让它能在高效前提下尽早合流；统一位置编码让 single-stream backbone 真正成立；而 timestep modulation 让这个统一主干在不同扩散阶段具有不同工作模式。它是一条强调参数共享、效率优先、尽早合流的图像基模型路线。
+\end{conceptbox}

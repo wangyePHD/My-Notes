@@ -1,0 +1,874 @@
+% ============================================================
+% Diffusion Noise Schedule & Sampling Algorithms
+% 面试速查笔记 · 2026/04/11
+% ============================================================
+
+\section{Diffusion Noise Schedule 与采样算法全览}
+
+\note{面试速查笔记 · 2026/04/11 \quad 已有基础：DDPM 基本原理、Flow Matching。
+目标：彻底搞清楚各种 Schedule 和 Sampler 的区别、联系，能流畅答题。}
+
+% ------------------------------------------------------------
+\subsection*{知识地图}
+% ------------------------------------------------------------
+
+\begin{lstlisting}[language={}]
+[已掌握 ✓]                 [本次讲解 ★]                        [进阶方向 →]
+
+DDPM 前/反向过程  →   Noise Schedule                     EDM 框架
+Flow Matching    →     linear / cosine / EDM    →       Consistency Model
+                       Sampler                          LCM / Distillation
+                         DDPM → DDIM → DPM-Solver
+
+核心关系：
+  Schedule  决定「怎么加噪」（训练）
+  Sampler   决定「怎么去噪」（推理）
+  两者独立，但 Sampler 需要读取 Schedule 定义的 ᾱ_t 来计算每步幅度
+\end{lstlisting}
+
+% ============================================================
+\subsection{Noise Schedule：加噪时间表}
+% ============================================================
+
+\begin{intubox}
+\textbf{直觉：}Schedule 就是一张「加噪时间表」。它规定在第 $t$ 步，
+原始图像保留多少（$\sqrt{\bar\alpha_t}$），噪声加多少（$\sqrt{1-\bar\alpha_t}$）。
+$\bar\alpha_t$ 从 $\approx 1$（几乎是原图）下降到 $\approx 0$（纯噪声）。
+\end{intubox}
+
+前向过程统一写成一步到位的形式：
+
+\begin{conceptbox}
+\textbf{前向加噪（任意时刻）：}
+$$q(x_t \mid x_0) = \mathcal{N}\!\left(x_t;\; \sqrt{\bar\alpha_t}\,x_0,\;
+(1-\bar\alpha_t)\mathbf{I}\right)$$
+即：$x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon,
+\quad \epsilon \sim \mathcal{N}(0,\mathbf{I})$
+
+不同 Schedule 的本质区别就是：\key{$\bar\alpha_t$ 随 $t$ 怎么下降}。
+\end{conceptbox}
+
+% ------------------------------------------------------------
+\subsubsection{Linear Schedule（DDPM 原始，Ho et al.\ 2020）}
+% ------------------------------------------------------------
+
+单步加噪强度 $\beta_t$ 从小到大\textbf{线性增加}：
+$$\beta_1 = 10^{-4},\quad \beta_T = 0.02,\qquad
+\bar\alpha_t = \prod_{s=1}^{t}(1-\beta_s)$$
+
+\begin{warnbox}
+\textbf{问题：}在高分辨率图像上，$t$ 很小时 $\bar\alpha_t$ 仍然接近 1，
+最后几步才猛烈加噪——导致训练时\warn{大量时间步在做「几乎没噪声」的无效学习}，
+信噪比分布极不均匀。
+\end{warnbox}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.72\linewidth, height=4.8cm,
+  xlabel={$t/T$（归一化时间步）},
+  ylabel={$\bar{\alpha}_t$},
+  xmin=0, xmax=1, ymin=0, ymax=1.05,
+  xtick={0,0.2,0.4,0.6,0.8,1.0},
+  ytick={0,0.2,0.4,0.6,0.8,1.0},
+  grid=both,
+  grid style={line width=0.3pt, draw=gray!25},
+  major grid style={line width=0.5pt, draw=gray!40},
+  title={\small Linear Schedule：$\bar{\alpha}_t$ 随时间步的变化},
+  title style={font=\small},
+  label style={font=\small},
+  tick label style={font=\footnotesize},
+  axis line style={gray!60},
+]
+% Linear schedule: beta linearly from 1e-4 to 0.02, T=1000
+% alpha_bar_t = prod_{s=1}^{t}(1 - beta_s)
+% beta_s = 1e-4 + (0.02 - 1e-4)*(s-1)/(T-1)
+% Approximated by exp(-sum of betas) = exp(-integral)
+% integral from 0 to u of (1e-4 + (0.02-1e-4)*u) du = 1e-4*u + (0.0199/2)*u^2
+% alpha_bar ≈ exp(-(0.0001*u + 0.00995*u^2)) where u = t/T * T = t
+% For normalized: u = t (0 to 1000), so alpha_bar(t/T) = exp(-0.1*(t/T) - 9.95*(t/T)^2)
+\addplot[
+  color=accent, thick, smooth,
+  domain=0:1, samples=200,
+]{exp(-0.1*x - 9.95*x^2)};
+\addplot[
+  color=accent!40, dashed, thin,
+  domain=0:1, samples=2,
+]{0.5} node[pos=0.85, above, font=\footnotesize, color=accent!70] {$0.5$};
+% Annotation: sharp drop region
+\draw[->, color=danger, thick] (axis cs:0.75, 0.35) -- (axis cs:0.88, 0.08)
+  node[midway, right, font=\footnotesize, color=danger] {急剧下降};
+\draw[color=primary!50, dashed, thin] (axis cs:0, 1) -- (axis cs:0.6, 1);
+\node[font=\footnotesize, color=textgray, anchor=west] at (axis cs:0.02, 0.88)
+  {前 60\% 步：$\bar\alpha_t > 0.5$，几乎无噪声};
+\end{axis}
+\end{tikzpicture}
+\end{center}
+
+% ------------------------------------------------------------
+\subsubsection{Cosine Schedule（Improved DDPM，Nichol \& Dhariwal 2021）}
+% ------------------------------------------------------------
+
+直接让 $\bar\alpha_t$ 按\textbf{余弦曲线}下降：
+
+\begin{conceptbox}
+\textbf{Cosine Schedule 定义：}
+$$\bar\alpha_t = \frac{f(t)}{f(0)}, \qquad
+f(t) = \cos\!\left(\frac{t/T + s}{1+s} \cdot \frac{\pi}{2}\right)^2$$
+其中 $s = 0.008$ 是防止 $t=0$ 时 $\bar\alpha_0$ 过大的偏移量。
+\end{conceptbox}
+
+\begin{intubox}
+\textbf{效果：}$\bar\alpha_t$ 在中间段下降更平缓，两端更平滑，
+让模型在所有时间步获得\textbf{更均匀的学习信号}。这就是「和余弦有关」的那个！
+\end{intubox}
+
+\begin{summarybox}
+\textbf{面试一句话：}Cosine schedule 让信噪比在时间维度上分布更均匀，
+改善了 linear schedule 在高分辨率上浪费步骤的问题。
+\end{summarybox}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.72\linewidth, height=4.8cm,
+  xlabel={$t/T$（归一化时间步）},
+  ylabel={$\bar{\alpha}_t$},
+  xmin=0, xmax=1, ymin=0, ymax=1.05,
+  xtick={0,0.2,0.4,0.6,0.8,1.0},
+  ytick={0,0.2,0.4,0.6,0.8,1.0},
+  grid=both,
+  grid style={line width=0.3pt, draw=gray!25},
+  major grid style={line width=0.5pt, draw=gray!40},
+  title={\small Linear vs Cosine Schedule 对比},
+  title style={font=\small},
+  label style={font=\small},
+  tick label style={font=\footnotesize},
+  axis line style={gray!60},
+  legend style={font=\footnotesize, at={(0.97,0.97)}, anchor=north east,
+    fill=white, fill opacity=0.9, draw=gray!40},
+]
+% Linear (same as before)
+\addplot[
+  color=accent, thick, smooth,
+  domain=0:1, samples=200,
+]{exp(-0.1*x - 9.95*x^2)};
+\addlegendentry{Linear Schedule}
+% Cosine: alpha_bar(t) = cos((t/T + s)/(1+s) * pi/2)^2 / cos(s/(1+s)*pi/2)^2
+% s=0.008, f(t)=cos((u+0.008)/1.008 * pi/2)^2, f(0)=cos(0.008/1.008 * pi/2)^2
+% Numerically: f(0) ≈ cos(0.003976*pi)^2 ≈ cos(0.01249)^2 ≈ 0.99992
+\addplot[
+  color=primary, thick, smooth,
+  domain=0:1, samples=200,
+]{(cos(deg((x+0.008)/1.008 * pi/2))^2) / (cos(deg(0.008/1.008 * pi/2))^2)};
+\addlegendentry{Cosine Schedule}
+% Arrow showing difference in middle region
+\draw[<->, color=success, thick] (axis cs:0.5, 0.18) -- (axis cs:0.5, 0.53)
+  node[midway, right, font=\footnotesize, color=success] {差异最大};
+\end{axis}
+\end{tikzpicture}
+\end{center}
+
+% ------------------------------------------------------------
+\subsubsection{EDM Schedule（Karras et al.\ 2022）}
+% ------------------------------------------------------------
+
+\begin{intubox}
+\textbf{直觉：}EDM（Elucidating Diffusion Models）重新梳理整个框架，
+用连续时间噪声标准差 $\sigma$ 作为时间变量，彻底解耦 Schedule、Sampler、
+网络预处理（Preconditioning）三个组件。
+\end{intubox}
+
+\begin{conceptbox}
+\textbf{EDM 前向过程（极简）：}
+$$x = x_0 + \sigma \cdot \epsilon, \qquad \epsilon \sim \mathcal{N}(0,\mathbf{I})$$
+Schedule 变成了如何分配推理时的 $\sigma$ 采样点（通常是 log-normal 分布），
+与训练目标解耦。
+\end{conceptbox}
+
+\textbf{核心贡献：}把三件事分开讨论——
+\begin{itemize}
+  \item \key{Schedule}：$\sigma$ 的分布与采样点选取；
+  \item \key{Sampler}：如何用数值方法解 ODE（Heun / Euler 等）；
+  \item \key{Preconditioning}：网络输入/输出的归一化方式。
+\end{itemize}
+三者可以\textbf{自由组合}，为后续工作（如 DPM-Solver、Flash Diffusion）铺路。
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.72\linewidth, height=4.8cm,
+  xlabel={$\sigma$（噪声标准差）},
+  ylabel={概率密度 / 采样密度},
+  xmin=0.002, xmax=80,
+  xmode=log,
+  ymin=0, ymax=1.15,
+  grid=both,
+  grid style={line width=0.3pt, draw=gray!25},
+  major grid style={line width=0.5pt, draw=gray!40},
+  title={\small EDM Schedule：$\sigma$ 的 Log-Normal 分布（推理采样点分布）},
+  title style={font=\small},
+  label style={font=\small},
+  tick label style={font=\footnotesize},
+  axis line style={gray!60},
+  legend style={font=\footnotesize, at={(0.97,0.97)}, anchor=north east,
+    fill=white, fill opacity=0.9, draw=gray!40},
+]
+% Log-normal PDF: p(sigma) = 1/(sigma * s_sigma * sqrt(2pi)) * exp(-(ln(sigma)-mu)^2 / (2*s^2))
+% EDM default: mu = -1.2 (P_mean), s = 1.2 (P_std) for training
+% In log space (x = ln(sigma)): Gaussian with mean=-1.2, std=1.2
+% Plot as function of sigma (log x-axis): p = 1/(1.2*sqrt(2pi)) * exp(-(ln(sigma)+1.2)^2/(2*1.44))
+\addplot[
+  color=primary, thick, smooth,
+  domain=0.01:80, samples=300,
+]{(1/(1.2*sqrt(2*pi))) * exp(-(ln(x)+1.2)^2 / (2*1.44))};
+\addlegendentry{Log-Normal ($\mu{=}{-}1.2$,\ $\sigma_{\!s}{=}1.2$)}
+% Vertical lines showing typical sigma_min and sigma_max for inference
+\addplot[color=success, dashed, thick, domain=0:1.15] coordinates {(0.002, 0) (0.002, 1.15)};
+\addplot[color=danger, dashed, thick, domain=0:1.15] coordinates {(80, 0) (80, 1.15)};
+\node[font=\footnotesize, color=success, rotate=90, anchor=south] at (axis cs:0.0035, 0.6) {$\sigma_\min$};
+\node[font=\footnotesize, color=danger, rotate=90, anchor=north] at (axis cs:55, 0.6) {$\sigma_\max$};
+\node[font=\footnotesize, color=primary] at (axis cs:0.3, 0.75) {训练采样分布};
+\end{axis}
+\end{tikzpicture}
+\end{center}
+
+% ------------------------------------------------------------
+\subsubsection{三种 Schedule 对比}
+% ------------------------------------------------------------
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{p{2.8cm}p{3.5cm}p{3.5cm}p{3.5cm}}
+\hline
+ & \textbf{Linear} & \textbf{Cosine} & \textbf{EDM} \\
+\hline
+\textbf{时间表示}   & 离散 $t \in \{1,\ldots,T\}$ & 离散 $t \in \{1,\ldots,T\}$ & 连续 $\sigma \in \mathbb{R}^+$ \\
+\textbf{$\bar\alpha_t$ 曲线} & 连乘，前期变化慢 & 余弦，更均匀 & 由 $\sigma$ 隐式定义 \\
+\textbf{信噪比分布} & 不均匀（前期偏高） & 较均匀 & 可自由设计 \\
+\textbf{主要问题}   & 高分辨率训练低效 & 端点可能截断 & 相对复杂 \\
+\textbf{代表作}     & DDPM (2020) & Improved DDPM (2021) & EDM (2022) \\
+\hline
+\end{tabular}
+\end{table}
+
+% ============================================================
+\subsection{Sampling Algorithm：采样算法}
+% ============================================================
+
+\begin{intubox}
+\textbf{直觉：}训练完成后，要从噪声 $x_T$ 生成图像 $x_0$，
+需要反向走若干步。不同 Sampler 的区别就是：\textbf{怎么走这些步更聪明、更快、更准}。
+本质上都是在用不同的数值方法求解同一个 ODE/SDE。
+\end{intubox}
+
+% ------------------------------------------------------------
+\subsubsection{DDPM Sampler（基线，随机采样）}
+% ------------------------------------------------------------
+
+\begin{conceptbox}
+\textbf{DDPM 反向采样：}
+$$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\!\left(
+  x_t - \frac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t, t)
+\right) + \sigma_t z, \qquad z \sim \mathcal{N}(0,\mathbf{I})$$
+\end{conceptbox}
+
+这是\textbf{随机采样（SDE）}——每步都注入随机噪声 $z$。
+
+\begin{itemize}
+  \item \good{优点}：理论完整，生成多样性好；
+  \item \bad{缺点}：必须走满约 1000 步，极慢；随机性导致不可复现。
+\end{itemize}
+
+% ------------------------------------------------------------
+\subsubsection{DDIM（Song et al.\ 2020）——确定性 ODE，可跳步}
+% ------------------------------------------------------------
+
+\begin{intubox}
+\textbf{核心思路：}把 DDPM 的 SDE 变成 ODE——去掉随机项，
+让采样过程\textbf{确定性化}。同一噪声 $x_T$ 始终生成同一张图。
+\end{intubox}
+
+\begin{conceptbox}
+\textbf{DDIM 采样步骤（$\eta = 0$，纯确定性）：}
+$$x_{t-1} = \sqrt{\bar\alpha_{t-1}}
+  \underbrace{\left(\frac{x_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\theta}
+  {\sqrt{\bar\alpha_t}}\right)}_{\text{预测的 }x_0}
+  + \sqrt{1-\bar\alpha_{t-1}}\,\epsilon_\theta(x_t, t)$$
+\end{conceptbox}
+
+\textbf{关键洞察：}每一步都先\key{预测 $x_0$}，再重新加回噪声到上一步的噪声水平。
+
+\textbf{为什么可以跳步？}
+
+\begin{intubox}
+因为 ODE 是确定性的，轨迹是平滑曲线，可以用\textbf{大步长}近似积分。
+DDPM 的随机性让大步长误差极大，DDIM 去掉随机性后
+可以从 1000 步减到 \key{20--50 步}。
+\end{intubox}
+
+\textbf{$\eta$ 参数控制随机性：}
+\begin{itemize}
+  \item $\eta = 0$：纯确定性 DDIM（标准）；
+  \item $\eta = 1$：退化回 DDPM 随机采样。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{常见误区：}
+\begin{itemize}
+  \item \bad{✗}~「DDIM 需要重新训练模型」\;\textbf{→}\;
+        \good{✓}~不需要，直接换采样器即可，复用 DDPM 权重。
+  \item \bad{✗}~「确定性 = 质量更差」\;\textbf{→}\;
+        \good{✓}~步数够多时质量相当，确定性还支持图像插值和编辑。
+\end{itemize}
+\end{warnbox}
+
+% ------------------------------------------------------------
+\subsubsection{DPM-Solver / DPM-Solver++（Lu et al.\ 2022）}
+% ------------------------------------------------------------
+
+\begin{intubox}
+\textbf{核心思路：}DDIM 本质是用欧拉法（一阶）求解 ODE，
+DPM-Solver 用\textbf{高阶数值积分}（类似 Runge-Kutta），
+大幅减少离散化误差，步数更少、质量更高。
+\end{intubox}
+
+\begin{conceptbox}
+\textbf{概率流 ODE（连续形式）：}
+$$\frac{dx}{d\sigma} = -\sigma\,\nabla_x \log p_\sigma(x)
+  \;\approx\; \frac{x - D_\theta(x,\sigma)}{\sigma}$$
+
+DPM-Solver 对这个方程做\textbf{解析积分 + Taylor 展开}，
+二阶精度只需 \key{10--20 步}即可达到 DDIM 50 步的质量。
+\end{conceptbox}
+
+\begin{summarybox}
+\textbf{面试一句话：}DPM-Solver 是在 ODE 求解器层面的优化，
+用更高阶的数值方法减少离散化误差，本质是比 DDIM 欧拉法更「聪明」的积分器，
+所以步数少但质量不掉。
+\end{summarybox}
+
+\textbf{DPM-Solver++ 的改进：}在 DPM-Solver 基础上引入 $x_0$ 预测参数化
+（而非 $\epsilon$ 参数化），在 guidance 场景（如 CFG）下更稳定。
+
+% ------------------------------------------------------------
+\subsubsection{其他常见 Sampler 速览}
+% ------------------------------------------------------------
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{p{3.2cm}p{5.5cm}p{2.5cm}p{2cm}}
+\hline
+\textbf{Sampler} & \textbf{核心特点} & \textbf{典型步数} & \textbf{类型} \\
+\hline
+DDPM       & SDE，每步加噪，标准基线 & $\sim$1000 步 & SDE \\
+DDIM       & 确定性 ODE，欧拉法，可跳步 & 20--50 步 & ODE \\
+PLMS       & 多步预测器-校正器（Adams 法） & $\sim$20 步 & ODE \\
+DPM-Solver & 高阶泰勒积分，最优精度 & 10--20 步 & ODE \\
+DPM-Solver++ & DPM-Solver + $x_0$ 预参数化，CFG 友好 & 10--20 步 & ODE \\
+UniPC      & 统一预测-校正，自适应阶数 & $\sim$10 步 & ODE \\
+Euler (FM) & Flow Matching 欧拉法，直线轨迹 & 20--50 步 & ODE \\
+LCM / Consistency & 蒸馏 ODE 轨迹，直接预测 $x_0$ & \key{1--4 步} & 蒸馏 \\
+\hline
+\end{tabular}
+\end{table}
+
+% ============================================================
+\subsection{Schedule 与 Sampler 的关系}
+% ============================================================
+
+\begin{conceptbox}
+\textbf{串联视角：}
+\begin{enumerate}
+  \item \key{训练时}：Schedule 决定如何构造 $(x_t, t, \epsilon)$ 训练对；
+        模型学会从 $x_t$ 预测 $\epsilon$（或 $x_0$，或 $v$）。
+  \item \key{推理时}：Sampler 决定如何从 $x_T$ 一步步还原到 $x_0$；
+        Sampler \textbf{需要读取 Schedule 定义的 $\bar\alpha_t$}
+        来计算每步去噪的幅度。
+  \item \key{联系}：Schedule 和 Sampler 原则上独立，但组合不当会有误差
+        （如 Cosine schedule + DDIM 高步数一般，
+        EDM schedule + DPM-Solver 效果最佳）。
+\end{enumerate}
+\end{conceptbox}
+
+\begin{lstlisting}[language={}]
+训练时：
+  Schedule  →  构造 (x_t, ε) 训练对  →  模型学到 ε_θ / v_θ / x_0预测
+                         ↓
+推理时：
+  Sampler 读取 ᾱ_t（由 Schedule 定义）
+       →  决定每步去噪幅度
+       →  从 x_T 走到 x_0
+
+工业界常见组合：
+  SD 1.x / 2.x   ：Linear/Cosine schedule + DDIM / DPM-Solver++
+  SDXL            ：Cosine schedule + DPM-Solver++
+  SD3 / FLUX      ：Flow Matching（线性路径）+ Euler ODE
+\end{lstlisting}
+
+% ============================================================
+\subsection{面试高频问题 \& 答题要点}
+% ============================================================
+
+\paragraph{Q1：DDIM 和 DDPM 的区别？}
+
+\begin{conceptbox}
+DDPM 是随机采样（SDE），每步需要注入随机噪声，需要约 1000 步。
+DDIM 把它变成确定性 ODE，去掉随机项后轨迹变平滑，
+可以用大步长近似积分，加速到 20--50 步。
+\textbf{不需要重新训练，直接换采样器。}
+同一 $x_T$ 始终生成同一张图，支持图像插值与编辑。
+\end{conceptbox}
+
+\paragraph{Q2：为什么 Cosine Schedule 比 Linear 好？}
+
+\begin{conceptbox}
+Linear schedule 在前期（接近原图的时间步）$\bar\alpha_t$ 变化极慢，
+浪费训练资源；在高分辨率下尤其严重。
+Cosine schedule 让信噪比均匀地覆盖整个时间轴，
+模型在每个时间步都能得到有效的训练信号。
+\end{conceptbox}
+
+\paragraph{Q3：DPM-Solver 凭什么只需 10 步？}
+
+\begin{conceptbox}
+DDIM 用欧拉法（一阶）求解 ODE，步长大时截断误差大。
+DPM-Solver 对概率流 ODE 做了解析积分配合高阶 Taylor 展开，
+减少离散化误差，本质是更聪明的数值积分器。
+同样步长下积分更精准，所以 10--15 步就能达到 DDIM 50 步的质量。
+\end{conceptbox}
+
+\paragraph{Q4：Flow Matching 和 DDPM Sampler 有什么关系？}
+
+\begin{conceptbox}
+都是在求解「把噪声变成数据」的向量场，推理时都可以用 ODE Solver 求解。
+区别在于：
+\begin{itemize}
+  \item \key{路径形状}：DDPM 是弯曲的方差调度路径；FM 是线性插值路径（更直）；
+  \item \key{训练目标}：DDPM 预测 $\epsilon$；FM 预测速度 $v = x_1 - x_0$；
+  \item \key{兼容性}：两者网络权重不能互用，FM \warn{必须重新训练}。
+\end{itemize}
+\end{conceptbox}
+
+\paragraph{Q5：为什么 DDIM 一步不行，Consistency Model 怎么解决的？}
+
+\begin{conceptbox}
+DDIM 用欧拉法近似 ODE，一步跨越 $T \to 0$ 的积分误差极大，
+无法保证走到正确的 $x_0$。
+
+Consistency Model 的思路是：\textbf{直接蒸馏训练一个映射}
+$f_\theta(x_t, t) \to x_0$，使得同一条 ODE 轨迹上任意时刻都映射到同一个 $x_0$
+（自洽性）。不再需要积分，直接「传送」到目标，1--3 步即可高质量生成。
+代价是需要预训练扩散模型作为教师（Consistency Distillation）。
+\end{conceptbox}
+
+% ============================================================
+\subsection{关键公式速查}
+% ============================================================
+
+\begin{summarybox}
+\renewcommand{\arraystretch}{1.7}
+\begin{tabular}{p{7cm}p{6.5cm}}
+\hline
+\textbf{公式} & \textbf{含义} \\
+\hline
+$\bar\alpha_t = \prod_{s=1}^{t}(1-\beta_s)$
+  & Linear schedule 定义 \\[4pt]
+$\bar\alpha_t = \cos^2\!\!\left(\dfrac{t/T+s}{1+s}\cdot\dfrac{\pi}{2}\right)\bigg/\cos^2\!\!\left(\dfrac{s}{1+s}\cdot\dfrac{\pi}{2}\right)$
+  & Cosine schedule 定义 \\[8pt]
+$x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$
+  & 任意时刻加噪（重参数化） \\[4pt]
+$x_{t-1} = \dfrac{1}{\sqrt{\alpha_t}}\!\left(x_t
+  - \dfrac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}}\epsilon_\theta\right) + \sigma_t z$
+  & DDPM 反向采样（SDE） \\[8pt]
+$\hat{x}_0 = \dfrac{x_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\theta}{\sqrt{\bar\alpha_t}}$
+  & DDIM 预测 $x_0$ \\[8pt]
+$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat{x}_0
+  + \sqrt{1-\bar\alpha_{t-1}}\,\epsilon_\theta(x_t,t)$
+  & DDIM 采样步骤（ODE） \\[4pt]
+\hline
+\end{tabular}
+\end{summarybox}
+
+% ============================================================
+\subsection{下一步建议}
+% ============================================================
+
+\begin{itemize}
+  \item \key{马上可以看的 1}：Karras et al.\ EDM (2022) Figure~1 和 Table~1——
+        把所有 Schedule/Sampler 的关系用一张图说清楚，面试答题直接用这个框架；
+  \item \key{马上可以看的 2}：Consistency Models (Song et al.\ 2023)，
+        搞清楚 CD（有教师蒸馏）vs CT（从零训练）的区别；
+  \item \key{代码实践}：\code{diffusers} 库中
+        \code{DDIMScheduler} 和 \code{DPMSolverMultistepScheduler}，
+        看 \code{step()} 函数即可看到上述公式的实现。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{思考题：}DDIM 能跳步，能不能只用 1 步？为什么不行？
+Consistency Model 是怎么解决这个问题的？
+
+\medskip
+\note{提示：1 步 DDIM 等价于用欧拉法一步积分 $T \to 0$，
+步长极大导致误差爆炸。CM 绕开了积分，直接学映射。}
+\end{warnbox}
+
+\begin{conceptbox}
+\textbf{思考题解答}
+
+\medskip
+\textbf{为什么 1 步 DDIM 不行？}
+
+DDIM 本质上是在用数值方法求解一个 \key{概率流 ODE}：
+\[
+  \frac{dx}{dt} = -\frac{1}{2}\,\frac{d\log\sigma_t^2}{dt}
+  \left[x - \frac{\hat{x}_0(x,t)}{\sigma_t^2/(1+\sigma_t^2)}\right]
+\]
+DDIM 每一步相当于一阶欧拉积分：$x_{t-\Delta t} \approx x_t + f(x_t, t)\cdot\Delta t$。
+当步数足够多（50--1000步），每步 $\Delta t$ 很小，一阶近似误差也很小，最终积分到 $x_0$ 是可信的。
+
+但如果把所有步数压缩到 \textbf{1 步}，等价于 $\Delta t = T$（从 $t=T$ 一步跳到 $t=0$），这一步的 \warn{截断误差} 正比于步长的平方，即 $O(T^2)$——极其巨大。模型预测的 $\epsilon_\theta(x_T, T)$ 是基于纯噪声的，完全没有数据结构信息，一阶欧拉法用这样一个粗糙的梯度方向走一大步，最终落点离真正的 $x_0$ 数据流形十万八千里。
+
+直观类比：想象你要沿着弯曲山路开车从山顶（$x_T$）开到山脚（$x_0$），多步 ODE 是一段一段地精确跟随路面弯曲前进；1 步 DDIM 是在山顶看一眼大方向直接猛踩油门，大概率飞出山崖。
+
+\medskip
+\textbf{Consistency Model 是怎么解决的？}
+
+核心思想：\key{绕开积分，直接学习映射}。
+
+Consistency Model（CM，Song et al.\ 2023）训练一个函数 $f_\theta(x_t, t)$，满足\textbf{自洽性（Self-Consistency Property）}：
+\[
+  f_\theta(x_t, t) = f_\theta(x_{t'}, t') = x_0
+  \quad \forall\, t,\, t' \text{ 在同一条 ODE 轨迹上}
+\]
+无论你在 ODE 轨迹的哪个时刻 $t$ 采样，$f_\theta$ 都直接输出轨迹终点 $x_0$。推理时完全不需要数值积分，而是：
+
+\begin{enumerate}
+  \item 从 $x_T \sim \mathcal{N}(0, I)$ 出发，\textbf{一步}得到 $\hat{x}_0 = f_\theta(x_T, T)$；
+  \item 若想提升质量，可做 2--3 步「Restart」：对 $\hat{x}_0$ 重新加噪到中间时刻 $t'$，再用 $f_\theta$ 映射回，逐步细化。
+\end{enumerate}
+
+\textbf{两种训练方式：}
+\begin{itemize}
+  \item \key{Consistency Distillation (CD)}：有教师扩散模型，用 ODE Solver 生成相邻时刻对 $(x_t, x_{t-\delta})$，
+        监督 $f_\theta(x_t,t) \approx f_\theta(x_{t-\delta}, t-\delta)$（自洽损失）。
+        质量好，但依赖预训练教师。
+  \item \key{Consistency Training (CT)}：无教师，直接从随机噪声配对训练，
+        代价是质量略低，但不需要扩散模型。
+\end{itemize}
+
+\textbf{为什么 CM 能 1 步生成？} 因为它的训练目标就是让 $f_\theta$ \textbf{在整条 ODE 轨迹上都正确}，而不是学习一个局部梯度方向。它把原来需要 50 步积分才能走完的路，用一次「传送」替代，代价是训练时需要更强的监督信号（要么教师模型，要么更多数据）。
+\end{conceptbox}
+
+\medskip
+\note{推荐资源：
+DDPM (Ho et al.\ 2020),
+Improved DDPM (Nichol \& Dhariwal 2021),
+DDIM (Song et al.\ 2021),
+DPM-Solver (Lu et al.\ 2022),
+EDM (Karras et al.\ 2022),
+Consistency Models (Song et al.\ 2023),
+Flow Matching (Lipman et al.\ 2022; Liu et al.\ 2022),
+LCM (Luo et al.\ 2023),
+ADD / SDXL-Turbo (Sauer et al.\ 2023),
+\emph{diffusers} 源码 \url{https://github.com/huggingface/diffusers}}
+
+% ============================================================
+\subsection{前沿进展：更新的 Schedule（2022--2024）}
+% ============================================================
+
+\begin{intubox}
+\textbf{为什么需要更新的 Schedule？}
+
+Linear / Cosine / EDM 三套经典 Schedule 各有局限：Linear 在高分辨率下过早破坏结构；
+Cosine 在极高分辨率下信噪比仍然失衡；EDM 虽然灵活，但超参数敏感。
+2022 年以来的工作从 \key{路径线性化}、\key{分辨率感知} 两个方向显著改进了训练效率与生成质量。
+\end{intubox}
+
+% ----------------------------------------
+\subsubsection{Rectified Flow / Flow Matching 线性路径}
+% ----------------------------------------
+
+\paragraph{基本思想}
+
+Liu et al.\ (2022) 的 \key{Rectified Flow} 与 Lipman et al.\ (2022) 的 \key{Flow Matching}
+几乎同时提出了相同的核心想法：用\textbf{线性插值路径}连接数据 $x_0$ 和噪声 $x_1 \sim \mathcal{N}(0,I)$：
+\[
+  x_t = (1-t)\,x_0 + t\,x_1, \quad t \in [0,1]
+\]
+
+这不是一个加噪的 Schedule，而是直接定义\textbf{流的路径}。训练目标是预测速度场：
+\[
+  v_\theta(x_t, t) \approx x_1 - x_0
+\]
+推理时用 ODE Solver：$x_{t+\Delta t} = x_t + v_\theta(x_t, t)\cdot\Delta t$，从 $t=1$（纯噪声）积分到 $t=0$（数据）。
+
+\begin{conceptbox}
+\textbf{线性路径的核心优势}
+
+\begin{itemize}
+  \item \key{轨迹更直}：DDPM 的扩散路径是弯曲的（方差调度驱动），FM 路径是直线，
+        ODE Solver 需要更少步数就能精确积分，减少离散化误差；
+  \item \key{训练更稳定}：速度目标 $v = x_1 - x_0$ 是常数（对给定数据对），
+        不依赖时间步，梯度信号更均匀；
+  \item \key{无需 Schedule 超参数}：不需要 $\beta_t$ 序列或 $\sigma_t$，路径完全由线性插值决定；
+  \item \key{SNR 对称}：$t=0.5$ 处信噪比恰好为 1，训练信号在时间轴上分布更均衡。
+\end{itemize}
+\end{conceptbox}
+
+\paragraph{Reflow：轨迹进一步线性化}
+
+实践中，即使路径定义为直线，由于不同数据对 $(x_0, x_1)$ 的对应关系是随机采样的，
+实际期望速度场仍有弯曲。\key{Reflow} 通过迭代「用前一个模型生成配对 $(x_0, x_1)$，
+再重新训练」来减少轨迹交叉，使路径越来越直，最终支持 1--2 步高质量采样。
+
+\paragraph{应用：SD3 与 FLUX}
+
+Stable Diffusion 3（Esser et al.\ 2024）和 FLUX（Black Forest Labs 2024）
+均采用 Flow Matching 线性路径，配合 DiT 架构（Transformer-based diffusion），
+在文生图质量和训练效率上显著超越基于 DDPM 的 SD 1/2/XL。
+
+\begin{summarybox}
+\textbf{FM vs DDPM Schedule 对比一览}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{p{3.5cm}p{5cm}p{5cm}}
+\hline
+\textbf{维度} & \textbf{DDPM/Cosine Schedule} & \textbf{Flow Matching 线性路径} \\
+\hline
+路径形状       & 弯曲（方差调度驱动）   & 直线插值 \\
+训练目标       & $\epsilon$ 预测 / $v$ 预测 & 速度 $v = x_1 - x_0$ \\
+所需步数       & 50--1000（DDPM），10--50（DDIM）& 20--50（一般），1--4（Reflow 后）\\
+超参数         & $\beta_{\min}, \beta_{\max}$ 或 $s$ & 无额外超参数 \\
+典型代表       & DDPM, DDIM, SD 1/2, SDXL & SD3, FLUX, InstaFlow \\
+\hline
+\end{tabular}
+\end{summarybox}
+
+% ----------------------------------------
+\subsubsection{Simple Diffusion：高分辨率感知 Schedule（Hoogeboom et al.\ 2023）}
+% ----------------------------------------
+
+\paragraph{问题背景}
+
+将 Cosine Schedule 直接用于高分辨率图像（如 $512\times512$ 或 $1024\times1024$）时，
+存在一个隐藏问题：在同等 SNR 下，\textbf{高分辨率图像的每个 patch 噪声是独立的}，
+整体图像结构（低频信息）反而在较低的噪声水平就被破坏，导致模型难以在高噪声阶段学到有效的全局信息。
+
+\paragraph{核心改进：SNR Shifting}
+
+Hoogeboom et al.\ (2023) 提出根据图像分辨率对 Schedule 做\textbf{偏移（Shift）}：
+\[
+  \mathrm{SNR}(t)_{\text{shifted}} = \frac{\mathrm{SNR}(t)}{1 + (r^2 - 1)\cdot\mathrm{SNR}(t)}
+\]
+其中 $r = d / d_{\text{ref}}$，$d$ 为当前分辨率，$d_{\text{ref}}$ 为参考分辨率（通常 $64\times64$）。
+效果是高分辨率下自动降低 SNR（提高噪声水平），使模型在更高噪声阶段仍能接收到丰富的结构信息。
+
+\begin{intubox}
+\textbf{直觉}：想象在低分辨率 $8\times8$ 的图像上加 50\% 噪声，整体轮廓还清晰可见；
+但在 $1024\times1024$ 的图像上加同样比例的噪声，每个像素的随机性被平均掉，
+反而低频结构已经完全被破坏了。SNR Shifting 的作用就是确保不同分辨率下，
+模型「看到的」噪声难度是一致的。
+\end{intubox}
+
+\paragraph{其他贡献}
+
+Simple Diffusion 还发现：
+\begin{itemize}
+  \item \key{多分辨率训练}：从低分到高分渐进训练，显著加速收敛；
+  \item \key{噪声水平对高频/低频分离}：高噪声阶段学习低频结构，低噪声阶段学习高频细节；
+  \item \key{Schedule 影响远大于架构改进}：在高分辨率任务上，正确的 Schedule 带来的 FID 提升超过很多结构创新。
+\end{itemize}
+
+% ----------------------------------------
+\subsubsection{EDM2：量级保持架构与改进训练动态（Karras et al.\ 2024）}
+% ----------------------------------------
+
+EDM（2022）主要贡献在于统一了 Schedule 与 Preconditioning 框架；
+EDM2（Karras et al.\ 2024）进一步解决了 \key{训练稳定性} 问题，
+提出\textbf{量级保持（Magnitude-Preserving，MP）架构}。
+
+\begin{conceptbox}
+\textbf{EDM2 的核心改进}
+
+\begin{itemize}
+  \item \key{量级保持操作}：每一层的权重和激活值的 $\ell_2$ 范数被主动归一化，
+        确保信号在前向传播中不发生量级爆炸或消失，消除了对 BatchNorm / LayerNorm 的依赖；
+  \item \key{改进 Preconditioning}：基于分析网络输入/输出的统计量，
+        自适应地调整 $c_\text{skip}, c_\text{out}$ 等缩放因子，
+        确保不同噪声水平下的训练损失量级一致（不再需要手动调整损失权重）；
+  \item \key{更大模型，更好效果}：EDM2-XXL 在 ImageNet $64\times64$ 上达到
+        FID $< 1.0$，是当时无条件生成的 SOTA；
+  \item \key{指导蒸馏友好}：EDM2 框架的 Preconditioning 天然兼容 CFG 蒸馏，
+        为后续快速采样方法提供更好的教师模型。
+\end{itemize}
+\end{conceptbox}
+
+% ============================================================
+\subsection{前沿进展：更新的 Sampler 与蒸馏方法（2023--2024）}
+% ============================================================
+
+\begin{intubox}
+\textbf{这个方向的整体趋势}
+
+经典 Sampler（DDIM、DPM-Solver++）把步数从 1000 步压到 10--20 步，
+已经是数值方法的极限。2023 年起，研究转向\textbf{训练介入}：
+要么训练一个专门的快速采样器（蒸馏），要么直接改变模型让它天生支持少步生成。
+目标是 \key{1--4 步高质量生成}，同时不牺牲多样性或训练一致性。
+\end{intubox}
+
+% ----------------------------------------
+\subsubsection{Restart Sampler（Xu et al.\ 2023）}
+% ----------------------------------------
+
+\begin{conceptbox}
+\textbf{核心思想}：在 ODE 求解过程中周期性地\textbf{重新加噪再去噪}（Restart），
+让轨迹有机会修正之前积累的误差，而无需重新训练模型。
+
+\textbf{算法步骤}：
+\begin{enumerate}
+  \item 正常 ODE 积分从 $x_T$ 到某个中间状态 $x_{t_\text{restart}}$；
+  \item 对当前状态加少量噪声：$x' = \sqrt{1-\gamma^2}\,x_{t_\text{restart}} + \gamma\epsilon$；
+  \item 从 $x'$ 继续去噪到 $x_0$。
+\end{enumerate}
+
+\textbf{效果}：在不增加训练开销的情况下，显著改善 FID，
+尤其对之前积分误差大（Heun 法收敛慢的难样本）效果明显。
+代价是每次 Restart 需要额外的函数求值（NFE 增加）。
+\end{conceptbox}
+
+% ----------------------------------------
+\subsubsection{LCM：Latent Consistency Model（Luo et al.\ 2023）}
+% ----------------------------------------
+
+\paragraph{背景}
+
+Consistency Model（CM）原本在像素空间工作，直接蒸馏 SD 的 UNet 到潜变量空间得到 \key{LCM}。
+
+\begin{conceptbox}
+\textbf{LCM 的关键设计}
+
+\begin{itemize}
+  \item \key{跳步增广 ODE}：传统 CM 在相邻时刻 $t, t-1$ 之间建立自洽约束，
+        LCM 扩展到跳步配对 $(t, t-k)$，$k$ 可以是 20--50 步，
+        让模型学会「长程自洽」，即从任意位置直接映射到终点；
+  \item \key{CFG 蒸馏内化}：把 Classifier-Free Guidance 的缩放效果
+        通过蒸馏嵌入模型权重，推理时无需额外的 CFG forward pass；
+  \item \key{LoRA 快速适配（LCM-LoRA）}：只训练约 67M 参数的 LoRA 权重，
+        可插拔到任意基于 SDXL 的微调模型上，极大降低部署成本。
+\end{itemize}
+
+\textbf{性能}：4 步生成质量接近 SDXL 50 步 DPM-Solver++，
+1 步生成可接受但细节较弱。
+\end{conceptbox}
+
+% ----------------------------------------
+\subsubsection{ADD / SDXL-Turbo：对抗蒸馏（Sauer et al.\ 2023）}
+% ----------------------------------------
+
+\begin{conceptbox}
+\textbf{核心创新：Score Distillation + GAN 判别器}
+
+ADD（Adversarial Diffusion Distillation）同时使用两个监督信号：
+\begin{itemize}
+  \item \key{Score Distillation Loss}：用大的教师扩散模型（SDXL）
+        提供分布级别的梯度方向，保持生成分布接近教师；
+  \item \key{GAN 判别器 Loss}：用一个与编码器共享权重的多尺度判别器
+        区分生成图与真实图，强制高频细节的真实性。
+\end{itemize}
+
+两者互补：Score Distillation 保整体分布，GAN 保局部细节。
+SDXL-Turbo 在 \textbf{1 步}下生成质量已经可以在很多场景替代 SDXL 20+ 步，
+是目前实时生成领域的重要里程碑。
+\end{conceptbox}
+
+\begin{warnbox}
+ADD 的局限：训练开销大（需要同时训练判别器）；
+1 步时多样性偏低（Mode-seeking 倾向）；
+对训练数据分布外的 prompt 泛化能力弱于完整扩散模型。
+\end{warnbox}
+
+% ----------------------------------------
+\subsubsection{PCM / TCD / Hyper-SD：一致性蒸馏的后继工作}
+% ----------------------------------------
+
+\paragraph{PCM：Phased Consistency Model（Wang et al.\ 2024）}
+
+\begin{conceptbox}
+LCM 统一用一个模型完成全时间轴的 1 步映射，导致训练信号过于复杂。
+PCM 将时间轴分成若干\textbf{阶段（Phase）}，每个阶段内独立训练一个一致性映射：
+\begin{itemize}
+  \item 每阶段只需映射约 $T/K$ 步长，训练难度大幅降低；
+  \item 推理时按阶段串联，$K$ 步即可；
+  \item 支持 1/2/4/8 步灵活配置，高步数下质量显著优于 LCM。
+\end{itemize}
+\end{conceptbox}
+
+\paragraph{TCD：Trajectory Consistency Distillation（Zheng et al.\ 2024）}
+
+\begin{conceptbox}
+TCD 的核心观察：LCM 的跳步 ODE 使用的是\textbf{概率流 ODE}（确定性），
+但实际扩散轨迹有随机性（SDE）。TCD 设计了一个\textbf{半线性扩散 ODE}，
+使得轨迹更直、自洽约束更易满足：
+\begin{itemize}
+  \item 引入 $\gamma$ 参数控制随机性与确定性之间的平衡；
+  \item 推理时可配合 $\eta$ 参数调整样本多样性，在步数-质量权衡上优于 LCM；
+  \item 同样支持 LoRA 高效适配。
+\end{itemize}
+\end{conceptbox}
+
+\paragraph{Hyper-SD（Ren et al.\ 2024）}
+
+\begin{conceptbox}
+Hyper-SD 提出\textbf{统一轨迹分段一致性蒸馏（UTCD）}，结合了：
+\begin{itemize}
+  \item 分段一致性（类 PCM）降低每段训练难度；
+  \item 人类反馈对齐（Score Distillation from Human Preference Model）提升美学质量；
+  \item 1-step LoRA 通过额外对抗训练提升细节。
+\end{itemize}
+在 1 步和 2 步下，Hyper-SD 的人类偏好评分超过 SDXL-Turbo，
+是当时（2024 Q1）单步蒸馏质量最高的方法之一。
+\end{conceptbox}
+
+\begin{summarybox}
+\textbf{蒸馏方法横向对比}
+\renewcommand{\arraystretch}{1.6}
+\begin{tabular}{p{3cm}p{2.5cm}p{3cm}p{4.5cm}}
+\hline
+\textbf{方法} & \textbf{最优步数} & \textbf{核心机制} & \textbf{主要局限} \\
+\hline
+LCM (2023)      & 4 步        & 跳步一致性蒸馏      & 1 步质量有限，多样性偏低 \\
+ADD/Turbo (2023) & 1--4 步    & Score Distill + GAN & 训练成本高，OOD 泛化弱 \\
+PCM (2024)      & 2--8 步     & 分阶段一致性映射    & 推理需串联多个阶段 \\
+TCD (2024)      & 1--8 步     & 半线性 ODE 一致性   & 超参数 $\gamma$ 需调整 \\
+Hyper-SD (2024) & 1--8 步     & UTCD + 人类偏好对齐 & 蒸馏流程复杂 \\
+\hline
+\end{tabular}
+\end{summarybox}
+
+% ----------------------------------------
+\subsubsection{知识体系更新：Schedule 与 Sampler 的全貌（截至 2024）}
+% ----------------------------------------
+
+\begin{summarybox}
+\textbf{完整知识地图（2020--2024）}
+
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{p{3cm}p{3.5cm}p{3.5cm}p{3cm}}
+\hline
+\textbf{时期} & \textbf{Schedule 进展} & \textbf{Sampler 进展} & \textbf{代表模型} \\
+\hline
+2020--2021 & Linear, Cosine        & DDPM, DDIM, PLMS    & DDPM, DALL-E \\
+2022       & EDM, RF/FM 线性路径   & DPM-Solver, EDM Sampler, Heun & SD 1/2, InstaFlow \\
+2023       & Simple Diffusion SNR  & DPM-Solver++, UniPC, Restart & SDXL, SD3 开发中 \\
+           &                       & LCM, ADD/Turbo, CM  & SDXL-Turbo \\
+2024       & EDM2 MP 架构          & PCM, TCD, Hyper-SD  & SD3, FLUX, HiDream \\
+\hline
+\end{tabular}
+
+\medskip
+整体趋势：Schedule 向\good{线性化、分辨率感知}发展；
+Sampler 向\good{蒸馏驱动的 1--4 步生成}发展；
+两者最终在 \key{Flow Matching + 一致性蒸馏} 的范式下统一。
+\end{summarybox}

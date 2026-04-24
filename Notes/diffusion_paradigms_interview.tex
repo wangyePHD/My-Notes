@@ -1,0 +1,1107 @@
+% ============================================================
+% 扩散模型三大范式：DDPM / DDIM / Flow Matching
+% 面试速查笔记 · 2026/04/11
+% ============================================================
+
+\section{扩散模型三大范式：DDPM / DDIM / Flow Matching}
+
+\note{面试速查笔记 · 2026/04/11 \quad 已有基础：了解 DDPM、DDIM、Flow Matching
+各自的大致概念，但不清楚三者的内在联系与区别。}
+
+% ------------------------------------------------------------
+\subsection*{知识地图}
+% ------------------------------------------------------------
+
+\begin{lstlisting}[language={}]
+[概率扩散 DDPM ✓]
+       ↓ 加速采样（确定性化）
+[DDIM ✓]  ← 去掉随机性，DDPM 的特例
+       ↓ 换一套框架（直线路径 + 速度场）
+[Flow Matching ✓]  ← 更通用、更高效的生成框架
+
+三者本质：都是在学习"把噪声变成数据"的路径
+区别：路径形状不同 / 训练目标不同 / 采样效率不同
+\end{lstlisting}
+
+% ============================================================
+\subsection{DDPM：扩散模型的奠基}
+% ============================================================
+
+\begin{intubox}
+\textbf{直觉：}往图片里一点点加噪声，训练模型学会反向一步步去噪。
+\end{intubox}
+
+\subsubsection*{正向过程（加噪）}
+
+将数据 $x_0$ 逐步加噪，共 $T$ 步（通常 $T = 1000$）：
+
+\begin{conceptbox}
+\textbf{逐步加噪（马尔可夫链）：}
+$$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(x_t;\; \sqrt{1-\beta_t}\, x_{t-1},\;
+\beta_t \mathbf{I}\right)$$
+
+利用重参数化技巧，可以\textbf{一步到位}采样任意时刻的噪声图：
+$$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon,
+\qquad \epsilon \sim \mathcal{N}(0, \mathbf{I})$$
+
+其中 $\displaystyle\bar{\alpha}_t = \prod_{s=1}^{t}(1 - \beta_s)$。
+\end{conceptbox}
+
+\subsubsection*{训练目标}
+
+训练网络 $\epsilon_\theta$ 预测加入的噪声：
+
+\begin{conceptbox}
+\textbf{DDPM 训练损失：}
+$$\mathcal{L} = \mathbb{E}_{t,\, x_0,\, \epsilon}\!\left[
+  \|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]$$
+\end{conceptbox}
+
+\subsubsection*{反向采样（去噪）}
+
+逐步去噪，\warn{每步都要加随机噪声}（马尔可夫链）：
+
+$$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\!\left(
+  x_t - \frac{\beta_t}{\sqrt{1-\bar{\alpha}_t}}\,\epsilon_\theta(x_t, t)
+\right) + \sigma_t z, \qquad z \sim \mathcal{N}(0,\mathbf{I})$$
+
+\subsubsection*{核心特点}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{ll}
+\hline
+\textbf{特征} & \textbf{说明} \\
+\hline
+路径形状 & 随机游走（非直线），轨迹弯曲 \\
+采样步数 & 需要约 \textbf{1000 步}，很慢 \\
+随机性   & 每步都注入噪声，采样是随机的 \\
+理论基础 & 非平衡热力学 / 随机微分方程（SDE） \\
+训练目标 & 预测噪声 $\epsilon$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{warnbox}
+\textbf{常见误区：}
+\begin{itemize}
+  \item \bad{✗}~「DDPM 每步只能去噪一点」\;\textbf{→}\;
+        \good{✓}~正向加噪可以一步跳到任意 $t$，但\textbf{反向采样}确实是逐步的。
+  \item \bad{✗}~「$T$ 越大越好」\;\textbf{→}\;
+        \good{✓}~$T$ 大精度高但采样慢，需要权衡。
+\end{itemize}
+\end{warnbox}
+
+% ============================================================
+\subsection{DDIM：DDPM 的确定性加速版}
+% ============================================================
+
+\begin{intubox}
+\textbf{直觉：}DDPM 的反向过程是随机的（每步加噪声），DDIM 把这个随机性去掉，
+换成确定性 ODE，从而可以\textbf{大步跳跃}。
+\end{intubox}
+
+\subsubsection*{关键推导}
+
+DDPM 的反向过程本质上对应一个 SDE。DDIM 找到了它对应的\key{确定性 ODE}
+（概率流 ODE）：
+
+\begin{conceptbox}
+\textbf{DDIM 采样步骤（无随机噪声项）：}
+$$x_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\;
+  \underbrace{\left(
+    \frac{x_t - \sqrt{1-\bar{\alpha}_t}\,\epsilon_\theta}{\sqrt{\bar{\alpha}_t}}
+  \right)}_{\text{预测的 }x_0}
+  \;+\;
+  \underbrace{\sqrt{1-\bar{\alpha}_{t-1}}\,\epsilon_\theta}_{\text{方向项}}$$
+
+注意：\warn{这里没有随机噪声项 $z$}，完全确定！
+\end{conceptbox}
+
+\subsubsection*{DDIM 和 DDPM 的关系}
+
+DDIM 是 DDPM 的特例（$\eta = 0$ 时），两者使用\textbf{同一个训练好的模型}，只是
+采样方式不同。参数 $\eta \in [0, 1]$ 控制随机性：
+
+\begin{itemize}
+  \item $\eta = 0$：纯确定性 DDIM；
+  \item $\eta = 1$：退化回 DDPM 的随机采样。
+\end{itemize}
+
+\subsubsection*{为什么可以跳步？}
+
+\begin{intubox}
+因为 ODE 是确定性的，轨迹是平滑曲线，可以用\textbf{大步长}近似积分（DDPM 的随机性
+让大步长误差很大）。DDPM 需要 1000 步，DDIM 只需 20\,--\,50 步即可。
+\end{intubox}
+
+\begin{warnbox}
+\textbf{常见误区：}
+\begin{itemize}
+  \item \bad{✗}~「DDIM 需要重新训练模型」\;\textbf{→}\;
+        \good{✓}~\textbf{不需要}，直接换采样器就行。
+  \item \bad{✗}~「DDIM 比 DDPM 质量差」\;\textbf{→}\;
+        \good{✓}~步数够多时质量相当，某些情况甚至更好（消除了随机误差）。
+\end{itemize}
+\end{warnbox}
+
+% ============================================================
+\subsection{Flow Matching：更优雅的新范式}
+% ============================================================
+
+\begin{intubox}
+\textbf{直觉：}不走弯路，直接走直线！Flow Matching 用线性插值定义「噪声 $\to$ 数据」
+的最优传输路径，训练模型学习这条直线的\textbf{速度场}。
+\end{intubox}
+
+\subsubsection*{符号约定}
+
+\begin{warnbox}
+\warn{注意：Flow Matching 的时间方向与 DDPM \textbf{相反}！}
+\begin{itemize}
+  \item $x_0$：\key{真实数据}（干净图片），$t = 0$；
+  \item $x_1$：\key{纯噪声}，$t = 1$；
+  \item 推理方向：从 $x_1$（噪声）积分走到 $x_0$（图片）。
+\end{itemize}
+\end{warnbox}
+
+\subsubsection*{正向路径（Rectified Flow）}
+
+任意时刻的「混合样本」定义为\key{线性插值}：
+
+\begin{conceptbox}
+\textbf{Flow Matching 路径（直线！）：}
+$$x_t = (1-t)\,x_0 + t\,x_1, \qquad t \in [0, 1]$$
+
+相比 DDPM 的弯曲随机游走路径，Flow Matching 的路径是\textbf{最短的}。
+\end{conceptbox}
+
+\subsubsection*{训练目标：回归速度场}
+
+\begin{conceptbox}
+\textbf{Flow Matching 训练损失：}
+$$\mathcal{L}(\theta) = \mathbb{E}_{t,\; x_0,\; x_1}\!\left[
+  \|v_\theta(x_t, t) - (x_1 - x_0)\|^2\right]$$
+
+目标速度 $x_1 - x_0$ 是\textbf{常数}——方向就是从数据指向噪声，一直不变。
+\end{conceptbox}
+
+\subsubsection*{推理：ODE 积分}
+
+从 $x_1$ 出发，跟着速度场走：
+
+$$\frac{dx_t}{dt} = v_\theta(x_t, t)
+  \quad\Longrightarrow\quad
+  x_{t - \Delta t} = x_t - v_\theta(x_t, t) \cdot \Delta t$$
+
+\begin{warnbox}
+\textbf{常见误区：}
+\begin{itemize}
+  \item \bad{✗}~「Flow Matching 和 DDIM 是一回事」\;\textbf{→}\;
+        \good{✓}~框架不同：DDIM 是 DDPM 的采样方法，FM 是独立的训练范式。
+  \item \bad{✗}~「Flow Matching 的路径是真正的直线」\;\textbf{→}\;
+        \good{✓}~每对 $(x_0, x_1)$ 单独是直线，但混合后的\textbf{边际速度场是弯的}；
+        只有学到完美模型时才近似直线。
+\end{itemize}
+\end{warnbox}
+
+\subsubsection*{深挖：路径是直线，为什么还需要多步采样？}
+
+\begin{intubox}
+\textbf{理想情况（训练完美）：}每对 $(x_0, x_1)$ 之间的路径确实是直线，速度
+$v = x_1 - x_0$ 是常数。如果模型学得完美，从 $x_1$ 出发沿速度场走，理论上\textbf{一步}
+就能到 $x_0$。
+
+\medskip
+\textbf{现实情况：}根本原因在于，同一个 $x_t$ 来自无数条不同的直线路径——模型只能
+给出「平均速度」，而平均方向不等于任何一条真实直线。
+
+\medskip
+训练时 $x_t = (1-t)x_0 + tx_1$，其中 $x_0$ 和 $x_1$ 是独立随机采样的。不同的
+$(x_0, x_1)$ 对可能经过\textbf{同一个 $x_t$ 位置}，但目标速度方向完全不同。
+模型在 $x_t$ 处学到的是所有经过这里的路径的期望速度：
+$$v_\theta(x_t, t) \approx \mathbb{E}[x_1 - x_0 \mid x_t]$$
+这个\textbf{期望方向}不等于任何一条真实直线的方向，所以如果真的一步走过去，会走偏。
+需要走一步再问一次，不断修正方向。
+
+\medskip
+\textbf{类比：}想象你在城市里问路，路过的人各自要去不同的目的地。你问「请问往哪走？」，
+大家的平均指向是城市中心，但没有人真的住在城市中心——沿着平均方向走一步，你并不会
+到达任何真实目的地。
+\end{intubox}
+
+\begin{summarybox}
+\textbf{一句话总结：}单对路径是直线，但「边际速度场」（学到的期望速度场）是弯的。
+模型每一步只能走「当前平均方向」，需要多步不断修正，才能到达真实数据分布。
+\end{summarybox}
+
+% ============================================================
+\subsection{三者对比总览}
+% ============================================================
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{p{2.6cm}p{3.5cm}p{3.5cm}p{4.5cm}}
+\hline
+ & \textbf{DDPM} & \textbf{DDIM} & \textbf{Flow Matching} \\
+\hline
+\textbf{本质}
+  & SDE（随机过程）
+  & ODE（确定性）
+  & ODE（最优传输） \\
+\textbf{路径}
+  & 弯曲随机游走
+  & 弯曲但平滑
+  & 线性（最短路径） \\
+\textbf{采样步数}
+  & $\sim$1000 步
+  & $\sim$20--50 步
+  & $\sim$10--20 步 \\
+\textbf{训练目标}
+  & 预测噪声 $\epsilon$
+  & 同 DDPM（无需重训）
+  & 预测速度 $v = x_1-x_0$ \\
+\textbf{随机性}
+  & 有（每步加噪）
+  & 可选（$\eta$ 控制）
+  & 无（默认 ODE） \\
+\textbf{需要重训}
+  & ——
+  & \bad{✗ 不需要}
+  & \good{✓ 需要重训} \\
+\textbf{代表作}
+  & DDPM (Ho 2020)
+  & DDIM (Song 2021)
+  & Lipman 2022 / Liu 2022 \\
+\textbf{当前主流}
+  & 理论基础
+  & 常用采样器
+  & \key{工业界主流}（FLUX, SD3） \\
+\hline
+\end{tabular}
+\end{table}
+
+% ============================================================
+\subsection{内在联系：统一视角}
+% ============================================================
+
+\begin{summarybox}
+三者本质上都在回答同一个问题：\textbf{如何定义一条从噪声到数据的路径，并训练模型沿
+这条路径走？}
+\begin{itemize}
+  \item \key{DDPM}：用随机路径（SDE），噪声级别由方差调度 $\beta_t$ 控制；
+  \item \key{DDIM}：把 SDE 变成 ODE，路径形状不变，去掉随机项；
+  \item \key{Flow Matching}：重新设计路径（直线），更换训练目标。
+\end{itemize}
+\end{summarybox}
+
+DDPM 训练的 $\epsilon_\theta$ 实际上在估计\key{分数函数（score function）}
+$\nabla_{x_t} \log p(x_t)$：
+
+$$\epsilon_\theta(x_t, t) \approx -\sqrt{1-\bar{\alpha}_t}
+  \cdot \nabla_{x_t} \log p(x_t)$$
+
+DDIM 的确定性采样等价于对 score-based SDE 的\key{概率流 ODE}（probability flow
+ODE）求解。
+
+% ============================================================
+\subsection{面试高频问题 \& 答题要点}
+% ============================================================
+
+\paragraph{Q1：DDPM 和 DDIM 的区别？}
+
+\begin{conceptbox}
+DDIM 是 DDPM 的加速采样方法，\textbf{不需要重新训练模型}。DDPM 对应 SDE（每步需要
+加随机噪声），DDIM 找到了对应的确定性 ODE，去掉随机项后轨迹变平滑，可以用大步长
+近似，从 1000 步加速到 20--50 步。两者使用同一个网络（预测 $\epsilon$）。
+\end{conceptbox}
+
+\paragraph{Q2：Flow Matching 和 DDPM/DDIM 的本质区别？}
+
+\begin{conceptbox}
+有两点核心区别：
+\begin{enumerate}
+  \item \textbf{路径设计不同：}DDPM 用非线性方差调度（弯曲路径），Flow Matching
+        用线性插值（直线路径），路径更短更平滑，理论上需要更少步数。
+  \item \textbf{训练目标不同：}DDPM 预测噪声 $\epsilon$，FM 直接预测速度场
+        $v = x_1 - x_0$。FM \warn{需要重新训练}，不能复用 DDPM 的权重。
+\end{enumerate}
+\end{conceptbox}
+
+\paragraph{Q3：为什么现在工业界（FLUX, SD3）用 Flow Matching 而不是 DDPM？}
+
+\begin{conceptbox}
+主要三个优势：
+\begin{enumerate}
+  \item \good{采样更快}：直线路径导致 ODE 更易数值积分，步数更少；
+  \item \good{训练更稳定}：目标速度是常数方向 $x_1 - x_0$，信噪比均匀；
+        DDPM 不同 $t$ 的损失量级差异大；
+  \item \good{更易扩展到视频/高分辨率}：更少的步数意味着更低的显存消耗。
+\end{enumerate}
+\end{conceptbox}
+
+\paragraph{Q4：Flow Matching 的训练目标为什么是 $x_1 - x_0$？}
+
+\begin{conceptbox}
+因为路径是线性插值 $x_t = (1-t)x_0 + tx_1$，对 $t$ 求导得到
+$\dfrac{dx_t}{dt} = x_1 - x_0$，这就是路径切线方向，即速度。训练目标就是让网络
+预测这个常数速度向量。
+\end{conceptbox}
+
+\paragraph{Q5：DDIM 可以有随机性吗？}
+
+\begin{conceptbox}
+可以。DDIM 论文引入了参数 $\eta \in [0, 1]$：
+\begin{itemize}
+  \item $\eta = 0$：确定性 ODE（标准 DDIM）；
+  \item $\eta = 1$：退化回 DDPM 的随机采样。
+\end{itemize}
+通过调节 $\eta$ 可以在确定性（高可复现性）和多样性之间权衡。
+\end{conceptbox}
+
+% ============================================================
+\subsection{关键公式速查}
+% ============================================================
+
+\begin{summarybox}
+\renewcommand{\arraystretch}{1.6}
+\begin{tabular}{ll}
+\hline
+\textbf{公式} & \textbf{含义} \\
+\hline
+$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon$
+  & DDPM 正向（一步到任意 $t$） \\[4pt]
+$\mathcal{L} = \|\epsilon - \epsilon_\theta(x_t, t)\|^2$
+  & DDPM 训练目标 \\[4pt]
+$\hat{x}_0 = \dfrac{x_t - \sqrt{1-\bar{\alpha}_t}\,\epsilon_\theta}{\sqrt{\bar{\alpha}_t}}$
+  & DDIM 预测 $x_0$ \\[8pt]
+$x_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\,\hat{x}_0
+  + \sqrt{1-\bar{\alpha}_{t-1}}\,\epsilon_\theta(x_t, t)$
+  & DDIM 采样步骤 \\[4pt]
+$x_t = (1-t)\,x_0 + t\,x_1$
+  & Flow Matching 线性路径 \\[4pt]
+$\mathcal{L} = \|v_\theta(x_t, t) - (x_1 - x_0)\|^2$
+  & Flow Matching 训练目标 \\[4pt]
+$x_{t - \Delta t} = x_t - v_\theta(x_t, t) \cdot \Delta t$
+  & Flow Matching ODE 采样 \\
+\hline
+\end{tabular}
+\end{summarybox}
+
+% ============================================================
+\subsection{Consistency Models：一步生成的蒸馏路线}
+% ============================================================
+
+\begin{intubox}
+\textbf{直觉：}扩散模型慢，是因为每步只走一小段 ODE 路径。Consistency Model 的思路是：
+直接训练一个函数，\textbf{不管从路径上哪个位置出发，都能一步映射回 $x_0$}。
+\end{intubox}
+
+\subsubsection*{核心性质：自洽性（Self-Consistency）}
+
+\begin{conceptbox}
+\textbf{自洽条件（Consistency Property）：}
+
+设 $f_\theta(x_t, t)$ 是一致性函数，则对同一条 ODE 轨迹上的任意两个时刻 $t_1, t_2$：
+$$f_\theta(x_{t_1}, t_1) = f_\theta(x_{t_2}, t_2) = x_0$$
+
+即：\textbf{同一条轨迹上的所有点都映射到同一个 $x_0$}。
+边界条件：$f_\theta(x_0, 0) = x_0$（恒等映射）。
+\end{conceptbox}
+
+\begin{intubox}
+可以把 $f_\theta$ 理解成一个「定向传送门」——无论你站在轨迹上哪个时刻，
+都能直接传送回原始数据点。一步生成就是：从纯噪声 $x_T$ 直接调用 $f_\theta(x_T, T)$。
+\end{intubox}
+
+\subsubsection*{两种训练方式}
+
+\paragraph{方式一：Consistency Distillation（CD，需要预训练扩散模型）}
+
+利用已有的扩散模型教师来监督：相邻两个时刻的预测应该一致。
+
+\begin{conceptbox}
+\textbf{CD 损失：}
+$$\mathcal{L}_\text{CD} = \mathbb{E}_{t,\, x_0,\, \epsilon}\!\left[
+  d\!\left(f_\theta(x_{t_{n+1}},\, t_{n+1}),\;
+            f_{\theta^-}(\hat{x}_{t_n}^{\phi},\, t_n)\right)\right]$$
+
+其中：
+\begin{itemize}
+  \item $\hat{x}_{t_n}^{\phi}$：用预训练扩散模型（ODE solver）从 $x_{t_{n+1}}$ 走一步到 $t_n$；
+  \item $\theta^-$：EMA 慢速参数（target network），防止训练坍塌；
+  \item $d(\cdot,\cdot)$：距离函数（如 $\ell_2$ 或 LPIPS）。
+\end{itemize}
+\end{conceptbox}
+
+\paragraph{方式二：Consistency Training（CT，从零训练，无需教师）}
+
+不依赖预训练模型，直接用扰动数据训练，但精度略低于 CD。
+
+\begin{conceptbox}
+\textbf{CT 损失（简化版）：}
+$$\mathcal{L}_\text{CT} = \mathbb{E}_{t_n,\, x_0,\, \epsilon}\!\left[
+  d\!\left(f_\theta(x_{t_{n+1}},\, t_{n+1}),\;
+            f_{\theta^-}(x_{t_n},\, t_n)\right)\right]$$
+
+其中 $x_{t_n} = \sqrt{\bar{\alpha}_{t_n}}\,x_0 + \sqrt{1-\bar{\alpha}_{t_n}}\,\epsilon$
+直接通过加噪构造（不需要 ODE solver）。
+\end{conceptbox}
+
+\subsubsection*{采样：一步 or 少步迭代}
+
+\begin{itemize}
+  \item \textbf{1 步生成}：$\hat{x}_0 = f_\theta(x_T, T)$，质量略低；
+  \item \textbf{少步迭代（Multistep）}：生成 $\hat{x}_0$ 后，再加一点噪声到中间时刻
+        $t' < T$，再调用 $f_\theta$ 修正——\textbf{2--3 步}即可大幅提质：
+        $$\hat{x}_0^{(k+1)} = f_\theta\!\left(\sqrt{\bar{\alpha}_{t'}}\,\hat{x}_0^{(k)}
+        + \sqrt{1-\bar{\alpha}_{t'}}\,\epsilon,\; t'\right)$$
+\end{itemize}
+
+\begin{warnbox}
+\textbf{常见误区：}
+\begin{itemize}
+  \item \bad{✗}~「Consistency Model 只能 1 步」\;\textbf{→}\;
+        \good{✓}~支持 1 步粗生成 + 少步迭代精修，灵活权衡质量与速度。
+  \item \bad{✗}~「CT 和 CD 效果一样」\;\textbf{→}\;
+        \good{✓}~CD 有教师蒸馏，质量更高；CT 无教师，方便但效果差一点。
+  \item \bad{✗}~「Consistency Model 是 Flow Matching 的加速」\;\textbf{→}\;
+        \good{✓}~两者是不同路线：FM 改设计路径，CM 改映射方式（直接预测 $x_0$）。
+\end{itemize}
+\end{warnbox}
+
+\subsubsection*{与其他范式的对比}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{p{3cm}p{3cm}p{3cm}p{3.5cm}}
+\hline
+ & \textbf{DDPM/DDIM} & \textbf{Flow Matching} & \textbf{Consistency Model} \\
+\hline
+\textbf{采样步数} & 20--1000 步 & 10--20 步 & \key{1--3 步} \\
+\textbf{训练方式} & 从零训练 & 从零训练 & 蒸馏（CD）或从零（CT） \\
+\textbf{网络预测目标} & 噪声 $\epsilon$ & 速度 $v$ & 直接预测 $x_0$ \\
+\textbf{质量上限} & 高 & 高 & 略低（蒸馏损耗） \\
+\textbf{代表作} & Ho 2020 / Song 2021 & Lipman 2022 & Song 2023 \\
+\hline
+\end{tabular}
+\end{table}
+
+% ============================================================
+\subsection{进阶方向}
+% ============================================================
+
+\begin{itemize}
+  \item \key{Consistency Models}：蒸馏 DDPM，1 步生成；
+  \item \key{Stable Diffusion 3 / FLUX}：Flow Matching 的工业实现；
+  \item \key{Stochastic Interpolants}：统一 DDPM 和 FM 的理论框架；
+  \item \key{Score Distillation (SDS)}：用于 NeRF / 3D 生成。
+\end{itemize}
+
+\medskip
+\note{推荐资源：DDPM (Ho et al.\ 2020), DDIM (Song et al.\ 2021),
+Flow Matching (Lipman et al.\ 2022), Rectified Flow (Liu et al.\ 2022),
+Lilian Weng 博客 \emph{``What are Diffusion Models?''}}
+
+\medskip
+\begin{warnbox}
+\textbf{思考题：}DDIM 是把 DDPM 的 SDE 变成 ODE，Flow Matching 也是 ODE——那么
+DDIM 采样和 Flow Matching 采样有什么\textbf{本质不同}？
+
+\medskip
+\note{提示：思考两者的路径曲率（是否是直线？）以及是否可以用同一个网络。}
+\end{warnbox}
+
+% ============================================================
+\subsection*{思考题解答：DDIM 采样 vs Flow Matching 采样的本质不同}
+% ============================================================
+
+\begin{conceptbox}
+\textbf{一句话答案：}DDIM 和 FM 都是 ODE，但 \key{ODE 的背后定义完全不同}——
+路径形状不同、训练目标不同、网络权重不能互用。
+\end{conceptbox}
+
+\paragraph{相同点（表面上）}
+
+两者推理时都在求解一个确定性 ODE，因此都不需要每步注入随机噪声，可以大步跳跃：
+
+\begin{itemize}
+  \item DDIM：$x_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\hat{x}_0 + \sqrt{1-\bar{\alpha}_{t-1}}\,\epsilon_\theta(x_t,t)$
+  \item FM：$\dfrac{dx_t}{dt} = v_\theta(x_t, t)$
+\end{itemize}
+
+\paragraph{本质不同 1：路径曲率}
+
+\begin{itemize}
+  \item \key{DDIM}：路径形状\textbf{继承自 DDPM 的方差调度} $\bar{\alpha}_t$，是非线性弯曲的
+        （$\bar{\alpha}_t$ 是 $\cos^2$ 或线性 schedule 的连乘积，曲率非零）。
+        即使去掉了随机性，轨迹本身不是直线。
+  \item \key{Flow Matching}：路径被人为设计为\textbf{线性插值} $x_t = (1-t)x_0 + tx_1$，
+        每对 $(x_0, x_1)$ 单独看是真正的直线。边际速度场虽然弯曲（因为期望混合），
+        但\textbf{比 DDIM 的 ODE 轨迹直得多}，数值积分误差更小。
+\end{itemize}
+
+\paragraph{本质不同 2：网络预测的物理含义不同}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lll}
+\hline
+ & \textbf{DDIM（用 DDPM 网络）} & \textbf{Flow Matching} \\
+\hline
+网络输出 & 噪声 $\epsilon_\theta$（间接推算 $x_0$） & 速度场 $v_\theta$（直接给方向） \\
+ODE 右端项 & 由 $\epsilon_\theta$ 经公式变换得到 & 直接就是 $v_\theta$ \\
+物理意义 & 预测「当前混入了多少噪声」 & 预测「现在应该朝哪个方向走」 \\
+\hline
+\end{tabular}
+\end{table}
+
+\paragraph{本质不同 3：网络权重不能互用}
+
+DDIM 直接复用 DDPM 权重（只换采样器）。Flow Matching \warn{必须重新训练}：
+其训练目标 $\|v_\theta - (x_1-x_0)\|^2$ 和 DDPM 的 $\|\epsilon - \epsilon_\theta\|^2$
+优化的是不同函数，即使网络结构相同，权重含义完全不同。
+
+\paragraph{类比总结}
+
+\begin{intubox}
+\textbf{类比：}两辆车都开着「自动驾驶」（ODE），但：
+\begin{itemize}
+  \item DDIM 的地图是按 DDPM 弯曲山路绘制的，只是把方向盘锁定（去随机性），路还是弯的；
+  \item Flow Matching 直接重新规划了高速直路，路本身就更直，同样的步长走得更远更准。
+\end{itemize}
+核心：\textbf{去随机性（DDIM 的做法）≠ 直线化路径（FM 的做法）}，是两件独立的事情。
+\end{intubox}
+
+%% ============================================================
+\subsection{补充高频面试题（来源：知乎 / 牛客 / CSDN）}
+%% ============================================================
+
+% ---- Category 1 ----
+\subsubsection{DDPM 原理推导}
+
+\begin{conceptbox}{Q1：推导 DDPM 的训练目标}
+\textbf{问：} 从 VAE/ELBO 视角推导 DDPM 的训练损失，为何最终化简为噪声预测的 MSE？
+
+\textbf{答：}
+\begin{enumerate}
+  \item 最大化对数似然下界（ELBO）：
+    \[
+      \mathcal{L} = \underbrace{\mathcal{L}_T}_{\text{先验匹配}} + \sum_{t>1}\underbrace{\mathcal{L}_{t-1}}_{\text{去噪匹配}} + \underbrace{\mathcal{L}_0}_{\text{重建}}
+    \]
+  \item $\mathcal{L}_{t-1}$ 为两个高斯分布的 KL 散度，只依赖均值之差；
+  \item 代入反向均值的参数化 $\tilde{\mu}_t = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}}\epsilon_\theta\right)$ 后，
+    KL 化简为：
+    \[
+      \mathcal{L}_{\text{simple}} = \mathbb{E}_{t,x_0,\epsilon}\!\left[\|\epsilon - \epsilon_\theta(x_t,t)\|^2\right]
+    \]
+  \item 用 $x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$ 的重参数化消去 $x_0$。
+\end{enumerate}
+\key{结论}：训练目标本质是让网络预测加进去的高斯噪声，是标准 MSE 回归。
+\end{conceptbox}
+
+\begin{conceptbox}{Q2：$q(x_t|x_0)$ 的闭合形式}
+\textbf{问：} 为什么可以直接从 $x_0$ 一步采样 $x_t$，推导过程？
+
+\textbf{答：}
+利用高斯卷积：$q(x_t|x_{t-1})=\mathcal{N}(\sqrt{\alpha_t}x_{t-1},(1-\alpha_t)I)$，
+递推 $t$ 步后，所有中间高斯可合并：
+\[
+  x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon, \quad \epsilon\sim\mathcal{N}(0,I)
+\]
+其中 $\bar\alpha_t = \prod_{s=1}^{t}\alpha_s$。\key{这是"任意时刻直接加噪"的数学基础}，
+训练时无需逐步前向只需一次采样。
+\end{conceptbox}
+
+\begin{conceptbox}{Q3：后验 $q(x_{t-1}|x_t,x_0)$ 推导}
+\textbf{问：} 如何用贝叶斯定理推导去噪后验，结果是什么分布？
+
+\textbf{答：}
+\[
+  q(x_{t-1}|x_t,x_0) \propto q(x_t|x_{t-1})\,q(x_{t-1}|x_0)
+\]
+两个高斯相乘后配方，得到高斯分布：
+\[
+  \tilde\mu_t(x_t,x_0)=\frac{\sqrt{\bar\alpha_{t-1}}(1-\alpha_t)}{1-\bar\alpha_t}x_0
+  +\frac{\sqrt{\alpha_t}(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}x_t,
+  \quad
+  \tilde\sigma_t^2=\frac{(1-\alpha_t)(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}
+\]
+\key{实际训练中用 $\epsilon_\theta$ 预测 $\epsilon$ 后即可还原 $x_0$，进而算出 $\tilde\mu_t$。}
+\end{conceptbox}
+
+\begin{conceptbox}{Q4：为何选择预测 $\epsilon$ 而非 $x_0$？}
+\textbf{问：} DDPM 为何默认用 $\epsilon$-prediction？与 $x_0$-prediction 相比有何优劣？
+
+\textbf{答：}
+\begin{itemize}
+  \item \good{$\epsilon$-prediction 优点}：均值估计方差更稳定，梯度尺度均匀，实验效果更好；
+  \item \bad{$x_0$-prediction 缺点}：高噪声步（小 $t$）中 SNR 极低，估计 $x_0$ 方差极大；
+  \item 数学等价性：两者可互相转换（$\hat x_0 = \frac{x_t - \sqrt{1-\bar\alpha_t}\epsilon_\theta}{\sqrt{\bar\alpha_t}}$），
+    但优化难易度不同；
+  \item $v$-prediction（$v = \sqrt{\bar\alpha_t}\epsilon - \sqrt{1-\bar\alpha_t}x_0$）是高分辨率和蒸馏的最优选择。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q5：噪声调度（Noise Schedule）对比}
+\textbf{问：} Linear、Cosine、Sigmoid schedule 各有什么特点？为何改进？
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{Schedule} & \textbf{特点} & \textbf{问题/改进} \\ \hline
+Linear（DDPM）& $\beta_t$ 线性增长 & 末尾过早变全噪声，末几步浪费 \\
+Cosine（iDDPM）& $\bar\alpha_t\!=\!\cos^2\!\left(\frac{t/T+s}{1+s}\cdot\frac{\pi}{2}\right)$ & 头尾过渡更平滑，图像质量↑ \\
+Sigmoid & $\bar\alpha_t$ 按 sigmoid 变化 & 中段变化更均匀 \\
+Zero-SNR & 强制 $\bar\alpha_T\to0$ & 高分辨率 v-pred 必须；避免过亮问题 \\
+\hline
+\end{tabular}
+\end{center}
+\end{conceptbox}
+
+\begin{conceptbox}{Q6：重参数化技巧的作用}
+\textbf{问：} DDPM 中的重参数化（reparameterization trick）解决了什么问题？
+
+\textbf{答：}
+采样 $x_t \sim q(x_t|x_0)$ 时，直接从分布中采样无法反向传播。
+重参数化将随机性分离：
+\[
+  x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\underbrace{\epsilon}_{\text{独立随机变量}}
+\]
+梯度可以通过 $x_0$（模型参数端）流动，$\epsilon$ 作为外部噪声不需要梯度。
+\key{这与 VAE 中对隐变量 $z$ 的重参数化完全同构。}
+\end{conceptbox}
+
+% ---- Category 2 ----
+\subsubsection{DDIM 加速与反转}
+
+\begin{conceptbox}{Q7：DDIM 为何能加速且不需重新训练？}
+\textbf{问：} DDIM 的核心思想是什么？$\eta$ 参数有什么作用？
+
+\textbf{答：}
+\begin{itemize}
+  \item DDIM 将 DDPM 的 Markov 前向过程推广为\key{非 Markov 链}，但保持相同的边际分布 $q(x_t|x_0)$；
+  \item 因此训练目标不变，\good{DDPM 权重可直接复用}；
+  \item 采样公式变为确定性 ODE，可跳步（1000步→50步甚至10步）；
+  \item $\eta$ 参数控制随机性：$\eta=0$ 为完全确定性（DDIM），$\eta=1$ 恢复 DDPM 随机性。
+\end{itemize}
+\[
+  x_{t-1} = \sqrt{\bar\alpha_{t-1}}\hat x_0 + \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\cdot\epsilon_\theta + \sigma_t\epsilon_t
+\]
+其中 $\sigma_t = \eta\sqrt{(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)}\sqrt{1-\alpha_t}$。
+\end{conceptbox}
+
+\begin{conceptbox}{Q8：DDIM Inversion 的应用与局限}
+\textbf{问：} DDIM Inversion 能做什么？有什么缺陷？
+
+\textbf{答：}
+\textbf{应用：}
+\begin{itemize}
+  \item \good{图像插值}：将两张图各自 invert 到噪声空间，插值后再 denoise；
+  \item \good{图像编辑}：Prompt-to-Prompt、Null-Text Inversion 等先 invert 再用新 prompt 引导；
+  \item \good{可复现性}：固定初始噪声，结果完全确定。
+\end{itemize}
+\textbf{局限：}
+\begin{itemize}
+  \item \warn{高 CFG scale 下 inversion 不准确}，需 Null-Text Inversion / NTI 纠正；
+  \item 步数越少误差越大（ODE 数值积分误差累积）；
+  \item FM 的 Inversion 更简单准确（直线路径）。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q9：还有哪些加速采样方法？}
+\textbf{问：} 除 DDIM 外列举其他常见采样加速方案并比较。
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{方法} & \textbf{核心思路} & \textbf{步数} \\ \hline
+DDIM & 非 Markov ODE，跳步 & 10--50 \\
+DPM-Solver / ++ & 指数积分器，高阶 ODE 求解 & 5--20 \\
+PNDM & 伪数值 Runge-Kutta & 20--50 \\
+Progressive Distillation & 模型蒸馏，每次折半步数 & 4--8 \\
+Consistency Models & 自洽性蒸馏/训练 & 1--3 \\
+LCM（Latent CM） & 潜空间一致性模型 & 2--4 \\
+\hline
+\end{tabular}
+\end{center}
+\key{DPM-Solver++ 是目前 Stable Diffusion 默认推荐的高质量快速采样器。}
+\end{conceptbox}
+
+% ---- Category 3 ----
+\subsubsection{Flow Matching 深入}
+
+\begin{conceptbox}{Q10：Flow Matching vs DDPM 全面对比}
+\textbf{问：} 从路径、训练目标、推断速度等维度对比 Flow Matching 与 DDPM。
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{维度} & \textbf{DDPM} & \textbf{Flow Matching} \\ \hline
+数学框架 & SDE（随机微分方程）& ODE（常微分方程）\\
+噪声路径 & 弯曲（cosine/linear）& 线性插值 $x_t=(1-t)x_0+tx_1$ \\
+训练目标 & $\epsilon$-prediction & $v$-prediction（$v=x_1-x_0$）\\
+是否需重训练 & 基准 & \warn{需从头训练} \\
+OFE（函数评估次数）& 高（弯路 → 多步）& 低（直路 → 少步）\\
+与 DDIM 关系 & DDIM 是其 ODE 极限 & 独立框架，更简洁 \\
+\hline
+\end{tabular}
+\end{center}
+\end{conceptbox}
+
+\begin{conceptbox}{Q11：Optimal Transport Flow Matching（OT-FM）}
+\textbf{问：} OT-FM 相比普通 FM 有何改进？为什么路径更直？
+
+\textbf{答：}
+\begin{itemize}
+  \item 普通 FM 随机配对 $(x_0, x_1)$，导致速度场 $v_t$ 存在轨迹交叉，\bad{路径实际不直}；
+  \item \key{OT-FM 使用最优传输配对}：最小化 $\mathbb{E}[\|x_1-x_0\|^2]$，
+    使 $(x_0,x_1)$ 对尽量匹配（近的配近的）；
+  \item 配对后速度场近似全局线性，\good{路径更直，步数更少，NFE 更低}；
+  \item 速度目标仍是 $v=x_1-x_0$，但因配对优化，条件方差更小，训练更稳；
+  \item SD3、Flux 等模型均采用 OT-FM。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q12：Flow Matching 与 Score Matching 的关系}
+\textbf{问：} FM 与 Score Matching / 扩散模型概率流 ODE 的本质联系是什么？
+
+\textbf{答：}
+\begin{itemize}
+  \item 扩散模型的概率流 ODE（DDPM $\eta=0$ 极限）与 SDE 共享相同边际分布；
+  \item Score function $\nabla_{x_t}\log p_t(x_t)$ 与速度场 $v_t(x_t)$ 可互相转换；
+  \item FM \good{直接参数化速度场}，无需估计 score（避免 score 估计误差累积）；
+  \item FM 训练目标是\key{条件速度场的期望}（可精确计算），比 score matching 方差更低、更稳定。
+\end{itemize}
+\end{conceptbox}
+
+% ---- Category 4 ----
+\subsubsection{与 GAN / VAE 对比}
+
+\begin{conceptbox}{Q13：扩散模型 vs GAN}
+\textbf{问：} 扩散模型相比 GAN 的优缺点是什么？}
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{维度} & \textbf{GAN} & \textbf{扩散模型} \\ \hline
+训练稳定性 & \bad{模式崩塌、训练不稳} & \good{MSE 损失，稳定} \\
+多样性 & \bad{覆盖不全} & \good{全局分布建模} \\
+采样速度 & \good{单次前向，极快} & \bad{多步迭代，慢} \\
+条件控制 & 中等 & \good{CFG 灵活控制} \\
+可逆性 & \bad{一般不可逆} & \good{DDIM Inversion} \\
+\hline
+\end{tabular}
+\end{center}
+\key{扩散模型用采样速度换来训练稳定性和多样性，是图像生成的当前主流。}
+\end{conceptbox}
+
+\begin{conceptbox}{Q14：扩散模型 vs VAE}
+\textbf{问：} 扩散模型与 VAE 的本质区别是什么？
+
+\textbf{答：}
+\begin{itemize}
+  \item \key{无瓶颈压缩}：VAE 强制将信息压缩到低维隐变量，扩散模型在完整分辨率/潜空间中渐进去噪；
+  \item \key{多步精化}：扩散模型通过 $T$ 步逐步去噪，每步修正误差；VAE 单次解码；
+  \item \good{无后验坍塌}（posterior collapse）：VAE 常见问题，扩散模型不存在；
+  \item 两者结合：\key{LDM（Latent Diffusion）= VAE 压缩 + 潜空间扩散}，兼顾效率与质量。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q15：为什么 LDM 要先用 VAE 压缩到潜空间？}
+\textbf{问：} Latent Diffusion Model 的动机和计算量分析。
+
+\textbf{答：}
+\begin{itemize}
+  \item 像素空间扩散（$512\times512\times3$）计算量极大；
+  \item VAE 将其压缩为 $64\times64\times4$（\key{48× 压缩比}），自注意力复杂度从 $O(n^2)$ 中 $n$ 减少 $1/8^2$；
+  \item VAE 保留语义信息，丢弃高频冗余，扩散在语义空间建模；
+  \item \good{训练加速约 $\mathbf{4\times}$，推断加速更多}；
+  \item KL-regularized VAE 使潜变量分布近似 $\mathcal{N}(0,I)$，方便扩散建模。
+\end{itemize}
+\end{conceptbox}
+
+% ---- Category 5 ----
+\subsubsection{Classifier-Free Guidance（CFG）}
+
+\begin{conceptbox}{Q16：CFG 的公式推导与训练方式}
+\textbf{问：} CFG 的数学形式是什么？训练时如何实现无条件预测？
+
+\textbf{答：}
+\textbf{推断公式：}
+\[
+  \tilde\epsilon_\theta(x_t,c) = \epsilon_\theta(x_t,\varnothing) + w\cdot\bigl[\epsilon_\theta(x_t,c) - \epsilon_\theta(x_t,\varnothing)\bigr]
+\]
+其中 $w$ 为 guidance scale（典型值 7.5），$c$ 为条件（文本），$\varnothing$ 为空条件。
+
+\textbf{训练方式：}以概率 $p_{\text{uncond}}\approx10\%\sim20\%$ 随机将条件 $c$ 替换为 $\varnothing$（空字符串 / 零向量），
+同一个网络同时学习有条件和无条件预测，\good{无需额外分类器}。
+
+\key{$w=1$ 为标准条件生成；$w>1$ 增强条件对齐，但会降低多样性；$w=0$ 为无条件生成。}
+\end{conceptbox}
+
+\begin{conceptbox}{Q17：CFG vs Classifier Guidance}
+\textbf{问：} 两种 Guidance 方案的核心区别是什么？
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{维度} & \textbf{Classifier Guidance} & \textbf{CFG} \\ \hline
+额外模型 & \warn{需噪声鲁棒分类器} & \good{不需要} \\
+推断计算 & 需对分类器反向传播梯度 & 两次前向传播 \\
+可控性 & 类别标签 & 任意条件（文本/图像）\\
+训练耦合 & 分类器需在噪声数据上训练 & 端到端 \\
+实用性 & 较少用 & \good{工业主流} \\
+\hline
+\end{tabular}
+\end{center}
+\end{conceptbox}
+
+\begin{conceptbox}{Q18：CFG 两次前向传播的优化手段}
+\textbf{问：} CFG 每步需两次 UNet 前向，如何优化？
+
+\textbf{答：}
+\begin{itemize}
+  \item \key{CFG Distillation}（Meng et al.）：将 CFG 蒸馏进单次前向的模型；
+  \item \key{LCM（Latent Consistency Model）}：结合 CFG Distillation + 一致性蒸馏，1--4 步；
+  \item \key{Adaptive / Dynamic CFG}：不同步骤使用不同 $w$，早期低 $w$，后期高 $w$；
+  \item \key{PAG（Perturbed Attention Guidance）}：替代无条件分支，不需无条件训练；
+  \item Batch 合并：将有/无条件拼成一个 batch，用一次前向计算两者（节省 overhead 非 FLOPs）。
+\end{itemize}
+\end{conceptbox}
+
+% ---- Category 6 ----
+\subsubsection{预测目标与损失权重}
+
+\begin{conceptbox}{Q19：$\epsilon$-pred / $x_0$-pred / $v$-pred 三者对比}
+\textbf{问：} 三种预测目标的定义、转换公式和各自适用场景？
+
+\textbf{答：}
+\textbf{定义与转换：}
+\[
+  v_t \triangleq \sqrt{\bar\alpha_t}\,\epsilon - \sqrt{1-\bar\alpha_t}\,x_0
+\]
+\[
+  \hat x_0 = \sqrt{\bar\alpha_t}\,x_t - \sqrt{1-\bar\alpha_t}\,v_\theta,\quad
+  \hat\epsilon = \sqrt{1-\bar\alpha_t}\,x_t + \sqrt{\bar\alpha_t}\,v_\theta
+\]
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+ & $\epsilon$-pred & $x_0$-pred & $v$-pred \\ \hline
+高噪声步稳定性 & \good{好} & \bad{差（SNR 低）} & \good{好} \\
+低噪声步稳定性 & \bad{差} & \good{好} & \good{好} \\
+高分辨率生成 & 中 & \bad{差} & \good{最佳} \\
+蒸馏友好性 & 中 & 中 & \good{最佳} \\
+\hline
+\end{tabular}
+\end{center}
+\key{SDXL、SD3、Imagen Video 均使用 $v$-prediction；需配合 Zero-SNR schedule。}
+\end{conceptbox}
+
+\begin{conceptbox}{Q20：Min-SNR-$\gamma$ 损失权重}
+\textbf{问：} 为什么引入 Min-SNR 加权？公式是什么？
+
+\textbf{答：}
+\begin{itemize}
+  \item \textbf{问题}：不同时间步的 SNR 差异巨大（$t$ 小时 SNR 高，梯度大；$t$ 大时 SNR 低，梯度小），
+    导致优化偏向高 SNR 步骤，低 SNR（粗结构）学习不充分；
+  \item \textbf{Min-SNR-$\gamma$ 权重}：
+    \[
+      w_t = \frac{\min(\text{SNR}_t,\, \gamma)}{\text{SNR}_t}, \quad \text{SNR}_t = \frac{\bar\alpha_t}{1-\bar\alpha_t}
+    \]
+  \item 典型 $\gamma=5$；当 $\text{SNR}_t>\gamma$ 时权重 $<1$，压低高 SNR 步的梯度；
+  \item \good{更均匀的多尺度学习，FID 和细节质量均有改善}。
+\end{itemize}
+\end{conceptbox}
+
+% ---- Category 7 ----
+\subsubsection{条件生成与微调}
+
+\begin{conceptbox}{Q21：文本条件是如何注入 UNet 的？}
+\textbf{问：} Stable Diffusion 中文本信息通过什么机制控制图像生成？
+
+\textbf{答：}
+\begin{enumerate}
+  \item \key{文本编码器}：CLIP Text Encoder（SD 1.x/2.x）或 T5-XXL（SD3/Flux）将 prompt 编码为序列嵌入；
+  \item \key{Cross-Attention}：在 UNet 中间层，图像特征作为 Query，文本嵌入作为 Key/Value：
+    \[
+      \text{Attn}(Q,K,V) = \text{softmax}\!\left(\frac{QW_Q(KW_K)^\top}{\sqrt{d}}\right)VW_V
+    \]
+  \item \key{时间步注入}：$t$ 编码为 sinusoidal embedding，通过 AdaGN（Adaptive Group Norm）注入 ResBlock；
+  \item DiT 架构中用 adaLN-Zero 同时注入文本和时间步。
+\end{enumerate}
+\end{conceptbox}
+
+\begin{conceptbox}{Q22：ControlNet 的结构与训练方式}
+\textbf{问：} ControlNet 如何实现空间精确控制，Zero-Convolution 的作用是什么？
+
+\textbf{答：}
+\begin{itemize}
+  \item \key{结构}：冻结原 UNet 权重，复制 UNet Encoder 部分为可训练副本；
+  \item 控制信号（边缘/深度/姿态）通过四层卷积映射到与 UNet 特征同维度；
+  \item 副本输出经 \key{Zero-Convolution}（$1\times1$ 卷积，权重和偏置\warn{初始化为零}）
+    加到 UNet decoder 的 skip connection 上；
+  \item \good{初始时 Zero-Conv 输出为零，不影响原模型}，训练稳定地从零开始学习控制；
+  \item 推断时可叠加多个 ControlNet，用权重系数混合。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q23：LoRA 的原理与在扩散模型中的应用}
+\textbf{问：} LoRA 为何参数高效？在 Stable Diffusion 中具体怎么应用？
+
+\textbf{答：}
+\textbf{原理：}预训练权重 $W_0\in\mathbb{R}^{d\times k}$ 冻结，添加低秩增量：
+\[
+  W = W_0 + \Delta W = W_0 + BA, \quad B\in\mathbb{R}^{d\times r},\;A\in\mathbb{R}^{r\times k},\;r\ll\min(d,k)
+\]
+参数量从 $dk$ 降至 $r(d+k)$，典型 $r=4/8/16$。
+
+\textbf{在 SD 中的应用：}
+\begin{itemize}
+  \item 应用于 Cross-Attention 的 $W_Q, W_K, W_V, W_{\text{out}}$（有时也包括 FFN）；
+  \item \good{训练参数量 $<1\%$ 原模型，显存友好}；
+  \item 推断时直接将 $BA$ 合并回 $W_0$，无额外推断开销；
+  \item $\alpha/r$ 比值控制 LoRA 权重缩放，防止不稳定。
+\end{itemize}
+\end{conceptbox}
+
+% ---- Category 8 ----
+\subsubsection{训练技巧与架构}
+
+\begin{conceptbox}{Q24：EMA（指数移动平均）的作用}
+\textbf{问：} 扩散模型训练为何几乎必须使用 EMA？
+
+\textbf{答：}
+\[
+  \theta_{\text{EMA}} \leftarrow \lambda\,\theta_{\text{EMA}} + (1-\lambda)\,\theta, \quad \lambda=0.9999
+\]
+\begin{itemize}
+  \item \good{降低方差}：相当于对历史参数做加权平均，抑制训练噪声；
+  \item \good{隐式集成效果}：多个时间点的模型加权组合，泛化更好；
+  \item 推断时使用 $\theta_{\text{EMA}}$，\key{FID 通常低 10--30\%}；
+  \item \warn{不影响优化轨迹}，训练仍用原始梯度更新 $\theta$。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q25：时间步采样策略}
+\textbf{问：} 训练时如何采样时间步 $t$？不同策略有什么区别？
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{策略} & \textbf{方法} & \textbf{适用} \\ \hline
+均匀采样 & $t\sim\text{Uniform}(1,T)$ & DDPM 原始方案 \\
+重要性采样 & 按损失方差加权 & Improved DDPM \\
+Logit-Normal & $t = \sigma(\mathcal{N}(\mu,\sigma^2))$ & Flow Matching（SD3）\\
+P2 Weighting & 按感知重要性加权中间步 & 改善细节质量 \\
+\hline
+\end{tabular}
+\end{center}
+\key{FM 中 Logit-Normal 使 $t$ 集中在 0.2--0.8 的语义关键区间，改善生成质量。}
+\end{conceptbox}
+
+\begin{conceptbox}{Q26：如何生成高分辨率图像？}
+\textbf{问：} 扩散模型生成超高分辨率（$2048^+$）有哪些主流方案？
+
+\textbf{答：}
+\begin{enumerate}
+  \item \key{级联扩散（Cascaded Diffusion）}：低分辨率生成 + SR 扩散模型逐步上采样（Imagen）；
+  \item \key{SDXL 两阶段}：Base 模型（$1024^2$）+ Refiner 模型精化细节；
+  \item \key{MultiDiffusion / Tiled Diffusion}：滑动窗口分块去噪，全局平均融合；
+  \item \key{$v$-prediction + Zero-SNR}：高分辨率下避免低频/全局结构退化；
+  \item \key{分辨率条件化}：将训练分辨率作为条件输入，推断时指定目标分辨率；
+  \item \key{ScaleCrafter / FreeU}：推断时调整注意力和特征权重无需重训练。
+\end{enumerate}
+\end{conceptbox}
+
+\begin{conceptbox}{Q27：UNet 在扩散模型中的架构细节}
+\textbf{问：} DDPM / SD 的 UNet 由哪些模块组成，各模块作用是什么？
+
+\textbf{答：}
+\begin{itemize}
+  \item \key{ResBlock + AdaGN}：基本计算单元，时间步通过 Adaptive Group Norm 注入；
+  \item \key{Self-Attention}：建模空间长程依赖（低分辨率层使用，高分辨率层省略）；
+  \item \key{Cross-Attention}：文本/条件注入（Query = 图像特征，K/V = 文本嵌入）；
+  \item \key{Skip Connection（U型）}：Encoder 特征拼接到 Decoder，保留细节；
+  \item \key{下采样}：stride=2 卷积（非池化，保留更多信息）；
+  \item \key{中间瓶颈层}：ResBlock + Self-Attn + ResBlock，最大感受野。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q28：DiT vs UNet：Transformer 替代卷积骨干}
+\textbf{问：} DiT（Diffusion Transformer）相比 UNet 有什么优势和不同？
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{维度} & \textbf{UNet} & \textbf{DiT} \\ \hline
+骨干架构 & 卷积 + 注意力混合 & 纯 Transformer \\
+条件注入 & AdaGN & \key{adaLN-Zero}（初始化为恒等变换）\\
+可扩展性 & \bad{较弱，结构固定} & \good{Scaling Laws 强，参数量→质量}\\
+空间建模 & 局部感受野优先 & 全局注意力 \\
+代表模型 & SD 1.x/2.x, SDXL & DiT, SD3, Flux, Sora \\
+\hline
+\end{tabular}
+\end{center}
+\key{adaLN-Zero：$\gamma,\beta$ 初始化为 $(1,0)$，残差 gate 初始化为 $0$，训练初期退化为恒等，稳定早期训练。}
+\end{conceptbox}
+
+% ---- Category 9 ----
+\subsubsection{综合与评估}
+
+\begin{conceptbox}{Q29：扩散模型为何不产生模式坍塌？}
+\textbf{问：} GAN 经常出现 mode collapse，扩散模型为何没有此问题？
+
+\textbf{答：}
+\begin{itemize}
+  \item \key{无对抗训练}：GAN 的 mode collapse 源于生成器欺骗判别器的博弈；扩散模型使用 MSE 回归损失，优化景观平滑；
+  \item \key{多步修正}：每一步都有独立的去噪预测，误差可在后续步骤中部分纠正；
+  \item \key{全局分布匹配}：训练目标为重建分布期望，而非点对点对抗；
+  \item \key{随机性保留}（DDPM）：采样时保留高斯随机噪声，保证多样性；
+  \item \warn{仍可能出现质量退化}（如过拟合），但机制与 mode collapse 不同。
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q30：生成模型评估指标全览}
+\textbf{问：} 评估扩散模型常用哪些指标？各自衡量什么？
+
+\textbf{答：}
+\begin{center}
+\begin{tabular}{lllll}
+\hline
+\textbf{指标} & \textbf{方向} & \textbf{衡量内容} & \textbf{参考范围} & \textbf{局限} \\ \hline
+FID $\downarrow$ & 越低越好 & 生成与真实分布距离（InceptionV3 特征）& $<10$ 优秀 & 依赖参考集 \\
+IS $\uparrow$ & 越高越好 & 多样性 + 可辨识性 & 因数据集差异大 & 无与真实对比 \\
+CLIP Score $\uparrow$ & 越高越好 & 图文语义对齐度 & $0.2\sim0.35$ & 偏 CLIP 分布 \\
+LPIPS $\downarrow$ & 越低越好 & 感知相似度（深度特征）& $<0.1$ 极好 & 需参考图像 \\
+Precision $\uparrow$ & 越高越好 & 生成样本在真实流形内比例（保真度）& — & — \\
+Recall $\uparrow$ & 越高越好 & 真实样本被覆盖比例（多样性）& — & — \\
+NFE $\downarrow$ & 越低越好 & 推断步数（函数评估次数）& 1--50 & — \\
+\hline
+\end{tabular}
+\end{center}
+\key{FID 是目前最通用的单一指标；同时报告 Precision+Recall 能更全面反映质量与多样性权衡。}
+\end{conceptbox}
+
+\begin{summarybox}
+\textbf{高频面试题规律总结}
+\begin{itemize}
+  \item \key{推导题}（Q1--Q4, Q16）：必须能手推 ELBO→MSE、后验高斯、CFG 公式；
+  \item \key{对比题}（Q10, Q13, Q14, Q17, Q28）：用表格思维清晰列维度，有\good{优}/\bad{劣}判断；
+  \item \key{工程题}（Q18, Q22, Q23, Q24, Q26）：结合代码/实践经验回答，体现动手能力；
+  \item \key{原理题}（Q5, Q11, Q20, Q25, Q29）：理解「为什么这样设计」而非只背公式。
+\end{itemize}
+\end{summarybox}

@@ -1,0 +1,72 @@
+% ============================================================
+% Flow Matching 基础
+% 来源：Flow-GRPO 论文 Section 3 Background
+% ============================================================
+
+\section{Flow Matching 基础}
+
+\subsection{符号定义}
+
+\begin{conceptbox}
+\begin{itemize}[leftmargin=1.5em]
+  \item $x_0 \sim X_0$：来自\key{真实数据分布}的样本（真实图片）
+  \item $x_1 \sim X_1$：来自\key{噪声分布}的样本（纯高斯噪声）
+  \item $t \in [0, 1]$：时间步，$t=0$ 是真实图片，$t=1$ 是纯噪声
+\end{itemize}
+\end{conceptbox}
+
+\begin{intubox}
+\textbf{直觉：} 和 DDPM 方向相反——Flow Matching 里 $t=0$ 是干净图片，$t=1$ 是噪声。\\
+推理时从 $t=1$（噪声）走到 $t=0$（图片）。
+\end{intubox}
+
+\subsection{Rectified Flow：插值路径}
+
+Rectified Flow 框架将任意时刻的"加噪图片" $x_t$ 定义为真实图片和噪声的\key{线性插值}：
+
+\[
+x_t = (1 - t)\, x_0 + t\, x_1 \tag{1}
+\]
+
+\begin{intubox}
+\textbf{直觉：} $t=0$ 时 $x_t = x_0$（纯图片），$t=1$ 时 $x_t = x_1$（纯噪声），中间是直线过渡。\\
+这条直线就是 Flow Matching 的\key{最优传输路径}。
+\end{intubox}
+
+\subsection{训练目标：学习速度场}
+
+训练一个 Transformer 模型 $v_\theta(x_t, t)$，直接回归速度场，最小化：
+
+\[
+\mathcal{L}(\theta) = \mathbb{E}_{t,\, x_0 \sim X_0,\, x_1 \sim X_1} \left[ \left\| \boldsymbol{v} - v_\theta(x_t, t) \right\|^2 \right] \tag{2}
+\]
+
+其中目标速度（直线方向）为：
+
+\[
+\boldsymbol{v} = x_1 - x_0
+\]
+
+\begin{summarybox}
+\textbf{一句话理解：} 模型学的是"在时刻 $t$，噪声图片 $x_t$ 应该往哪个方向走，才能最终变成真实图片"。\\
+答案就是从 $x_0$ 指向 $x_1$ 的方向，即 $x_1 - x_0$。
+\end{summarybox}
+
+\subsection{推理：ODE 采样}
+
+训练好之后，推理时从纯噪声 $x_1$ 出发，沿速度场积分走到 $x_0$：
+
+\[
+\frac{dx_t}{dt} = v_\theta(x_t, t)
+\]
+
+离散化后每步更新：
+\[
+x_{t - \Delta t} = x_t - v_\theta(x_t, t) \cdot \Delta t
+\]
+
+\begin{warnbox}
+\warn{ODE 的问题：} 这是完全确定性的——同一个初始噪声 $x_1$，每次推理出\key{完全相同}的图片。\\
+这导致 ODE 无法直接用于强化学习（无随机性，无法计算 log 概率）。\\
+$\Rightarrow$ Flow-GRPO 的解决方案：将 ODE 转换为 SDE。
+\end{warnbox}

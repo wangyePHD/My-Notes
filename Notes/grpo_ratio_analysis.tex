@@ -1,0 +1,376 @@
+%% GRPO Importance Ratio 深度排查笔记
+%% 记录时间：2025-04-11
+%% 背景：R3（BAGEL 图像编辑 RL 训练）中关于 GRPO importance ratio 的实现方式引发的疑问
+
+\section{GRPO Importance Ratio 深度排查}
+
+\note{记录时间：2025-04-11 \quad 背景：R3（BAGEL 图像编辑 RL 训练）中关于 GRPO importance ratio
+的实现方式引发的疑问，经过查阅源码、GitHub 讨论和论文，最终得出结论。}
+
+% ============================================================
+\subsection{起点：疑问}
+% ============================================================
+
+在 \code{train/online\_rl.py} 中，image policy loss 的写法是：
+
+\begin{lstlisting}[language=Python]
+img_per_token_loss = -(
+    torch.exp(log_prob_per_image - log_prob_per_image.detach()) * cur_image_advantages
+).sum() / (1e-4 + total_image_num)
+\end{lstlisting}
+
+文本 policy loss 也类似：
+
+\begin{lstlisting}[language=Python]
+per_token_loss = -(
+    torch.exp(per_token_logps - per_token_logps.detach()) * cur_text_advantages
+).sum() / (1e-4 + total_text_grad_tokens)
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{疑问}：\code{log\_prob - log\_prob.detach()} 永远等于 $0$，$\exp(0) = 1$，
+那 ratio 不就永远是 $1$ 吗？\code{.detach()} 怎么能作为 old policy？
+\end{warnbox}
+
+% ============================================================
+\subsection{对比参考：flow\_grpo 的实现}
+% ============================================================
+
+\note{来源：\texttt{https://github.com/yifan123/flow\_grpo}}
+
+\code{flow\_grpo} 的做法分为两个阶段：
+
+\begin{lstlisting}[language=Python]
+# 阶段 1：rollout 时保存 old log_prob（权重为 theta_0）
+images, latents, log_probs = pipeline_with_logprob(...)
+samples["log_probs"] = log_probs   # <- 存入内存，这才是真正的 old policy
+
+# 阶段 2：多次梯度更新（theta 从 theta_0 变成 theta_1, theta_2, ...）
+for epoch in range(num_epochs):
+    log_prob_new = recompute_log_prob(latents)   # 当前权重重新算
+    ratio = torch.exp(log_prob_new - sample["log_probs"])  # pi_new / pi_old，真的不等于 1
+
+    unclipped = -advantages * ratio
+    clipped   = -advantages * torch.clamp(ratio, 1-eps, 1+eps)
+    loss = torch.mean(torch.maximum(unclipped, clipped))
+\end{lstlisting}
+
+\begin{conceptbox}
+\textbf{\code{flow\_grpo} 的关键区别}：old policy 是 rollout 时真正存下来的 $\theta_0$
+的 log\_prob。多次梯度更新后 $\theta$ 发生漂移，ratio 真实地偏离 $1$，clip 具有实际意义。
+\end{conceptbox}
+
+% ============================================================
+\subsection{社区讨论的结论}
+% ============================================================
+
+\subsubsection{来源 1：TRL PR \#2565}
+
+\note{\texttt{https://github.com/huggingface/trl/pull/2565\#issuecomment-2595837761}}
+
+TRL 作者 \code{qgallouedec} 的回答：
+
+\begin{intubox}
+\textit{``The math is correct; if you look at the loss, it is indeed equal to the KL value.
+However, in terms of differentiation, we cannot remove the ratio term justifying that it
+equals 1.''}
+
+他指出，必须保留 ratio 项的形式：
+\[
+    \frac{\pi_\theta}{\lfloor \pi_\theta \rfloor_{\mathrm{sg}}}
+\]
+其中下标 $\mathrm{sg}$ 表示 stop-gradient（即 \code{.detach()}）。
+
+写成 \code{exp(logp - logp.detach())} 的原因：\textbf{不是为了模拟 old policy，
+而是为了保留梯度通道}。
+\end{intubox}
+
+\begin{warnbox}
+如果直接删掉 ratio，loss 变成常数（$-\text{advantage}$），梯度为零，\warn{模型不会更新}。
+\end{warnbox}
+
+\subsubsection{来源 2：R1-V Issue \#174}
+
+\note{\texttt{https://github.com/StarsfieldAI/R1-V/issues/174}}
+
+有人认为这是 bug（``open-r1 库一开始犯了这个错误，现在已纠正''），有人认为不是。
+
+\textbf{结论}：两种实现都是正确的，只是适用场景不同：
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{4.2cm} p{4.8cm} p{4.8cm}}
+\hline
+\rule{0pt}{2.4ex}
+& \textbf{\code{logp.detach()} 方式（TRL/R3）}
+& \textbf{存储真实 old logp 方式（flow\_grpo / open-r1 修正版）} \\
+\hline
+每次 rollout 做几次梯度更新 & \good{1 次} & \good{多次}（\code{num\_epochs}）\\
+old policy 来源 & 当前 forward 的 stop-grad 拷贝 & rollout 时真正存下来的 $\theta_0$ \\
+ratio 数值 & 永远 $= 1$ & 真的偏离 $1$ \\
+clip 有用吗 & \bad{无用}（形同虚设） & \good{有用} \\
+数学自洽吗 & \good{✓} 单步更新下自洽 & \good{✓} 多步更新下自洽 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{来源 3：TRL Issue \#2608（最终结论）}
+
+\note{\texttt{https://github.com/huggingface/trl/issues/2608}}
+
+\code{qgallouedec} 明确说明：
+
+\begin{intubox}
+\textit{``In the current implementation, we're just update once after a generation.
+In fact, we align with this sentence from the paper: \emph{The policy model only has a
+single update following each exploration stage.} Therefore it implies that
+$\pi_{\theta_{\mathrm{old}}} = \pi_\theta$, and the equation can be simplified to\ldots''}
+\end{intubox}
+
+\[
+    \mathcal{J}_{\mathrm{GRPO}}(\theta)
+    = \frac{1}{G} \sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|}
+      \left[
+          \frac{\pi_\theta}{\lfloor \pi_\theta \rfloor_{\mathrm{sg}}} \,\hat{A}_{i,t}
+          \;-\;
+          \beta\, \mathbb{D}_{\mathrm{KL}}\!\left[\pi_\theta \,\|\, \pi_{\mathrm{ref}}\right]
+      \right]
+\]
+
+用户 \code{ghrua} 进一步指出（\key{关键结论}）：
+
+\begin{summarybox}
+\textit{``I think the two lines of code are equivalent\ldots the single-update GRPO
+degrades to the standard policy gradient, which is consistent with Eq.~(17) in
+DeepSeekMath.''}
+
+\medskip
+\begin{lstlisting}[language=Python]
+# 这两行完全等价（梯度相同）
+loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages
+loss = -per_token_logps * advantages   # <- 就是 REINFORCE
+\end{lstlisting}
+
+\medskip
+\textbf{证明（链式法则）：}
+\[
+    \frac{\partial}{\partial\theta}
+    \Bigl[\exp\!\bigl(\log p - \underbrace{\log p}_{\mathrm{sg}}\bigr)\Bigr]
+    = \exp(0) \cdot \frac{\partial \log p}{\partial \theta}
+    = \frac{\partial \log p}{\partial \theta}
+\]
+\end{summarybox}
+
+% ============================================================
+\subsection{最终结论}
+% ============================================================
+
+\subsubsection{R3 的 GRPO loss 本质上是什么？}
+
+\begin{summarybox}
+\textbf{带 group-relative advantage 归一化的 REINFORCE（Policy Gradient）}
+\[
+    \mathcal{L} = -\log p_\theta \cdot A
+\]
+其中 advantage $A$ 用 GRPO 的 group-relative 方式归一化（组内减均值除标准差）。
+\end{summarybox}
+
+\subsubsection{三个层次的理解}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{2.5cm} p{10cm}}
+\hline
+\rule{0pt}{2.4ex}
+层次 & 结论 \\
+\hline
+数值上 & \code{exp(logp - logp.detach())} $= 1$，ratio 永远等于 $1$ \\
+梯度上 & 等价于直接写 $\log p \times A$，即标准 REINFORCE \\
+算法上 & 单步 GRPO $=$ REINFORCE $+$ GRPO 的 group-relative advantage \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{R3 和 flow\_grpo 的本质区别}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{3.8cm} p{4.8cm} p{4.8cm}}
+\hline
+\rule{0pt}{2.4ex}
+& \textbf{R3（单步）} & \textbf{flow\_grpo（多步）} \\
+\hline
+算法名称 & REINFORCE + group advantage & GRPO with importance sampling \\
+采样效率 & \bad{低}（每个 rollout 只用 1 次） & \good{高}（每个 rollout 复用 \code{num\_epochs} 次）\\
+实现复杂度 & 简单 & 需要存储 \code{old\_log\_prob}，处理多轮更新 \\
+是否需要 clip & \bad{不需要}（ratio$=1$，clip 无效） & \good{需要}（ratio 真的偏离 $1$）\\
+是否正确 & \good{✓} 单步下数学自洽 & \good{✓} 多步下数学自洽 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{ref\_model 的角色（常见混淆点）}
+
+\begin{warnbox}
+\code{ref\_model} \warn{不是} old policy，和 importance ratio 没有关系。
+
+\begin{itemize}
+    \item \key{old policy}：用于 importance ratio（$\pi_{\mathrm{new}} / \pi_{\mathrm{old}}$），
+          在单步实现中退化为 \code{logp.detach()}
+    \item \key{ref\_model}：用于 KL penalty（防止训练后的策略偏离预训练模型太远），
+          是一个\textbf{冻结的预训练权重快照}
+\end{itemize}
+\end{warnbox}
+
+\begin{lstlisting}[language=Python]
+# KL penalty（ref_model 的用途）
+kl = exp(ref_logp - logp) - (ref_logp - logp) - 1   # K3 估计
+
+# importance ratio（和 ref_model 无关）
+ratio = exp(logp - logp.detach())   # = 1
+\end{lstlisting}
+
+% ============================================================
+\subsection{如果想升级为真正的多步 GRPO}
+% ============================================================
+
+\begin{conceptbox}
+R3 中 \code{RolloutStepResult} 已经存了 \code{log\_prob}，基础设施完备。
+以下改动是\textbf{性能优化方向}（提高采样效率），而不是纠正错误。
+\end{conceptbox}
+
+\textbf{步骤 1：rollout 时标记 old\_log\_prob}（已有，无需改动）
+
+\begin{lstlisting}[language=Python]
+rollout_result.log_prob = log_probs[i]   # 这就是 old log_prob
+\end{lstlisting}
+
+\textbf{步骤 2：训练循环中重新计算 new log\_prob}
+
+\begin{lstlisting}[language=Python]
+for epoch in range(num_epochs):   # 新增多次更新
+    log_prob_new = recompute_from_packed_input(...)
+    old_log_prob = loss_info["old_log_probs"]   # 从 rollout 存的值取
+
+    ratio = torch.exp(log_prob_new - old_log_prob)   # 真实 ratio
+
+    unclipped = -advantages * ratio
+    clipped   = -advantages * torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
+    loss = torch.mean(torch.maximum(unclipped, clipped))
+\end{lstlisting}
+
+% ============================================================
+\subsection{补充：什么是 REINFORCE（Policy Gradient）}
+% ============================================================
+
+\subsubsection{背景}
+
+REINFORCE 是 Williams（1992）提出的最基础的策略梯度算法，是所有现代强化学习方法
+（PPO、GRPO 等）的祖先。
+
+\subsubsection{核心思想}
+
+智能体（策略 $\pi_\theta$）采取行动 $a$，获得奖励 $R$。目标是最大化期望奖励：
+\[
+    J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\bigl[R(\tau)\bigr]
+\]
+
+对 $\theta$ 求梯度，利用 \key{log-derivative trick}：
+\[
+    \nabla_\theta J(\theta)
+    = \mathbb{E}\!\left[R(\tau) \cdot \nabla_\theta \log \pi_\theta(a \mid s)\right]
+\]
+
+\begin{intubox}
+\textbf{直觉}：如果某个行动得到了高奖励，就增大它的概率（$\log\pi$ 增大）；
+如果得到了低奖励，就减小它的概率。
+\end{intubox}
+
+\subsubsection{对应的 loss 写法（PyTorch 风格）}
+
+\begin{lstlisting}[language=Python]
+loss = -(log_prob * reward).mean()
+#        ^  要最大化 J，等价于最小化 -J
+#        ^  log pi_theta(a|s)
+#                   ^  奖励 R（或 advantage A）
+\end{lstlisting}
+
+\subsubsection{Advantage 版本（减 baseline）}
+
+原始 REINFORCE 方差很大。用 advantage $A = R - b$（$b$ 是 baseline，通常是 value
+function 的预测值）代替原始奖励，可以大幅降低方差：
+
+\begin{lstlisting}[language=Python]
+loss = -(log_prob * advantage).mean()
+\end{lstlisting}
+
+\begin{conceptbox}
+\begin{itemize}
+    \item $A > 0$：这个行动比平均水平\good{好} \quad$\Rightarrow$\quad 增大概率
+    \item $A < 0$：这个行动比平均水平\bad{差} \quad$\Rightarrow$\quad 减小概率
+    \item $A = 0$：和平均水平一样 \quad$\Rightarrow$\quad 不更新
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{GRPO 的 advantage 怎么算}
+
+GRPO 不需要 Critic（value function），用\key{组内相对奖励}作为 advantage：
+
+\begin{lstlisting}[language=Python]
+# 同一个 prompt，采样 G 个输出，计算相对排名
+rewards = [r_1, r_2, r_3, ..., r_G]             # G 个输出的奖励
+mean_r  = mean(rewards)
+std_r   = std(rewards)
+advantage_i = (r_i - mean_r) / (std_r + 1e-8)  # 组内 z-score 归一化
+\end{lstlisting}
+
+不需要额外训练一个 Critic 网络，结构简单，这是 GRPO 相比 PPO 的主要优势。
+
+\subsubsection{REINFORCE $\to$ PPO $\to$ GRPO 演化路径}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{3.2cm} p{5.0cm} p{5.0cm}}
+\hline
+\rule{0pt}{2.4ex}
+算法 & 改进点 & 缺陷 \\
+\hline
+REINFORCE (1992)
+    & 最基础的策略梯度
+    & 单步更新，采样效率低；方差大 \\
+PPO (2017)
+    & importance ratio 让同一批数据多次更新；clip 防止更新步长过大
+    & 需要 Critic（value function），参数量翻倍，训练复杂 \\
+GRPO (2024, DeepSeekMath)
+    & 去掉 Critic，用 group-relative reward 代替 advantage；保留 importance ratio + clip（多步更新时）
+    & 单步退化：$\pi_{\mathrm{old}} = \pi_{\mathrm{new}} \Rightarrow \text{ratio} = 1
+      \Rightarrow$ 等价于 REINFORCE + group advantage \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{对应到 R3 代码}
+
+\begin{lstlisting}[language=Python]
+# R3 的实际计算（单步更新时）
+loss = -(log_prob_per_image * cur_image_advantages).sum() / total_image_num
+
+# 其中 cur_image_advantages 来自 GRPO 的 group-relative 归一化：
+# advantage_i = (reward_i - mean(rewards_in_group)) / std(rewards_in_group)
+\end{lstlisting}
+
+\begin{summarybox}
+这就是完整的 \key{REINFORCE with group-relative baseline}，数学上等价于单步 GRPO。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考链接}
+% ============================================================
+
+\begin{itemize}
+    \item TRL PR \#2565 作者解释：
+          \texttt{https://github.com/huggingface/trl/pull/2565\#issuecomment-2595837761}
+    \item TRL Issue \#2608 最终讨论：
+          \texttt{https://github.com/huggingface/trl/issues/2608}
+    \item R1-V Issue \#174 社区争论：
+          \texttt{https://github.com/StarsfieldAI/R1-V/issues/174}
+    \item flow\_grpo 多步实现参考：
+          \texttt{https://github.com/yifan123/flow\_grpo}
+    \item DeepSeekMath 论文 Eq.~(17)：单步 GRPO 退化为标准 policy gradient
+\end{itemize}

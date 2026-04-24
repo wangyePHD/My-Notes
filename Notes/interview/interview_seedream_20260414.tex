@@ -1,0 +1,317 @@
+% ============================================================
+% SeeDream（字节跳动）技术面试笔记
+% 日期：2026/04/14
+% ============================================================
+
+\section{面试笔记：SeeDream · 2026/04/14}
+
+\begin{conceptbox}
+\textbf{面试速查笔记 · 2026/04/14 · 字节跳动 SeeDream 组}\\
+岗位方向：\\
+面试形式：技术追问，共 4 题\\
+涵盖：UMM 编辑数据的作用、交织多模态数据构造、Flow-GRPO 的 ODE→SDE 转换、CFG 贝叶斯推导
+\end{conceptbox}
+
+% ============================================================
+\subsection{Q1：UMM 中，编辑数据如何同时促进理解和生成？}
+% ============================================================
+
+\begin{warnbox}
+\textbf{面试官追问重点：}\\
+编辑数据明显是为了生成任务设计的，\bad{为什么它能促进理解？}
+机制到底是什么？
+\end{warnbox}
+
+\subsubsection{核心机制：反事实学习（Counterfactual Learning）}
+
+\begin{conceptbox}
+\textbf{一句话：} 编辑数据构造了"原图 $\leftrightarrow$ 编辑图"的\key{反事实对}，迫使模型精确理解"哪里变了、为什么变"，从而同时学会"看懂差异"（理解）和"精准改动"（生成）。
+\end{conceptbox}
+
+一条编辑样本包含三元组：$\langle I_\text{src},\; \text{instruction},\; I_\text{tgt}\rangle$
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $I_\text{src}$：原始图像
+  \item \text{instruction}：编辑指令（"把背景改成海边"、"把猫换成狗"）
+  \item $I_\text{tgt}$：编辑后图像
+\end{itemize}
+
+\begin{intubox}
+\textbf{为什么能促进理解？}\\
+要生成正确的 $I_\text{tgt}$，模型\key{必须}：
+\begin{enumerate}
+  \item 精确定位原图中被编辑的区域（空间理解）
+  \item 理解指令语义与图像内容的对应关系（跨模态对齐）
+  \item 保持未编辑区域不变（全局一致性理解）
+\end{enumerate}
+这三个能力都是纯粹的\key{视觉理解}能力，只不过是通过生成任务"倒逼"出来的。
+\end{intubox}
+
+\subsubsection{信息流共享（Shared Information Flow）}
+
+UMM 架构中，理解分支和生成分支\key{共享同一个 Transformer 主干}的中间表示：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 编辑任务产生的丰富语义特征（"哪里是猫、哪里是背景"）直接流入理解分支
+  \item 理解分支的精细语义对齐反过来指导生成分支的空间布局
+  \item 一个数据样本同时为两个分支提供梯度信号
+\end{itemize}
+
+\begin{summarybox}
+\textbf{总结：}\\
+编辑数据 = \key{反事实对} + \key{共享信息流}。\\
+它是"用生成任务的形式，训练理解能力"的最佳载体——因为编辑要求模型在亚区域级别理解图像语义，这比纯粹的 caption/VQA 任务提供了更精细的监督信号。
+\end{summarybox}
+
+% ============================================================
+\subsection{Q2：交织多模态数据（Interleaved Multimodal Data）如何构造？}
+% ============================================================
+
+\begin{warnbox}
+\textbf{面试官追问重点：}\\
+起点是什么数据？每一步怎么做？最终格式是什么样的？
+\end{warnbox}
+
+\subsubsection{构造流程（四步）}
+
+\begin{conceptbox}
+\textbf{出发点：} 视频（天然包含时序一致的多帧图像 + 对应字幕/旁白）
+\end{conceptbox}
+
+\textbf{Step 1：抽帧}
+
+以固定帧率（或场景切换）从视频中抽取 $N$ 帧：$\{f_1, f_2, \ldots, f_N\}$
+
+\begin{lstlisting}
+视频 -> 场景切割 -> 均匀抽帧 -> [f_1, f_2, ..., f_N]
+\end{lstlisting}
+
+\textbf{Step 2：生成 Global Caption}
+
+用强力 VLM（如 InternVL2、Qwen-VL）对\key{整段视频}生成全局描述，覆盖：
+\begin{itemize}[leftmargin=1.5em]
+  \item 场景整体语义（"海边日落，一对情侣散步"）
+  \item 时序动作描述（"镜头从左向右缓慢平移"）
+  \item 关键对象和属性
+\end{itemize}
+
+\textbf{Step 3：生成 Local Caption（Panoptic Caption 风格）}
+
+对每一帧 $f_i$ 单独生成精细描述，包含：
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{全景分割级别}的细节：前景对象 + 背景区域分别描述
+  \item 空间布局："左侧有一棵椰子树，右下角有一只海鸥"
+  \item 与 Global Caption 的\key{差异}：本帧特有的内容（运动模糊、遮挡等）
+\end{itemize}
+
+\begin{intubox}
+\textbf{为什么叫 Panoptic Caption？}\\
+Panoptic Segmentation（全景分割）= Things（可数对象）+ Stuff（不可数背景）。\\
+Local Caption 参考这个思路，对每帧分别描述前景实例和背景区域，提供\key{区域级别的细粒度对齐}信号。
+\end{intubox}
+
+\textbf{Step 4：组装交织序列}
+
+将 Global Caption、图像帧、Local Caption 按照文本-图像交织的格式组合：
+
+\begin{lstlisting}
+[Global Caption 文本]
+<image> [f_1 的 Local Caption]
+<image> [f_2 的 Local Caption]
+...
+<image> [f_N 的 Local Caption]
+\end{lstlisting}
+
+其中 \code{<image>} 是图像占位符，在实际训练时替换为对应帧的 visual token 序列。
+
+\begin{summarybox}
+\textbf{总结：}\\
+视频 $\to$ 抽帧 $\to$ Global Caption（全局语义）$\to$ Local Caption（逐帧细节）$\to$ 交织序列。\\
+这种构造方式天然包含\key{时序一致性}和\key{多粒度对齐}，是训练交织多模态理解与生成能力的高质量数据。
+\end{summarybox}
+
+% ============================================================
+\subsection{Q3：Flow-GRPO 中如何把 ODE 转换为 SDE？}
+% ============================================================
+
+\begin{warnbox}
+\textbf{面试官追问重点：}\\
+为什么 ODE 不能直接用于 RL？转换的数学依据是什么？SDE 新增了哪些项？
+\end{warnbox}
+
+\subsubsection{问题起点：ODE 确定性，无法探索}
+
+Flow Matching 的前向过程是一个\key{概率流 ODE（Probability Flow ODE）}：
+
+\[
+dx = v_\theta(x_t, t)\, dt
+\]
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 给定初始点 $x_0$，轨迹\key{完全确定}
+  \item RL 需要\key{随机采样}来探索策略空间——ODE 无法提供这种随机性
+  \item 无法定义有意义的"策略 $\pi_\theta$"和"动作分布"
+\end{itemize}
+
+\subsubsection{转换：ODE → SDE（Fokker-Planck 方程保证等价性）}
+
+\begin{conceptbox}
+\textbf{核心定理（Anderson 1982）：} 任何概率流 ODE 都对应一族等价 SDE，它们具有\key{相同的边际分布} $p_t(x)$。
+\end{conceptbox}
+
+对概率流 ODE，对应的 SDE 为：
+
+\[
+dx = \underbrace{v_\theta(x_t, t)\, dt}_{\text{原 ODE 漂移}} + \underbrace{\frac{\sigma_t^2}{2} \nabla \log p_t(x_t)\, dt}_{\text{score 修正项}} + \underbrace{\sigma_t\, dW_t}_{\text{布朗运动噪声}}
+\]
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.5cm}p{9cm}}
+\hline
+\textbf{项} & \textbf{含义} \\
+\hline
+$v_\theta(x_t, t)\, dt$ & 原始 Flow Matching 的速度场（确定性漂移） \\
+$\sigma_t\, dW_t$ & 新增布朗运动：提供\key{随机探索}，$\sigma_t$ 控制噪声强度 \\
+$\frac{\sigma_t^2}{2} \nabla \log p_t(x_t)\, dt$ & Score 修正：补偿随机噪声对边际分布的破坏，保证 $p_t$ 不变 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{Fokker-Planck 的作用：}\\
+Fokker-Planck 方程描述概率密度在漂移和扩散下的演化。对上面的 SDE，可以验证 $\partial_t p_t$ 的表达式与原 ODE 完全相同——即\key{边际分布 $p_t(x)$ 不变}。\\
+直觉：score 修正项精确抵消了布朗运动引入的额外扩散，使系统在统计意义上等价于原 ODE。
+\end{intubox}
+
+\subsubsection{实践中的离散近似}
+
+实际采样时，使用 Euler-Maruyama 离散化：
+
+\[
+x_{t+\Delta t} = x_t + v_\theta(x_t, t)\,\Delta t + \frac{\sigma_t^2}{2} \nabla \log p_t(x_t)\,\Delta t + \sigma_t \sqrt{\Delta t}\,\varepsilon, \quad \varepsilon \sim \mathcal{N}(0, I)
+\]
+
+其中 $\nabla \log p_t(x_t)$ 用已训练的 score 网络（或由 $v_\theta$ 推导）近似。
+
+\begin{summarybox}
+\textbf{总结：}\\
+ODE → SDE 的关键是：在原漂移基础上\key{加布朗运动噪声}（提供探索），同时\key{加 score 修正项}（保持边际分布不变）。\\
+Fokker-Planck 方程是数学保证：两者的 $p_t$ 相同，因此 SDE 的采样结果在分布上等价于 ODE，但多了随机性，可以用于 RL 的策略优化。
+\end{summarybox}
+
+% ============================================================
+\subsection{Q4：CFG（Classifier-Free Guidance）的贝叶斯推导}
+% ============================================================
+
+\begin{warnbox}
+\textbf{面试官追问重点：}\\
+CFG 的公式是怎么来的？能从贝叶斯角度完整推导吗？
+\end{warnbox}
+
+\subsubsection{目标：从无条件分布采样条件分布}
+
+我们希望从\key{条件分布} $p(x \mid c)$ 采样（给定文本条件 $c$ 生成图像 $x$），而模型同时训练了：
+\begin{itemize}[leftmargin=1.5em]
+  \item 条件模型：$\varepsilon_\theta(x_t, c)$（有条件噪声预测）
+  \item 无条件模型：$\varepsilon_\theta(x_t, \varnothing)$（条件置为空，\code{null} token）
+\end{itemize}
+
+\subsubsection{Step 1：贝叶斯展开条件 Score}
+
+对 $p(x \mid c)$ 取对数梯度（score function）：
+
+\[
+\nabla_x \log p(x \mid c) = \nabla_x \log \frac{p(x) \cdot p(c \mid x)}{p(c)}
+\]
+
+\[
+= \nabla_x \log p(x) + \nabla_x \log p(c \mid x) - \underbrace{\nabla_x \log p(c)}_{=0,\;\text{与 }x\text{ 无关}}
+\]
+
+\[
+\boxed{\nabla_x \log p(x \mid c) = \nabla_x \log p(x) + \nabla_x \log p(c \mid x)}
+\]
+
+\begin{intubox}
+这就是"条件生成 = 无条件生成 + 分类器梯度"的贝叶斯来源。$\nabla_x \log p(c|x)$ 正是\key{分类器}在图像空间的梯度——指向使条件 $c$ 更可能成立的方向。
+\end{intubox}
+
+\subsubsection{Step 2：用噪声预测器替换 Score}
+
+在扩散模型 / Flow Matching 中，score function 与噪声预测器 $\varepsilon_\theta$ 的关系为：
+
+\[
+\nabla_{x_t} \log p_t(x_t) \approx -\frac{1}{\sigma_t} \varepsilon_\theta(x_t)
+\]
+
+代入 Step 1 的结论，条件 score 变为：
+
+\[
+-\frac{1}{\sigma_t} \varepsilon_\theta(x_t, c) = -\frac{1}{\sigma_t} \varepsilon_\theta(x_t, \varnothing) + \nabla_{x_t} \log p(c \mid x_t)
+\]
+
+\subsubsection{Step 3：引入引导强度 $w$，得到 CFG 公式}
+
+对分类器梯度项乘以引导权重 $w > 0$（放大条件信号）：
+
+\[
+\nabla_{x_t} \log p_w(x_t \mid c) = \nabla_{x_t} \log p(x_t) + w \cdot \nabla_{x_t} \log p(c \mid x_t)
+\]
+
+再次用噪声预测器替换，整理得到：
+
+\[
+\boxed{\tilde{\varepsilon}(x_t, c) = \varepsilon_\theta(x_t, \varnothing) + w \cdot \left[\varepsilon_\theta(x_t, c) - \varepsilon_\theta(x_t, \varnothing)\right]}
+\]
+
+\begin{center}
+{\small
+\begin{tabular}{p{5cm}p{8.5cm}}
+\hline
+\textbf{项} & \textbf{含义} \\
+\hline
+$\varepsilon_\theta(x_t, \varnothing)$ & 无条件预测：基础生成方向 \\
+$\varepsilon_\theta(x_t, c) - \varepsilon_\theta(x_t, \varnothing)$ & 条件引导向量：条件相对无条件的"增量" \\
+$w$ & 引导强度：$w=0$ 退化为无条件，$w=1$ 为纯条件，$w>1$ 过引导 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{为什么叫 Classifier-\textit{Free}？}\\
+上面的推导在形式上需要 $\nabla_x \log p(c|x)$（分类器梯度）。CFG 的关键洞察是：
+\[
+\nabla_x \log p(c|x) \propto \varepsilon_\theta(x_t, c) - \varepsilon_\theta(x_t, \varnothing)
+\]
+这个差值\key{隐式地}扮演了分类器梯度的角色——无需真正训练一个单独的分类器，只需用同一个模型在有条件和无条件两种模式下做两次前向传播。
+\end{warnbox}
+
+\begin{summarybox}
+\textbf{CFG 推导三步：}\\
+1. \key{贝叶斯分解}：$\nabla\log p(x|c) = \nabla\log p(x) + \nabla\log p(c|x)$\\
+2. \key{Score ↔ 噪声预测器}：$\nabla\log p_t \approx -\varepsilon_\theta / \sigma_t$\\
+3. \key{引导权重}：对条件增量乘以 $w$，得到 $\tilde{\varepsilon} = \varepsilon_\text{unc} + w(\varepsilon_\text{cond} - \varepsilon_\text{unc})$\\[4pt]
+本质：用\key{无条件模型 + 两次前向差值}，无需独立分类器，实现可控的条件增强。
+\end{summarybox}
+
+% ============================================================
+\subsection{总结对比}
+% ============================================================
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4.5cm}p{5.5cm}}
+\hline
+\textbf{题目} & \textbf{核心关键词} & \textbf{一句话答案} \\
+\hline
+UMM 编辑数据 & 反事实对、共享信息流 & 编辑 = 强迫模型理解"哪里变了"，同时为理解和生成提供梯度 \\
+交织数据构造 & 视频抽帧、Global/Local Caption & 视频→抽帧→全局描述→逐帧细描→文图交织序列 \\
+ODE → SDE & Fokker-Planck、score 修正 & 加布朗运动噪声 + score 补偿，保持边际分布不变 \\
+CFG 推导 & 贝叶斯、score function & $\tilde\varepsilon = \varepsilon_\text{unc} + w(\varepsilon_\text{cond} - \varepsilon_\text{unc})$，无需独立分类器 \\
+\hline
+\end{tabular}
+}
+\end{center}

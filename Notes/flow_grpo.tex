@@ -1,0 +1,524 @@
+% ============================================================
+% Flow-GRPO 笔记
+% 论文：https://arxiv.org/abs/2505.05470
+% 代码：https://github.com/yifan123/flow_grpo
+% ============================================================
+
+\section{Flow-GRPO}
+
+% -------------------- Section 1 --------------------
+\subsection{Section 1：为什么把 GRPO 用到图像生成？}
+
+\begin{conceptbox}
+\textbf{核心动机：} 图像生成模型（SD3.5、FLUX）训练目标是"像素级重建"，对"人类到底更喜欢哪张"这类复杂偏好无能为力。\\
+RL 的优势：\key{直接用奖励信号优化你真正关心的目标}——CLIP 分数、文字渲染准确度、人类偏好打分。
+\end{conceptbox}
+
+\textbf{为什么选 GRPO 而不是 PPO？}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \bad{PPO}：需要独立的 Critic 网络估计 value，计算代价高
+  \item \good{GRPO}：同一个 prompt 生成 G 张图，\key{组内相对排名}估计 advantage，不需要 Critic
+\end{itemize}
+
+\begin{warnbox}
+\warn{核心矛盾：} Flow Matching 用的是\key{确定性 ODE 采样}，RL 需要的是\key{随机性 + log 概率}\\
+——这是整篇论文要解决的问题。
+\end{warnbox}
+
+% -------------------- Section 3 --------------------
+\subsection{Section 3：Flow Matching 的 ODE 与 RL 的矛盾}
+
+\subsubsection{Flow Matching 的 ODE}
+
+训练一个速度场 $v_\theta$，让它把噪声沿直线传输到真实图片：
+
+\[
+\frac{dx_t}{dt} = v_\theta(x_t, t)
+\]
+
+训练 loss（让预测速度逼近直线方向）：
+\[
+\mathcal{L} = \mathbb{E}\left[\left\| v_\theta(x_t, t) - (x_1 - x_0) \right\|^2\right]
+\]
+
+\begin{intubox}
+\textbf{直觉：} 给定初始噪声，路径\key{完全确定}——同一个 seed 每次出同一张图。
+\end{intubox}
+
+\subsubsection{为什么 ODE 不能直接用于 RL？}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{没有随机性（无法探索）}\\
+    RL 需要"试不同动作"，ODE 每次走同一条路，无法生成不同结果。
+
+  \item \textbf{无法计算 log 概率}\\
+    Policy Gradient 需要 $\log p_\theta(x_{t-1} \mid x_t)$，\\
+    ODE 是确定性的，每步转移\bad{概率要么是 1 要么是 0}，log prob 无从计算。
+\end{enumerate}
+
+% -------------------- Section 4 --------------------
+\subsection{Section 4：Flow-GRPO — 核心方法}
+
+\subsubsection{4.1 ODE → SDE（引入随机性）}
+
+\textbf{目标：} 在保持边缘分布不变的前提下，给 ODE 加上随机性。
+
+\textbf{原始 ODE（确定性）：}
+\[
+x_{t+\Delta t} = x_t + v_\theta(x_t, t)\,\Delta t
+\]
+
+\textbf{等价 SDE（随机）：}
+\[
+x_{t+\Delta t} = \underbrace{x_t + \left[v_\theta(x_t,t) + \frac{\sigma_t^2}{2t}\bigl(x_t + (1-t)\,v_\theta(x_t,t)\bigr)\right]\Delta t}_{\text{确定性漂移部分（ODE + score 修正）}} + \underbrace{\sigma_t\sqrt{\Delta t}\,\epsilon}_{\text{随机扩散部分}}
+\]
+
+\begin{summarybox}
+$\sigma_t = 0$：退化回 ODE（评估时用，\code{noise\_level=0}）\\
+$\sigma_t > 0$：引入随机性，每次生成路径不同（训练采样时用，\code{noise\_level=0.7\textasciitilde0.9}）
+\end{summarybox}
+
+\begin{intubox}
+\textbf{直觉：} 加了 $\sigma_t\sqrt{\Delta t}\,\epsilon$ 后，每步不再是确定落点，而是在正确方向上"抖动"——这就是 RL 需要的探索。\\
+\textbf{关键保证：} 时刻 $t$ 的边际概率分布 $p_t(x)$ 不变，所以 SDE 生成的图质量和 ODE 一样。
+\end{intubox}
+
+\paragraph{随机扩散部分拆解}
+
+随机扩散项就是在每步确定性移动之后，\textbf{叠加一个随时间自动缩放的高斯抖动}，$\epsilon \sim \mathcal{N}(0, I)$，引入探索性。
+
+\textbf{$\sigma_t$：控制每步抖动幅度}
+
+\[
+\sigma_t = a\sqrt{\frac{t}{1-t}}
+\]
+
+\begin{center}
+\begin{tabular}{p{4cm}p{2.5cm}p{5cm}}
+\hline
+时间位置 & $\sigma_t$ 大小 & 含义 \\
+\hline
+$t$ 接近 0（图像端） & 小 & 快生成图了，少抖，不破坏细节 \\
+$t$ 接近 1（纯噪声端） & 大 & 本来就乱，多抖无妨 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{$\sqrt{\Delta t}$：步长缩放}——来自布朗运动的标准性质：噪声标准差与 $\sqrt{\text{时间}}$ 成正比，而非与时间本身成正比。
+
+对应代码：
+\begin{lstlisting}[language=Python]
+prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1*dt) * variance_noise
+#                                  ^ sigma_t       ^ sqrt(|dt|)    ^ eps ~ N(0,I)
+\end{lstlisting}
+\code{-1*dt}：逆向过程 \code{dt < 0}，取绝对值保证开根号为实数。
+
+\paragraph{漂移部分拆解}
+
+\[
+\text{漂移} = x_t + \left[\underbrace{v_\theta(x_t,t)}_{\text{①原始ODE速度}} + \underbrace{\frac{\sigma_t^2}{2t}\bigl(x_t + (1-t)\,v_\theta(x_t,t)\bigr)}_{\text{②score修正项}}\right]\Delta t
+\]
+
+\textbf{① 原始 ODE 速度项：} 就是原始 Flow Matching ODE 的贡献，没有任何修改。
+
+\textbf{② Score 修正项：} 来自论文对 score function 的代入（公式27）：
+
+\[
+\nabla \log p_t(x) = -\frac{x_t}{t} - \frac{1-t}{t}\,v_\theta(x_t,t)
+\]
+
+反向 SDE 中是 $-\frac{\sigma_t^2}{2}\nabla\log p_t$，score 本身是负的，两个负号抵消，最终符号为正：
+
+\[
+-\frac{\sigma_t^2}{2}\nabla\log p_t = +\frac{\sigma_t^2}{2t}\bigl(x_t + (1-t)\,v_\theta\bigr)
+\]
+
+展开后各子项含义：
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+子项 & 含义 \\
+\hline
+$\dfrac{\sigma_t^2}{2t}x_t\,\Delta t$ & 对当前状态 $x_t$ 的额外"推力"，噪声越大推力越强 \\[6pt]
+$\dfrac{\sigma_t^2(1-t)}{2t}v_\theta\,\Delta t$ & 对速度场的额外加权，时间越早（$t$小）权重越大 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{score 修正项的作用：} 随机扩散项 $\sigma_t\sqrt{\Delta t}\,\epsilon$ 会扰乱时刻 $t$ 的边际概率分布，score 修正项正好\key{精确补偿}这个扰动，保证 $p_t(x)$（时刻 $t$ 的边际概率分布）不变。
+\end{intubox}
+
+\textbf{完整公式–代码对照表（\code{sd3\_sde\_with\_logprob.py}）：}
+
+{\small
+\begin{center}
+\begin{tabular}{p{5cm}p{9.5cm}}
+\hline
+\textbf{公式项（说明）} & \textbf{代码} \\
+\hline
+$\sigma_t = a\sqrt{t/(1-t)}$（扩散系数） & \code{std\_dev\_t = sqrt(sigma/(1-sigma)) * noise\_level} \\
+$x_t$（当前状态） & \code{sample} \\
+$v_\theta(x_t,t)$（速度场） & \code{model\_output} \\
+$\Delta t$（步长，逆向为负） & \code{dt} \\
+\hline
+\multicolumn{2}{l}{\textit{漂移均值 $\mu$（\code{prev\_sample\_mean}）：}} \\
+\hline
+$x_t$（ODE 初始值） & \code{sample * 1} \\
+$\dfrac{\sigma_t^2}{2t}x_t\Delta t$（score 修正 $x_t$） & \code{sample * std\_dev\_t**2/(2*sigma) * dt} \\[4pt]
+$v_\theta\Delta t$（原始 ODE 速度） & \code{model\_output * dt} \\
+$\dfrac{\sigma_t^2(1-t)}{2t}v_\theta\Delta t$（score 修正 $v_\theta$） & \code{model\_output * std\_dev\_t**2*(1-sigma)/(2*sigma) * dt} \\[4pt]
+\hline
+\multicolumn{2}{l}{\textit{随机扩散项：}} \\
+\hline
+$\sigma_t\sqrt{|\Delta t|}$（高斯标准差） & \code{std\_dev\_t * sqrt(-dt)} \\
+$\epsilon \sim \mathcal{N}(0,I)$（随机噪声） & \code{variance\_noise} \\
+$x_{t+\Delta t}$（下一步状态） & \code{prev\_sample} \\
+\hline
+\multicolumn{2}{l}{\textit{供 GRPO 使用：}} \\
+\hline
+$\log\mathcal{N}(x_{t+\Delta t};\mu,\sigma_t^2|\Delta t|)$（重要性权重） & \code{log\_prob} \\
+\hline
+\end{tabular}
+\end{center}
+}
+
+\begin{summarybox}
+\textbf{一句话：} score 修正项是 SDE 为了"抵消随机噪声对分布的破坏"而必须加入的补偿项，\\
+它让 SDE 和 ODE 走出完全相同的边际分布，代价只是多算了一个依赖 $v_\theta$ 和 $x_t$ 的小修正。
+\end{summarybox}
+
+\subsubsection{4.2 log\_prob 公式推导}
+
+\paragraph{为什么每步转移是高斯分布？}
+
+回到 Euler-Maruyama 离散化：
+
+\[
+x_{t+\Delta t} = \underbrace{\mu(x_t,t)}_{\text{已知}x_t\text{后完全确定}} + \underbrace{\sigma_t\sqrt{|\Delta t|}}_{\text{固定数}}\,\underbrace{\epsilon}_{\epsilon\,\sim\,\mathcal{N}(0,I)}
+\]
+
+漂移项 $\mu$ 中的所有输入——$x_t$（已观测）、$v_\theta(x_t,t)$（输入确定则输出确定）、$\sigma_t,t,\Delta t$（超参数）——在给定 $x_t$ 后\textbf{全部固定}。随机性\textbf{唯一来源}是 $\epsilon$。
+
+由高斯分布的线性性质：$\epsilon \sim \mathcal{N}(0,I) \implies a\epsilon+b \sim \mathcal{N}(b,\,a^2I)$，因此：
+
+\[
+x_{t+\Delta t} \mid x_t \;\sim\; \mathcal{N}\!\left(\mu,\; \sigma_t^2|\Delta t|\,I\right)
+\]
+
+\begin{warnbox}
+\textbf{对比 ODE 为什么不行：} ODE 无随机项，给定 $x_t$ 后 $x_{t+\Delta t}$ 唯一确定，是方差为 0 的狄拉克 $\delta$ 函数，\bad{无法写出概率密度}，也就无法计算 $\log p$。
+\end{warnbox}
+
+\paragraph{三步推导 log prob}
+
+\textbf{第一步：} 每步转移分布为高斯（均值 $\mu$，标准差 $s = \sigma_t\sqrt{|\Delta t|}$）。
+
+\textbf{第二步：} 代入一维高斯对数概率密度公式 $\log\mathcal{N}(x;\mu,s^2) = -\frac{(x-\mu)^2}{2s^2} - \log s - \log\sqrt{2\pi}$：
+
+\[
+\log p_\theta(x_{t+\Delta t} \mid x_t) = \underbrace{-\frac{\|x_{t+\Delta t}-\mu\|^2}{2\,\sigma_t^2|\Delta t|}}_{\text{①指数项}} \underbrace{-\log(\sigma_t\sqrt{|\Delta t|})}_{\text{②归一化项}} \underbrace{-\log\sqrt{2\pi}}_{\text{③常数项}}
+\]
+
+\textbf{第三步：} 逐项对照代码（\code{sd3\_sde\_with\_logprob.py} 第 64\textasciitilde68 行）：
+
+\begin{lstlisting}[language=Python, caption=log\_prob 计算]
+log_prob = (
+    # ① 指数项：(x - mu)^2 / (2s^2)
+    -((prev_sample.detach() - prev_sample_mean) ** 2)
+    / (2 * ((std_dev_t * torch.sqrt(-1*dt)) ** 2))
+    # ② 归一化项：log(s)
+    - torch.log(std_dev_t * torch.sqrt(-1*dt))
+    # ③ 常数项：log(sqrt(2pi))
+    - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+)
+\end{lstlisting}
+
+\begin{center}
+\begin{tabular}{p{0.5cm}p{4cm}p{6cm}}
+\hline
+项 & 公式 & 直觉 \\
+\hline
+① & $-\dfrac{(x-\mu)^2}{2s^2}$ & 落点越偏离均值，概率越低 \\[4pt]
+② & $-\log s$ & 分布越宽（$s$ 大），每点概率密度越低 \\
+③ & $-\log\sqrt{2\pi}$ & 高斯归一化常数，固定值 \\
+\hline
+\end{tabular}
+\end{center}
+
+整条轨迹 log prob（各步求和）：
+
+\[
+\log p_\theta(\tau) = \sum_{t=0}^{T-1} \log p_\theta(x_{t+1} \mid x_t)
+\]
+
+\paragraph{为什么需要 log prob？}
+
+GRPO 计算重要性权重比：
+
+\[
+r_t^i(\theta) = \frac{p_\theta(x_{t-1}^i \mid x_t^i)}{p_{\theta_{\text{old}}}(x_{t-1}^i \mid x_t^i)} = \exp\!\left(\log p_\theta - \log p_{\theta_{\text{old}}}\right)
+\]
+
+有了 \code{log\_prob}，直接相减取 $\exp$ 即可，\key{数值稳定且高效}。
+
+\subsubsection{4.3 GRPO Loss 适配 Flow Matching}
+
+\textbf{完整三步流程：}
+
+\textbf{Step 1 — 采样（SDE 推理）}
+
+同一个 prompt $c$，用当前策略采样 $G$ 张图 $\{x_i^0\}_{i=1}^G$，同时记录每步的 \code{log\_prob\_old}。
+
+\textbf{Step 2 — Advantage（组内归一化）}
+
+\[
+\hat{A}_i = \frac{R(x_i, c) - \mu(R)}{\sigma(R)}
+\]
+
+$A_i > 0$：这张图比组内平均好，增大其概率；$A_i < 0$：比平均差，减小其概率。
+
+\textbf{Step 3 — GRPO Objective}
+
+\[
+\mathcal{J}(\theta) = \mathbb{E}\left[\frac{1}{G}\sum_{i=1}^G \frac{1}{T}\sum_{t=0}^{T-1} \min\!\left(r_i^t \hat{A}_i,\; \text{clip}(r_i^t, 1-\epsilon, 1+\epsilon)\hat{A}_i\right) - \beta \cdot \text{KL}(\pi_\theta \| \pi_{\text{ref}})\right]
+\]
+
+其中 importance ratio：
+\[
+r_i^t = \frac{p_\theta(x_{t-1} \mid x_t, c)}{p_{\text{old}}(x_{t-1} \mid x_t, c)} = \exp\!\left(\log p_\theta - \log p_{\text{old}}\right)
+\]
+
+对应代码：
+
+\begin{lstlisting}[language=Python, caption=GRPO Loss（train\_sd3.py 第 956\textasciitilde968 行）]
+ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+unclipped_loss = -advantages * ratio
+clipped_loss   = -advantages * torch.clamp(ratio, 1-clip_range, 1+clip_range)
+policy_loss    = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+\end{lstlisting}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{clip}：防止策略更新步子太大（PPO 的经典稳定技巧）
+  \item \key{KL 惩罚}：防止奖励 hacking，不让模型离参考策略太远
+  \item \key{对所有 T 步求平均}：Flow Matching 每步都是一个"动作"
+\end{itemize}
+
+% -------------------- Section 5 --------------------
+\subsection{Section 5：训练代码详解}
+
+\subsubsection{5.1 整体训练流程}
+
+每个 epoch 分两阶段循环交替：
+
+\begin{center}
+\begin{tabular}{p{14cm}}
+\hline
+\textbf{采样阶段}（\code{no\_grad}）：SDE 推理 $\to$ 生成图片 $\to$ 算奖励 $\to$ 记录旧策略 \code{log\_prob} \\
+$\downarrow$ \\
+\textbf{训练阶段}（\code{with\_grad}）：新策略重算 \code{log\_prob} $\to$ PPO-clip Loss $\to$ 反向传播更新 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{5.2 同一 Prompt 生成 k 张图（\code{DistributedKRepeatSampler}）}
+
+GRPO 需要对同一个 prompt 生成多张图，才能做\key{组内奖励比较}（计算 Advantage）：
+
+\[
+\text{Prompt} \to [\text{图}_1, \text{图}_2, \ldots, \text{图}_k] \implies \hat{A}_i = \frac{R_i - \bar{R}}{\sigma_R}
+\]
+
+\begin{lstlisting}[language=Python]
+# 每个 prompt 重复 k 次
+repeated_indices = [idx for idx in indices for _ in range(self.k)]
+# 多 GPU 切分：每张卡拿到 k 张中的一部分
+per_card_samples = shuffled_samples[rank * batch_size : (rank+1) * batch_size]
+\end{lstlisting}
+
+\subsubsection{5.3 采样阶段}
+
+\paragraph{SDE 推理}
+
+\begin{lstlisting}[language=Python]
+images, latents, log_probs = pipeline_with_logprob(
+    pipeline,
+    noise_level=config.sample.noise_level,  # >0 启用 SDE，=0 退化为 ODE
+    num_inference_steps=config.sample.num_steps,  # 训练用少步数（如10步）
+)
+\end{lstlisting}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{noise\_level > 0}：启用 SDE，每步有随机性 $\to$ 探索
+  \item \code{noise\_level = 0}：退化为纯 ODE，用于评估（质量更好）
+\end{itemize}
+
+\paragraph{存储的关键数据}
+
+\begin{lstlisting}[language=Python]
+samples.append({
+    "latents":      latents[:, :-1],   # x_t，每步输入
+    "next_latents": latents[:, 1:],    # x_{t-1}，每步输出（SDE 结果）
+    "log_probs":    log_probs,         # 旧策略 log p_old，训练时作分母
+    "rewards":      rewards,           # Future 对象，异步并行计算
+    "timesteps":    timesteps,
+})
+\end{lstlisting}
+
+\paragraph{奖励计算异步化}
+
+奖励函数（OCR、VLM 打分等）耗时长，用异步避免 GPU 空转：
+
+\begin{center}
+\begin{tabular}{p{13cm}}
+\hline
+\textbf{同步（慢）}：GPU 推理完等奖励 $\to$ GPU 空转\\
+\textbf{异步（快）}：GPU 推理下一 batch，后台同时算上一 batch 的奖励\\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{lstlisting}[language=Python]
+for i in range(config.sample.num_batches_per_epoch):
+    images, latents, log_probs = pipeline_with_logprob(...)  # GPU 推理
+    rewards = executor.submit(reward_fn, images, prompts)    # 扔后台，不阻塞
+    time.sleep(0)   # 主动让出 GIL，让后台线程先跑起来
+    samples.append({..., "rewards": rewards})
+
+# 所有 batch 采样完，统一取结果（大概率早已算完）
+for sample in samples:
+    rewards, _ = sample["rewards"].result()
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{\code{time.sleep(0)} 的作用：} Python GIL 同一时刻只允许一个线程运行，\code{sleep(0)} 主动放弃时间片，让后台奖励线程先跑起来；之后 GPU 推理会自动释放 GIL，两者真正并行。
+\end{intubox}
+
+\subsubsection{5.4 Advantage 计算}
+
+\textbf{per-prompt 归一化（推荐）：} 由 \code{PerPromptStatTracker} 跟踪每个 prompt 的历史统计，避免不同难度 prompt 混淆：
+
+\[
+\hat{A}_i = \frac{R_i - \mu_{\text{prompt}}}{\sigma_{\text{prompt}} + \varepsilon}
+\]
+
+\textbf{全局归一化（backup）：}
+
+\begin{lstlisting}[language=Python]
+advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+\end{lstlisting}
+
+\textbf{过滤无效样本：} std=0 意味着同 prompt 所有图奖励完全一样，Advantage=0，对训练无贡献：
+
+\begin{lstlisting}[language=Python]
+mask = (samples["advantages"].abs().sum(dim=1) != 0)
+samples = {k: v[mask] for k, v in samples.items()}
+\end{lstlisting}
+
+\subsubsection{5.5 训练阶段}
+
+\paragraph{重算 log\_prob（\code{compute\_log\_prob}）}
+
+\begin{lstlisting}[language=Python]
+noise_pred = transformer(hidden_states=x_t, timestep=t, ...)
+noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+# 传入采样时存的 x_{t-1}，只算概率，不重新采样
+_, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
+    scheduler, noise_pred, t, x_t,
+    prev_sample=x_{t-1},   # 固定！不重新采样
+    noise_level=...
+)
+\end{lstlisting}
+
+\paragraph{PPO-clip Loss}
+
+\[
+\mathcal{L} = \mathbb{E}\!\left[\max\!\left(-\hat{A}\cdot r,\; -\hat{A}\cdot\text{clip}(r,1{-}\varepsilon,1{+}\varepsilon)\right)\right], \quad r = \exp(\log p_\text{new} - \log p_\text{old})
+\]
+
+\begin{lstlisting}[language=Python]
+ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+unclipped_loss = -advantages * ratio
+clipped_loss   = -advantages * torch.clamp(ratio, 1-eps, 1+eps)
+policy_loss    = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+\end{lstlisting}
+
+\paragraph{KL 正则项}
+
+防止偏离预训练模型（避免 reward hacking）。利用 \code{disable\_adapter()} 直接禁用 LoRA 得到参考模型，\key{零额外显存开销}：
+
+\[
+\mathcal{L}_\text{KL} = \frac{\|\mu_\theta - \mu_\text{ref}\|^2}{2\sigma_t^2}, \qquad \mathcal{L} = \mathcal{L}_\text{PPO} + \beta\,\mathcal{L}_\text{KL}
+\]
+
+\begin{lstlisting}[language=Python]
+with transformer.module.disable_adapter():
+    _, _, prev_sample_mean_ref, _ = compute_log_prob(...)
+
+kl_loss = ((prev_sample_mean - prev_sample_mean_ref)**2).mean() / (2 * std_dev_t**2)
+loss = policy_loss + beta * kl_loss
+\end{lstlisting}
+
+\paragraph{梯度累积}
+
+每个样本需对所有时间步做前向，因此：
+
+\begin{lstlisting}[language=Python]
+gradient_accumulation_steps = config.train.gradient_accumulation_steps * num_train_timesteps
+\end{lstlisting}
+
+\subsubsection{5.6 关键设计决策}
+
+{\small
+\begin{center}
+\begin{tabular}{p{5cm}p{9cm}}
+\hline
+\textbf{设计} & \textbf{作用} \\
+\hline
+SDE 替代 ODE & 引入随机探索，让 GRPO 有多样轨迹 \\
+\code{noise\_level} 超参 & 控制探索量，评估时设为 0 恢复 ODE \\
+Denoising Reduction（T=10） & 训练用少步数节省时间；推理用原始步数（T=40）保证质量 \\
+LoRA 微调 & 只训练 attention Q/K/V/O，参数少稳定性高 \\
+EMA & 用历史权重平均做采样，比当前训练权重更稳定 \\
+异步奖励计算 & 奖励计算与下一批采样并行，不浪费 GPU \\
+\code{disable\_adapter()} & 零额外显存获取参考模型（直接禁用 LoRA） \\
+per-prompt 归一化 & 避免不同难度 prompt 的奖励互相干扰 \\
+\hline
+\end{tabular}
+\end{center}
+}
+
+% -------------------- 总结 --------------------
+\subsection{全文串联总结}
+
+\begin{summarybox}
+\textbf{整篇论文的核心贡献就一句话：}\\
+\key{SDE 转换让 log\_prob 可算，log\_prob 可算让 GRPO 能跑。}
+
+\vspace{0.5em}
+\begin{center}
+\begin{tabular}{c}
+Flow Matching ODE（确定性，无法做 RL）\\
+$\downarrow$ 加扩散项（Fokker-Planck 推导）\\
+逆时间 SDE（有随机性，可以探索）\\
+$\downarrow$ Euler-Maruyama 离散化\\
+每步转移 = 高斯分布 $\Rightarrow$ 可计算 log\_prob\\
+$\downarrow$ log\_prob 代入\\
+GRPO importance ratio $r_i^t$\\
+$\downarrow$ 组内奖励归一化\\
+Advantage $\hat{A}_i$\\
+$\downarrow$\\
+Clip + KL 的 GRPO Loss $\Rightarrow$ 梯度更新 $\theta$\\
+\end{tabular}
+\end{center}
+\end{summarybox}
+
+\textbf{实验效果：}
+\begin{itemize}[leftmargin=1.5em]
+  \item GenEval（组合生成）：\bad{63\%} $\to$ \good{95\%}
+  \item 文字渲染（OCR）：\bad{59\%} $\to$ \good{92\%}
+  \item 几乎无奖励 hacking（质量和多样性保持）
+\end{itemize}

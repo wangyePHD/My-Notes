@@ -1,0 +1,296 @@
+% ============================================================
+% PyTorch 分布式 Process Group 笔记
+% 参考：online_rl.py lines 551-585（Policy Groups 机制）
+% ============================================================
+
+\section{PyTorch 分布式：Process Group 与 Policy Groups}
+
+\begin{conceptbox}
+\textbf{一句话：} \code{dist.new\_group()} 在全体进程中划定一个\key{通信子集}，返回一个轻量的句柄；\\
+后续所有通信原语（\code{all\_reduce}、\code{broadcast} 等）传入该句柄，通信就\key{限定在这个子集内}，不影响其他进程。\\
+\textbf{典型用途：} GRPO Policy Group——让同组 GPU 共享 reward，做组内 advantage 归一化。
+\end{conceptbox}
+
+% -------------------- 核心概念：句柄 --------------------
+\subsection{核心概念：句柄（Handle）}
+
+\code{dist.new\_group()} 返回的 \code{group} 是一个\key{句柄}，不是数据本身。
+
+\begin{intubox}
+\textbf{生活类比：} 图书馆借阅卡——卡本身不是书，但凭它才能找到书、借阅、归还。\\
+句柄的核心特点：\key{轻量}（只是引用），\key{可传递}（传给函数即可操作对应资源），\\
+真正的通信通道由底层 NCCL 维护，句柄只是访问入口。
+\end{intubox}
+
+\begin{lstlisting}[language=Python, caption=句柄类比：文件句柄 vs 通信组句柄]
+# 文件句柄：f 不是文件内容，是凭证
+f = open("cat.jpg", "rb")
+data = f.read()           # 拿着句柄操作文件
+
+# 通信组句柄：group 不存储 tensor，是凭证
+group = dist.new_group(ranks=[0, 1, 2, 3])
+dist.all_reduce(tensor, group=group)  # 拿着句柄，通信限定在 GPU 0-3 之间
+\end{lstlisting}
+
+% -------------------- SPMD 模型 --------------------
+\subsection{SPMD 模型：为什么所有 GPU 都必须调用 \texttt{new\_group}？}
+
+PyTorch 分布式遵循 \key{SPMD（Single Program Multiple Data）} 模型：所有 GPU 运行同一份代码，每条通信原语都需要\key{全员同步参与}才能完成握手和资源分配。
+
+\begin{warnbox}
+\textbf{常见误区：} "GPU 4 不属于 group\_0，就不用参与创建 group\_0。"\\
+\bad{错误！} 如果 GPU 4 缺席 \code{new\_group(ranks=[0,1,2,3])} 的调用，\\
+PyTorch 无法确认"其他卡确实不需要加入"，程序会\bad{卡死等待（deadlock）}。
+\end{warnbox}
+
+正确写法：每张卡都跑完整循环，建所有 group：
+
+\begin{lstlisting}[language=Python]
+# 所有 GPU 都执行这个完整循环（i = 0, 1 都要跑）
+for i in range(world_size // policy_group_size):
+    group_ranks = list(range(i * policy_group_size, (i + 1) * policy_group_size))
+    group = dist.new_group(ranks=group_ranks)  # 全员参与，但只有 ranks 里的卡加入
+    policy_groups.append(group)
+
+# 最后每张卡只取自己所属的那个句柄
+current_policy_group = policy_groups[policy_group_id]
+\end{lstlisting}
+
+GPU 0 虽然也"参与了"创建 group\_1 的过程，但它的 \code{current\_policy\_group} 始终是 group\_0，后续 \code{all\_reduce} 只在 GPU 0, 1, 2, 3 之间发生。
+
+% -------------------- Policy Group 机制 --------------------
+\subsection{Policy Group：为 GRPO 定制的通信子集}
+
+\subsubsection{背景：GRPO 需要组内 reward 汇聚}
+
+GRPO 的 advantage 计算公式为：
+
+\[
+\hat{A}_i = \frac{r_i - \mathrm{mean}(\{r_j\}_{j \in \text{group}})}{\mathrm{std}(\{r_j\}_{j \in \text{group}}) + \varepsilon}
+\]
+
+这要求同一组 GPU \key{同时处理同一条样本}，各自独立生成不同结果，再把所有 reward 汇总做归一化。这批 GPU 就是一个 \textbf{policy group}。
+
+\subsubsection{关键参数}
+
+\begin{center}
+\begin{tabular}{p{4.5cm}p{9cm}}
+\hline
+\textbf{参数} & \textbf{含义} \\
+\hline
+\code{policy\_group\_size} & 每个 group 有多少张 GPU（= GRPO 的 $G$） \\
+\code{policy\_group\_id} & 当前 GPU 属于第几个 group（整除得到） \\
+\code{policy\_group\_rank} & 当前 GPU 在组内是第几号（取模得到） \\
+\code{current\_policy\_group} & PyTorch 通信 group 句柄，传给 \code{all\_reduce} \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{8 GPU、group\_size = 4 的计算示例}
+
+\begin{center}
+{\small
+\begin{tabular}{cccc}
+\hline
+\textbf{GPU rank} & \textbf{policy\_group\_id} & \textbf{policy\_group\_rank} & \textbf{所属 group} \\
+\hline
+0 & $0 \div 4 = \mathbf{0}$ & $0 \bmod 4 = \mathbf{0}$ & Group 0 \\
+1 & $1 \div 4 = \mathbf{0}$ & $1 \bmod 4 = \mathbf{1}$ & Group 0 \\
+2 & $2 \div 4 = \mathbf{0}$ & $2 \bmod 4 = \mathbf{2}$ & Group 0 \\
+3 & $3 \div 4 = \mathbf{0}$ & $3 \bmod 4 = \mathbf{3}$ & Group 0 \\
+4 & $4 \div 4 = \mathbf{1}$ & $4 \bmod 4 = \mathbf{0}$ & Group 1 \\
+5 & $5 \div 4 = \mathbf{1}$ & $5 \bmod 4 = \mathbf{1}$ & Group 1 \\
+6 & $6 \div 4 = \mathbf{1}$ & $6 \bmod 4 = \mathbf{2}$ & Group 1 \\
+7 & $7 \div 4 = \mathbf{1}$ & $7 \bmod 4 = \mathbf{3}$ & Group 1 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{创建 group 的完整代码}
+
+\begin{lstlisting}[language=Python, caption=Policy Group 创建（online\_rl.py lines 551-585）]
+if world_size % data_args.policy_group_size != 0:
+    raise ValueError("world_size 必须能被 policy_group_size 整除")
+
+policy_groups = []
+for i in range(world_size // data_args.policy_group_size):
+    group_ranks = list(range(
+        i * data_args.policy_group_size,
+        (i + 1) * data_args.policy_group_size
+    ))
+    group = dist.new_group(ranks=group_ranks)
+    policy_groups.append(group)
+
+policy_group_id   = dist.get_rank() // data_args.policy_group_size
+policy_group_rank = dist.get_rank() % data_args.policy_group_size
+current_policy_group = policy_groups[policy_group_id]
+\end{lstlisting}
+
+% -------------------- 通信流程 --------------------
+\subsection{组内通信完整时序}
+
+\begin{center}
+\begin{tabular}{p{14cm}}
+\hline
+\textbf{[Rollout 阶段]} 各卡独立推理，无需通信 \\
+$\downarrow$ \\
+\textbf{[Reward 阶段]} 各卡独立计算 reward，无需通信 \\
+$\downarrow$ \\
+\textbf{[Advantage 阶段]} \code{all\_reduce(rewards, group=current\_policy\_group)} \quad $\leftarrow$ 唯一的组内通信 \\
+$\downarrow$ \\
+\textbf{[Loss 阶段]} 各卡独立计算 loss 和梯度 \\
+$\downarrow$ \\
+\textbf{[Backward 阶段]} FSDP 自动同步全局梯度（与 policy group 无关） \\
+\hline
+\end{tabular}
+\end{center}
+
+以 8 GPU、group\_size=4 为例，advantage 计算过程：
+
+\begin{lstlisting}[language=Python, caption=组内 reward 聚合与 advantage 计算]
+# Step 1：每张卡独立完成 rollout
+# GPU0: r0=0.8   GPU1: r1=0.3   GPU2: r2=0.6   GPU3: r3=0.5
+
+# Step 2：组内 all_reduce，让每张卡都知道全组 reward
+advantages, stats = compute_advantages_for_multi_round_rollout(
+    per_sample_rewards,
+    current_policy_group,       # 只在 GPU 0,1,2,3 之间通信
+    first_subtract_mean=True,
+)
+# all_reduce 后：mean = (0.8+0.3+0.6+0.5)/4 = 0.55
+
+# Step 3：每张卡各自用组内均值算自己的 advantage
+# GPU0: adv = 0.8 - 0.55 = +0.25  （好于平均，鼓励）
+# GPU1: adv = 0.3 - 0.55 = -0.25  （差于平均，惩罚）
+# GPU2: adv = 0.6 - 0.55 = +0.05
+# GPU3: adv = 0.5 - 0.55 = -0.05
+\end{lstlisting}
+
+% -------------------- policy_group_id 用于数据采样 --------------------
+\subsection{\texttt{policy\_group\_id} 的另一个用途：数据采样}
+
+\begin{lstlisting}[language=Python]
+train_sampler = DistributedKRepeatSampler(
+    ...
+    rank=policy_group_id,   # 用 group_id，而不是 GPU rank！
+    ...
+)
+\end{lstlisting}
+
+同一 group 内所有 GPU 的 \code{policy\_group\_id} 相同，因此它们会取到\key{同一条样本}（同一张源图 + 同一条指令）。这保证了组内所有生成结果都是对同一个输入的不同随机采样，advantage 归一化才有意义。
+
+\begin{intubox}
+\textbf{类比：} 就像让 4 个厨师用同一份食材各自发挥，然后评分。组内相对排名才能告诉我们哪种做法更好。\\
+如果 4 个厨师用不同食材，奖励差异来自食材而非厨艺，归一化就失去了意义。
+\end{intubox}
+
+% -------------------- 退化情况 --------------------
+\subsection{退化情况：\texttt{policy\_group\_size = 1}}
+
+\begin{lstlisting}[language=Python]
+# policy_group_size = 1 时的特殊处理
+current_policy_group = None          # None 表示使用全局通信域
+policy_group_id      = dist.get_rank()
+policy_group_rank    = 0
+\end{lstlisting}
+
+\begin{warnbox}
+当 \code{policy\_group\_size = 1} 时：每张卡自己就是一个 group，$G=1$，则\\
+$\hat{A}_i = r_i - r_i = 0$，\bad{advantage 恒为零}，退化为无梯度信号的训练。\\
+实际使用中 \code{policy\_group\_size} 至少应设为 4$\sim$8，太小则 advantage 估计方差过大。
+\end{warnbox}
+
+% -------------------- 配置参考 --------------------
+\subsection{常见配置参考}
+
+\begin{center}
+\begin{tabular}{cccc}
+\hline
+\textbf{总 GPU 数} & \textbf{policy\_group\_size} & \textbf{group 数量} & \textbf{每步处理样本数} \\
+\hline
+8  & 4 & 2 & 2 条 \\
+8  & 8 & 1 & 1 条 \\
+16 & 4 & 4 & 4 条 \\
+16 & 8 & 2 & 2 条 \\
+\hline
+\end{tabular}
+\end{center}
+
+group\_size 越大，advantage 估计越稳定（组内样本多），但每步只能处理更少的不同样本。
+
+% -------------------- 总结 --------------------
+% -------------------- 分布式随机种子 --------------------
+\subsection{分布式随机种子设置}
+
+\begin{lstlisting}[language=Python]
+seed = training_args.global_seed * dist.get_world_size() + dist.get_rank()
+set_seed(seed)
+\end{lstlisting}
+
+这一行藏着两个技巧。
+
+\subsubsection{技巧一：让每张卡的种子唯一且永不碰撞}
+
+公式 \code{global\_seed × world\_size + rank} 将所有卡的种子均匀铺开：
+
+\begin{center}
+{\small
+\begin{tabular}{lll}
+\hline
+\textbf{GPU} & \textbf{公式} & \textbf{种子（global\_seed=42, world\_size=8）} \\
+\hline
+GPU 0 & $42 \times 8 + 0$ & 336 \\
+GPU 1 & $42 \times 8 + 1$ & 337 \\
+GPU 2 & $42 \times 8 + 2$ & 338 \\
+$\vdots$ & $\vdots$ & $\vdots$ \\
+GPU 7 & $42 \times 8 + 7$ & 343 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+相邻两个 \code{global\_seed} 之间间距恰好是 \code{world\_size}（8），不同卡的种子\key{永远不会碰撞}。
+
+\begin{warnbox}
+\textbf{对比朴素写法 \code{seed = global\_seed + rank}：}\\
+\code{global\_seed=42}：GPU0→42, GPU1→43, ..., GPU7→49\\
+\code{global\_seed=43}：GPU0→\bad{43} \quad $\leftarrow$ 和上一次 GPU1 撞了！\\
+乘法彻底避免了跨实验的种子碰撞。
+\end{warnbox}
+
+\subsubsection{技巧二：完全可复现（Deterministic）}
+
+种子完全由 \code{global\_seed} 和 \code{rank} 决定，\key{没有任何随机成分}。给定相同的 \code{global\_seed}，任何时候重跑都得到完全一样的随机序列，方便调试和复现实验结果。
+
+\subsubsection{在 GRPO 中的具体作用}
+
+这个种子设置的是每张卡的 \code{sample\_generator}，用于 rollout 时各卡生成不同的编辑结果：
+
+\begin{center}
+\begin{tabular}{p{13cm}}
+\hline
+同一个 policy group 内的 4 张卡，种子各不相同\\
+$\Downarrow$\\
+扩散去噪时的随机噪声各不相同\\
+$\Downarrow$\\
+4 张卡生成 4 张不同的编辑结果图\\
+$\Downarrow$\\
+这正是 GRPO 需要的"同一个输入，$G$ 个不同样本"\\
+\hline
+\end{tabular}
+\end{center}
+
+% -------------------- 总结 --------------------
+\begin{summarybox}
+\textbf{分布式 Process Group 核心要点：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{句柄}：\code{dist.new\_group()} 返回轻量凭证，传给通信原语即可限定通信范围
+  \item \key{SPMD}：所有 GPU 必须调用 \code{new\_group}，缺席会导致死锁
+  \item \key{计算方法}：\code{group\_id = rank // group\_size}，\code{group\_rank = rank \% group\_size}
+  \item \key{通信位置}：组内通信只在 advantage 计算时发生一次（\code{all\_reduce}）
+  \item \key{数据采样}：用 \code{policy\_group\_id}（而非 GPU rank）作为 sampler 的 rank，确保同组 GPU 拿到同一条样本
+  \item \key{退化情况}：\code{group\_size = 1} 时 advantage 恒为零，失去训练信号
+  \item \key{种子公式}：\code{global\_seed × world\_size + rank}——唯一、不碰撞、可复现
+\end{itemize}
+\end{summarybox}

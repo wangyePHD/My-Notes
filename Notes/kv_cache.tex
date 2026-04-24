@@ -1,0 +1,398 @@
+% ============================================================
+% KV Cache 笔记
+% ============================================================
+
+\section{KV Cache：从第一性原理理解}
+
+\begin{conceptbox}
+\textbf{一句最本质的话：} 在自回归生成中，过去 token 的 attention 贡献会被反复使用，而这些贡献的核心载体 K/V 一旦算出就不会变，因此最合理的做法就是\key{缓存它们}。
+\end{conceptbox}
+
+% -------------------- 为什么需要 --------------------
+\subsection{为什么需要 KV Cache？}
+
+生成第 $t$ 个 token 时，Transformer 的 attention 机制需要：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 当前位置生成一个 $Q$（Query）
+  \item 过去每个位置的 $K$（Key）和 $V$（Value）
+  \item 用 $Q$ 和所有历史 $K$ 算相似度，再加权到所有历史 $V$ 上
+\end{itemize}
+
+问题在于，生成是\textbf{逐步累积}的：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2cm}p{10.5cm}}
+\hline
+生成第 2 步 & 需要第 1 个 token 的 K/V \\
+生成第 3 步 & 需要第 1、2 个 token 的 K/V \\
+生成第 $t$ 步 & 需要前 $t-1$ 个 token 的 K/V \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{没有 KV Cache 时：} 生成第 $t$ 步，必须把前 $t-1$ 个 token \bad{重新过一遍}，算出每一层的 K/V，才能做 attention——这是纯粹的重复劳动。
+\end{warnbox}
+
+关键洞察：\textbf{历史 token 本身不会改变}——它们的 K/V 算出来之后，对后续所有步骤都有效，不需要重算。
+
+% -------------------- KV Cache 是什么 --------------------
+\subsection{KV Cache 是什么？}
+
+\begin{summarybox}
+\textbf{KV Cache} = 推理生成过程中，把\key{每一层、每个历史 token 的 Key 和 Value} 保存下来的一块缓存。
+\end{summarybox}
+
+几个关键点：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \good{缓存 K 和 V}：历史 token 的索引标签和内容
+  \item \bad{不缓存 Q}：Q 只服务当前这一步，下一步必须重新生成
+  \item 不是缓存模型输出，也不是缓存整个 hidden state，而是\key{缓存 attention 里最值得复用的中间结果}
+\end{itemize}
+
+% -------------------- 为什么偏偏是 KV --------------------
+\subsection{为什么缓存 K/V，而不是别的？}
+
+Attention 里三者的角色：
+
+\begin{center}
+{\small
+\begin{tabular}{p{1.5cm}p{3cm}p{8cm}}
+\hline
+$Q$ & 当前问题 & 每步必须新算，不可复用 \\
+$K$ & 历史信息的索引标签 & 历史 token 固定后就不变，可复用 \\
+$V$ & 历史信息的内容 & 历史 token 固定后就不变，可复用 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+历史 token 的 K/V 具有两个特性：
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{稳定}：不因后续生成新 token 而改变
+  \item \textbf{反复被读取}：每生成一个新 token，就要 attend 全部历史 K/V
+\end{enumerate}
+
+这两个特性合在一起，使得 K/V 是\key{最值得缓存的对象}。
+
+% -------------------- 有无 Cache 的对比 --------------------
+\subsection{有无 KV Cache 的对比}
+
+假设已生成 100 个 token，现在要生成第 101 个：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+ & \textbf{无 KV Cache} & \textbf{有 KV Cache} \\
+\hline
+计算量 & 前 100 个 token 全部重新过一遍，算各层 K/V & 只算第 101 个 token 的新 Q/K/V \\
+Attention & 重算历史后做 attention & 直接用 cache 里的 100 个 K/V 做 attention \\
+复杂度 & $O(t^2)$ 逐步累积 & $O(t)$ 每步只增量 \\
+代价 & 计算时间爆炸 & 多占显存（存 K/V） \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{本质是空间换时间：} 多占显存，避免重复计算，显著降低生成延迟。
+\end{intubox}
+
+% -------------------- 类比 --------------------
+\subsection{直觉类比：开卷考试}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2cm}p{5cm}p{6cm}}
+\hline
+\textbf{角色} & \textbf{类比} & \textbf{含义} \\
+\hline
+$Q$ & 当前这道题在问什么 & 每道新题都不同，必须现场生成 \\
+$K$ & 书的目录 / 索引 & 书不变，目录不用每次重印 \\
+$V$ & 书里的具体内容 & 书不变，内容不用每次重读 \\
+KV Cache & 把书放桌上直接查 & 历史上下文整理成可查阅的形式，后续不重复整理 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+% -------------------- 总结 --------------------
+\begin{summarybox}
+\textbf{KV Cache 存在的根本原因：}\\
+自回归生成 = 反复读取历史 token 的 attention 贡献；\\
+历史 K/V 一旦算出就\key{不变且会被反复访问}；\\
+因此缓存 K/V 是最自然、最高效的做法——\key{不是优化技巧，是第一性原理的必然结论}。
+\end{summarybox}
+
+% -------------------- BAGEL 中的实现 --------------------
+\subsection{BAGEL 中的 KV Cache：\texttt{NaiveCache}}
+
+BAGEL 里 KV Cache 的具体实现是 \code{NaiveCache}，定义在 \code{qwen2\_navit.py}：
+
+\begin{lstlisting}[language=Python, caption=NaiveCache（qwen2\_navit.py）]
+class NaiveCache:
+    def __init__(self, num_layers):
+        self.key_cache   = {k: None for k in range(num_layers)}
+        self.value_cache = {k: None for k in range(num_layers)}
+
+    @property
+    def seq_lens(self):
+        if self.key_cache[0] is not None:
+            return self.key_cache[0].shape[0]
+        else:
+            return 0
+\end{lstlisting}
+
+\subsubsection{数据结构}
+
+\code{NaiveCache} 本质上是一个\textbf{两层字典}：
+
+\begin{center}
+{\small
+\begin{tabular}{p{5cm}p{8cm}}
+\hline
+\textbf{字段} & \textbf{含义} \\
+\hline
+\code{key\_cache[layer\_id]} & 第 \code{layer\_id} 层所有已缓存 token 的 Key 张量 \\
+\code{value\_cache[layer\_id]} & 第 \code{layer\_id} 层所有已缓存 token 的 Value 张量 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+张量形状：$[\text{已缓存 token 数},\; \text{num\_kv\_heads},\; \text{head\_dim}]$
+
+\subsubsection{生命周期}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{9.5cm}}
+\hline
+\textbf{阶段} & \textbf{状态} \\
+\hline
+初始化 & \code{key\_cache / value\_cache} 全为 \code{None}，\code{seq\_lens = 0} \\
+prefill / decode 后 & 每层变为一个张量，\code{seq\_lens} 返回已缓存 token 数 \\
+追加新 token & 新算出的 K/V 拼接（\code{cat}）到现有张量末尾 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{在 BAGEL 推理里的角色}
+
+\code{InterleaveInferencer} 通过 \code{init\_gen\_context()} 创建 \code{NaiveCache} 实例，存入 \code{gen\_context}：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{update\_context\_text} / \code{update\_context\_image}：调用 \code{forward\_cache\_update\_*}，把新 token 的 K/V \key{追加进 cache}
+  \item \code{gen\_text} / \code{gen\_image}：decode 阶段每步只算当前 token 的新 Q/K/V，再用 cache 里的历史 K/V 做 attention
+  \item \code{gen\_text} 内 \code{deepcopy(gen\_context)}：分叉出一个临时 cache，decode 完丢弃，\key{不污染外层上下文}
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} \code{NaiveCache} 就是把之前所有 \code{forward\_cache\_update\_*} 算出的 K/V 存在字典里，decode 时直接取出来和当前步的 Q 做 attention，不需要重新跑一遍历史 token 的前向。
+\end{intubox}
+
+% -------------------- 三个 cache update 函数 --------------------
+\subsection{写入 Cache 的三个函数}
+
+三个函数都做同一件事：\textbf{把一段新 token 的 K/V 算出来写进 \code{NaiveCache}}，区别只在 token 的来源。
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.5cm}p{3cm}p{5.5cm}}
+\hline
+\textbf{函数} & \textbf{token 来源} & \textbf{MoT mode} \\
+\hline
+\code{forward\_cache\_update\_text} & 纯文本 token & \code{mode="und"}（理解支路） \\
+\code{forward\_cache\_update\_vit} & 文本 + ViT 图像 patch & \code{mode="und"}（理解支路） \\
+\code{forward\_cache\_update\_vae} & 文本 + VAE latent patch & \code{mode="gen"}（生成支路） \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+三者均传入 \code{update\_past\_key\_values=True}，调用后 \code{past\_key\_values} 即更新为新长度的 cache。
+
+\subsubsection{\texttt{forward\_cache\_update\_text}（纯文本）}
+
+流程最简单：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \code{get\_embeddings}：text ids $\to$ embedding
+  \item \code{language\_model.forward}，\code{mode="und"}，\code{is\_causal=True}（文本有因果掩码）
+  \item 返回更新后的 \code{past\_key\_values}
+\end{enumerate}
+
+\begin{lstlisting}[language=Python]
+packed_text_embedding = self.language_model.forward(
+    mode="get_embeddings", input_ids=packed_text_ids)
+output = self.language_model.forward(
+    packed_query_sequence=packed_text_embedding,
+    update_past_key_values=True,
+    is_causal=True,
+    mode="und",
+    ...
+)
+\end{lstlisting}
+
+\subsubsection{\texttt{forward\_cache\_update\_vit}（文本 + ViT 图像）}
+
+多了 ViT 编码步骤：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \code{get\_embeddings}：text ids $\to$ embedding，拼入 \code{packed\_sequence}
+  \item \code{vit\_model} 对图像 patch 编码，经 \code{connector} 投影 + 位置编码
+  \item 将 ViT embedding 拼入 \code{packed\_sequence} 的 ViT 位置
+  \item \code{language\_model.forward}，\code{mode="und"}，\code{is\_causal=False}（图文混合，无因果约束）
+\end{enumerate}
+
+\begin{intubox}
+\textbf{注意：} ViT 属于理解侧，所以整段走 \code{mode="und"}，不触发 \code{moe\_gen}。
+\end{intubox}
+
+\subsubsection{\texttt{forward\_cache\_update\_vae}（文本 + VAE latent）}
+
+多了 VAE 编码和 latent 预处理：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \code{get\_embeddings}：text ids $\to$ embedding，拼入 \code{packed\_sequence}
+  \item \code{vae\_model.encode}：图像 $\to$ latent，按 patch 大小 $p$ 重排形状为 $[N_\text{patch},\; p^2 \cdot C_\text{latent}]$
+  \item 经 \code{vae2llm} 线性投影 + 时间步嵌入 \code{time\_embedder} + 位置嵌入 \code{latent\_pos\_embed}
+  \item 将 latent embedding 拼入 \code{packed\_sequence} 的 VAE 位置
+  \item \code{language\_model.forward}，\code{mode="gen"}（VAE 走生成支路），\code{is\_causal=False}
+\end{enumerate}
+
+\begin{lstlisting}[language=Python]
+padded_latent = vae_model.encode(padded_images)
+# patchify: [C, H, W] -> [N_patch, p*p*C]
+packed_latent = self.vae2llm(packed_latent) \
+              + self.time_embedder(packed_timesteps) \
+              + self.latent_pos_embed(packed_vae_position_ids)
+packed_sequence[packed_vae_token_indexes] = packed_latent
+
+output = self.language_model.forward(
+    ..., mode="gen",
+    packed_vae_token_indexes=packed_vae_token_indexes,
+    packed_text_indexes=packed_text_indexes,
+    update_past_key_values=True, is_causal=False,
+)
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{与 vit 的关键区别：} VAE latent 加了\key{时间步嵌入}（\code{packed\_timesteps}），这是 Flow Matching 去噪所必需的——latent 在不同去噪步 $t$ 时的嵌入不同。ViT patch 没有时间步。
+\end{warnbox}
+
+\begin{summarybox}
+\textbf{三函数一句话：}\\
+\code{update\_text}：文本理解 $\to$ \code{und} cache\\
+\code{update\_vit}：文本 + 图像理解 $\to$ \code{und} cache\\
+\code{update\_vae}：文本 + 图像生成（含时间步）$\to$ \code{gen} cache\\
+三者调完，\code{NaiveCache} 里积累了完整的多模态上下文 K/V，供后续 decode 使用。
+\end{summarybox}
+
+% -------------------- Merge Cache --------------------
+\subsection{Cache 合并：新 K/V 与历史 K/V 如何拼在一起}
+
+\subsubsection{问题}
+
+每一步前向时，当前 query token 会算出新的 K/V；同时 \code{NaiveCache} 里存着历史 token 的 K/V。Attention 需要同时看到\textbf{历史 + 当前}的 K/V，所以要先把两者合并成一条完整序列。
+
+\subsubsection{合并逻辑（带代码）}
+
+\begin{lstlisting}[language=Python, caption=推理 Attention 中的 Cache 合并（PackedAttentionMoT）]
+if past_key_values is not None and past_key_values.key_cache[layer_idx] is not None:
+    past_key_states   = past_key_values.key_cache[layer_idx]    # 历史 K
+    past_value_states = past_key_values.value_cache[layer_idx]  # 历史 V
+
+    # 新空张量：大小 = 历史 token 数 + 当前 query token 数
+    seqlens = sum(query_lens) + sum(key_values_lens)
+    merged_key_states   = zeros((seqlens, num_kv_heads, head_dim))
+    merged_value_states = zeros((seqlens, num_kv_heads, head_dim))
+
+    # 按 index 分别填入：当前新算的 K/V 和历史 K/V
+    merged_key_states[packed_query_indexes]     = packed_key_states    # 新 K 填到 query 位置
+    merged_key_states[packed_key_value_indexes] = past_key_states      # 历史 K 填到 cache 位置
+    merged_value_states[packed_query_indexes]   = packed_value_states
+    merged_value_states[packed_key_value_indexes] = past_value_states
+
+    key_values_lens = key_values_lens + query_lens  # 更新长度
+else:
+    # 第一次，cache 为空，直接用当前 K/V
+    merged_key_states   = packed_key_states
+    merged_value_states = packed_value_states
+    key_values_lens     = query_lens
+\end{lstlisting}
+
+\subsubsection{index 的含义}
+
+\begin{center}
+{\small
+\begin{tabular}{p{5cm}p{8cm}}
+\hline
+\textbf{index} & \textbf{含义} \\
+\hline
+\code{packed\_query\_indexes} & 当前步新 token 在合并后序列里的位置 \\
+\code{packed\_key\_value\_indexes} & 历史 cache token 在合并后序列里的位置 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+两组 index \textbf{不重叠}，合并后序列里每个位置只属于其中一方。
+
+\subsubsection{Attention 用合并后的 K/V 计算}
+
+\begin{lstlisting}[language=Python]
+cu_seqlens_q = pad(cumsum(query_lens), (1, 0))      # query 的累积长度
+cu_seqlens_k = pad(cumsum(key_values_lens), (1, 0)) # 合并后 K/V 的累积长度
+
+packed_attn_output = flash_attn_varlen_func(
+    q=packed_query_states,   # 只有当前步的 Q
+    k=merged_key_states,     # 历史 + 当前的 K
+    v=merged_value_states,   # 历史 + 当前的 V
+    cu_seqlens_q=cu_seqlens_q,
+    cu_seqlens_k=cu_seqlens_k,
+    causal=is_causal,
+)
+\end{lstlisting}
+
+Q 只有当前步的新 token，K/V 是历史 + 当前的完整序列——这正是 KV Cache 的核心：\key{Q 每步新算，K/V 历史复用}。
+
+\subsubsection{写回 Cache}
+
+\begin{lstlisting}[language=Python]
+if update_past_key_values:
+    past_key_values.key_cache[layer_idx]   = merged_key_states    # 合并后写回
+    past_key_values.value_cache[layer_idx] = merged_value_states  # 下一步直接用
+\end{lstlisting}
+
+\begin{warnbox}
+写回的是\textbf{合并后的完整序列}（历史 + 当前），不是只追加当前步——这样下一步取出来就是完整的历史，不需要再做任何拼接。
+\end{warnbox}
+
+\subsubsection{完整数据流}
+
+\begin{center}
+{\small
+\begin{tabular}{c}
+历史 K/V（\code{NaiveCache[layer\_idx]}）\\
+$+$ \\
+当前步新算的 K/V（\code{packed\_key/value\_states}）\\
+$\downarrow$ 按 index 填入 \code{merged\_key/value\_states} \\
+合并后完整 K/V 序列\\
+$\downarrow$ \code{flash\_attn\_varlen\_func}（Q = 只有当前步） \\
+attention 输出 $\to$ \code{o\_proj} $\to$ 残差\\
+$\downarrow$ \code{update\_past\_key\_values=True} \\
+合并后 K/V 写回 \code{NaiveCache[layer\_idx]}（供下一步使用）\\
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{Merge Cache 一句话：} 每步前向时，先把历史 K/V 和当前新 K/V 按 index 拼成一条完整序列，用 \code{flash\_attn\_varlen\_func} 算 attention（Q 只有当前步），算完把合并结果写回 cache——下一步直接取，不再重算历史。
+\end{summarybox}

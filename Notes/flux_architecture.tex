@@ -1,0 +1,1595 @@
+
+% ============================================================
+% FLUX.1 模型架构详解
+% Black Forest Labs, 2024.08
+% ============================================================
+
+\section{FLUX.1 模型架构详解}
+
+\begin{conceptbox}
+\textbf{一句话：} FLUX.1 是 Black Forest Labs（前 Stability AI 核心成员，Stable Diffusion 原班人马）于 2024 年 8 月发布的 \key{12B 参数 Multimodal Diffusion Transformer（MMDiT）}，在 SD3 基础上引入双流/单流混合架构、RoPE、T5+CLIP 双编码器、16ch VAE 和 Guidance Distillation。
+\end{conceptbox}
+
+% -------------------- 知识地图 --------------------
+\subsection{知识地图}
+
+\begin{lstlisting}
+[你已掌握 v]  -> Flow Matching, 双流/单流架构
+[本次讲解 *]  -> Flow Matching 细节, 双流/单流内部结构, RoPE,
+                 T5+CLIP 双编码器, 16ch VAE, Guidance Distillation,
+                 QK-Norm+并行注意力, 三变体区别
+[进阶方向 ->] -> Consistency Model, DiT/PixArt, 2D/3D RoPE,
+                 Prompt Engineering, LCM/SDXL-Turbo
+\end{lstlisting}
+
+% -------------------- 一、整体架构鸟瞰 --------------------
+\subsection{整体架构鸟瞰}
+
+\begin{conceptbox}
+FLUX.1 本质上是一个 \key{12B 参数的 Multimodal Diffusion Transformer（MMDiT）}，在 SD3 的基础上做了大量改进。
+\end{conceptbox}
+
+\textbf{输入路径：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本：\key{CLIP ViT-L}（pooled）$\to$ \code{vec}（全局语义向量）
+  \item 文本：\key{T5-XXL}（sequence）$\to$ \code{txt tokens}（细粒度语义序列）
+  \item 图像（加噪后的 latent）：\key{VAE Encoder（16ch）} $\to$ \code{img tokens}（patchify 成 $2\times2$ patches）
+  \item 时间步 $t$ + guidance scale $\to$ 融入 \code{vec}
+\end{itemize}
+
+\textbf{处理流程：}
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Double Stream Blocks} $\times$ 19：图文各自独立处理，cross-attend
+  \item \textbf{Single Stream Blocks} $\times$ 38：图文 concat，联合处理
+  \item Linear Head $\to$ VAE Decoder（16ch）$\to$ 最终图像输出
+\end{enumerate}
+
+% -------------------- 二、Flow Matching --------------------
+\subsection{Flow Matching（流匹配）}
+
+\subsubsection{直觉理解}
+
+\begin{intubox}
+传统 DDPM 加噪是「弯路」，Flow Matching 学的是从噪声 $\to$ 图像的\key{最短直线路径}（velocity field）。
+\end{intubox}
+
+\subsubsection{原理}
+
+FLUX 使用 \key{Rectified Flow（整流流）}，插值方式为线性：
+
+$$x_t = (1-t) \cdot x_0 + t \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+
+训练目标：
+
+$$\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} \left\| v_\theta(x_t, t) - (\epsilon - x_0) \right\|^2$$
+
+让模型预测的速度方向 $=$ 从数据指向噪声的方向（即 $\epsilon - x_0$）。
+
+\subsubsection{对比 DDPM}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.5cm}p{4.5cm}}
+\hline
+\textbf{对比点} & \textbf{DDPM} & \textbf{Rectified Flow} \\
+\hline
+轨迹 & 曲线（随机游走） & 直线 \\
+采样步数 & 通常 1000 步 & 少步即可（20\textasciitilde50，或蒸馏后 1\textasciitilde4 步）\\
+训练目标 & 预测噪声 $\epsilon$ & 预测速度 $v = \epsilon - x_0$ \\
+推导复杂性 & 需要 ELBO 推导 & 直接 OT 对齐，概念更简洁 \\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+\subsubsection{推理（Inference）过程}
+
+使用 ODE solver（如 Euler method）从 $t=1$（纯噪声）积分到 $t=0$（图像）：
+
+$$x_{t - \Delta t} = x_t - \Delta t \cdot v_\theta(x_t, t)$$
+
+% -------------------- 三、双流块 --------------------
+\subsection{双流块（Double Stream Blocks）}
+
+\subsubsection{结构}
+
+图像 token 和文本 token \textbf{各走各的 Transformer 流}，但通过 Attention 相互影响。
+
+\textbf{输入：}\code{img\_tokens} \code{[B, N\_img, D]}，\code{txt\_tokens} \code{[B, N\_txt, D]}，\code{vec} \code{[B, D]}（来自 CLIP + timestep + guidance）
+
+每个 Double Stream Block 内部：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Image Stream}：LayerNorm $\to$ Modulation(vec) $\to$ scale/shift/gate $\to$ Self-Attn（img Q,K,V，cross with txt K,V）$\to$ FFN
+  \item \textbf{Text Stream}：LayerNorm $\to$ Modulation(vec) $\to$ scale/shift/gate $\to$ Self-Attn（txt Q,K,V，cross with img K,V）$\to$ FFN
+\end{itemize}
+
+\begin{conceptbox}
+\textbf{关键设计点：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 两流都用 \key{RoPE} 做位置编码
+  \item Attention 时 img 和 txt 的 Q/K 拼接后一起算，但各自来自独立权重
+  \item 用 \key{QK-Norm} 对 Q 和 K 做 LayerNorm（稳定训练）
+  \item \key{Modulation 机制}：用 \code{vec}（全局条件向量）预测每个 token 的 scale/shift/gate，而不是用 AdaLN
+\end{itemize}
+\end{conceptbox}
+
+% -------------------- 四、单流块 --------------------
+\subsection{单流块（Single Stream Blocks）}
+
+\subsubsection{结构}
+
+把 \code{img\_tokens} 和 \code{txt\_tokens} \textbf{直接拼接}，当成一个序列联合处理：
+
+\begin{lstlisting}[language=Python]
+tokens = concat(img_tokens, txt_tokens)  # [B, N_img + N_txt, D]
+\end{lstlisting}
+
+Single Stream Block 内部（并行注意力）：
+\begin{itemize}[leftmargin=1.5em]
+  \item LayerNorm $\to$ Modulation(vec)
+  \item 并行：Attention head（Q,K,V）和 MLP（FFN）同时执行
+  \item 两路输出相加，再过 linear projection
+\end{itemize}
+
+\begin{conceptbox}
+\textbf{关键设计点：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{并行注意力（Parallel Attention）}：Attention 和 FFN 同时计算，减少内存带宽瓶颈，加速推理
+  \item 图文 tokens 完全打通，实现深度融合
+  \item 最终只取 \code{img\_tokens} 部分过 linear head 输出 velocity
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{双流 vs 单流的直觉区别}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{2.5cm}p{5cm}p{5cm}}
+\hline
+ & \textbf{双流块} & \textbf{单流块} \\
+\hline
+位置 & 前几层 & 后几层 \\
+目的 & 各自提取模态特征，再交互 & 深度融合，精细生成 \\
+类比 & 翻译时先各自读懂，再对照 & 双语融合后统一理解 \\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+% -------------------- 五、RoPE --------------------
+\subsection{RoPE（旋转位置编码）}
+
+\subsubsection{直觉理解}
+
+\begin{intubox}
+不是给 token 加一个「绝对座位号」，而是让 token 的 Q 和 K 向量\key{旋转一个角度}，旋转量由位置决定。两个 token 的注意力得分自动编码了它们的\key{相对距离}。
+\end{intubox}
+
+\subsubsection{为什么 FLUX 用 RoPE？}
+
+图像生成需要处理任意分辨率，如果用绝对位置编码，换分辨率就崩了。RoPE 只编码相对位置，天然支持\key{变长、变分辨率}。
+
+\subsubsection{FLUX 的 2D RoPE 实现}
+
+图像 patch 有 \code{(row, col)} 两个维度，FLUX 用分解的 2D RoPE：对 \code{(height\_ids, width\_ids)} 分别计算 1D RoPE，拼接成 2D。这样模型可以感知 patch 的二维空间关系，而不只是序列顺序。
+
+% -------------------- 六、文本编码器 --------------------
+\subsection{文本编码器：T5-XXL + CLIP}
+
+\subsubsection{为什么要两个？}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{2.5cm}p{1.8cm}p{3.5cm}p{4cm}}
+\hline
+\textbf{编码器} & \textbf{参数量} & \textbf{输出类型} & \textbf{作用} \\
+\hline
+\textbf{CLIP ViT-L} & \textasciitilde400M & pooled embedding（全局向量） & 图文对齐，提供整体语义 \\
+\textbf{T5-XXL} & 11B & sequence tokens（序列） & 理解复杂、长文本，精细控制 \\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+\subsubsection{如何使用}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{CLIP pooled} $\to$ 加入 \code{vec}（全局调制向量），影响每个 block 的 Modulation
+  \item \textbf{T5 tokens} $\to$ 作为 \code{txt\_tokens}，参与双流块的 cross-attention
+\end{itemize}
+
+这解决了 SD1.x 只用 CLIP、对复杂 Prompt 理解差的问题。
+
+% -------------------- 七、16通道 VAE --------------------
+\subsection{16 通道 VAE}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{3cm}p{2.5cm}}
+\hline
+\textbf{模型} & \textbf{VAE 通道数} & \textbf{压缩比} \\
+\hline
+SD 1.x / 2.x & 4 & 8$\times$ \\
+FLUX.1 & \textbf{16} & 8$\times$ \\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+FLUX 的 VAE 同样是 $8\times$ 空间压缩（1024px $\to$ 128 latent），但 latent 有 \key{16 个通道}而非 4 个，信息密度更高。
+
+\textbf{Patchify：}图像 latent \code{[B, 16, H, W]} $\to$ 切成 $2\times2$ patches $\to$ \code{[B, N, 16*4=64]}，作为 \code{img tokens} 输入 Transformer。
+
+% -------------------- 八、Guidance Distillation --------------------
+\subsection{Guidance Distillation（引导蒸馏）}
+
+\subsubsection{背景：CFG 的问题}
+
+Classifier-Free Guidance 每步要跑两次前向（条件 + 无条件），然后做插值：
+
+$$\hat{v} = v_\text{uncond} + w \cdot (v_\text{cond} - v_\text{uncond})$$
+
+慢，且存在 artifact。
+
+\subsubsection{FLUX.1 [dev] 的解法：Guidance Distillation}
+
+把 guidance scale $w$ 作为\textbf{额外输入}，用教师模型（跑 CFG）的输出蒸馏学生模型（只跑一次），让模型\textbf{内化} CFG 的效果。推理时只需一次前向，guidance scale 通过 \code{vec} 传入（如 \code{guidance\_scale=3.5}）。
+
+\subsubsection{FLUX.1 [schnell] 的解法：Timestep Distillation（LADD）}
+
+进一步把 50 步压缩到 \key{1\textasciitilde4 步}：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 使用 \key{Latent Adversarial Diffusion Distillation (LADD)}
+  \item 引入判别器网络，用对抗训练保持质量
+  \item 推理时 \code{guidance\_scale=0}（不需要 guidance 了）
+  \item 代价：max sequence length 256，复杂 Prompt 能力弱一些
+\end{itemize}
+
+% -------------------- 九、三个模型变体对比 --------------------
+\subsection{三个模型变体对比}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{2.8cm}p{3.5cm}p{3.5cm}p{3.8cm}}
+\hline
+ & \textbf{FLUX.1 [pro]} & \textbf{FLUX.1 [dev]} & \textbf{FLUX.1 [schnell]} \\
+\hline
+访问方式 & API Only（闭源） & 开放权重（非商用） & 开放权重（Apache 2.0）\\
+蒸馏方式 & 无蒸馏（完整 CFG） & Guidance Distillation & Guidance + Timestep 蒸馏（LADD）\\
+推理步数 & 50+ & 50 & 1\textasciitilde4 \\
+guidance\_scale & 需要 CFG & 3.5（单次前向） & 0 \\
+max seq len & 无限制 & 512 & 256 \\
+质量 & 最好 & 接近 Pro & 略低，但极快 \\
+适用场景 & 商业图像生成 & 研究/高质量本地 & 实时生成/原型 \\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+% -------------------- 十、训练稳定性技巧 --------------------
+\subsection{训练稳定性技巧}
+
+\subsubsection{QK-Norm}
+
+在计算 Attention 之前，对 Q 和 K 分别做 LayerNorm：
+
+$$\text{Attention} = \text{softmax}\left(\frac{\text{Norm}(Q) \cdot \text{Norm}(K)^T}{\sqrt{d}}\right) V$$
+
+防止 12B 大模型训练时注意力分数爆炸，梯度不稳定。
+
+\subsubsection{HybridNorm}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Pre-Norm}：用在 QKV 投影之前（保证 Attention 稳定）
+  \item \textbf{Post-Norm}：用在 FFN 之后（防止残差连接引起的输出漂移）
+\end{itemize}
+
+\subsubsection{并行注意力（Parallel Attention）}
+
+Single Stream Block 中 Attention 和 FFN 并行：
+
+\begin{lstlisting}
+x -> Norm -> [Attn(x) || FFN(x)] -> 相加 -> Linear
+\end{lstlisting}
+
+相比串行，计算效率提升，尤其在推理时减少内存访问延迟。
+
+% -------------------- 十一、Attention 机制全景 & 条件图像注入 --------------------
+\subsection{Attention 机制全景 \& 条件图像注入}
+
+\subsubsection{FLUX Attention 的三个维度}
+
+\begin{conceptbox}
+\textbf{关键设计哲学}：FLUX 不用显式 Cross-Attention，而是把所有 token（文本、噪声图、条件图）全部扔进同一个 Self-Attention 序列里，用 \key{RoPE 的位置 id 来区分它们的「身份」}。
+
+\textbf{序列组成：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 双流块：\code{[txt tokens | img tokens]}，\code{txt\_ids} 全 0，\code{img\_ids} 含 \code{(row,col)}
+  \item 单流块：\code{[txt tokens | img tokens]}（concat 后统一处理）
+  \item Kontext：\code{[img\_cond tokens | txt tokens | img\_noisy tokens]}，条件图 ids 第 0 维 = 1，生成图 ids 第 0 维 = 0
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{条件图像注入的三种方式（对比）}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{2.8cm}p{3cm}p{2.5cm}p{2cm}p{3cm}}
+\hline
+\textbf{方式} & \textbf{代表模型} & \textbf{注入位置} & \textbf{改 Attn？} & \textbf{适用场景} \\
+\hline
+\textbf{Channel concat} & Fill（Inpainting）、Canny、Depth & img token 的\textbf{特征维度}上拼接 & 不改，只改 \code{img\_in} 输入维度 & 像素级对齐的条件（mask、边缘图）\\
+\textbf{Sequence concat} & Kontext & img token 的\textbf{序列长度}上拼接 & 条件图 tokens 完整参与 Attention & 参考图风格/内容迁移 \\
+\textbf{txt 侧 concat} & Redux & 拼接到 txt tokens 序列末尾 & 通过双流图文交互影响生成 & 图像风格/内容参考（无需空间对齐）\\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+\subsubsection{方式一：Channel Concat（Fill / Canny / Depth）}
+
+\textbf{核心思路：}条件图（inpainting mask、边缘图、深度图）与\textbf{噪声 latent 逐像素对齐}，直接在通道维度拼接。
+
+\begin{lstlisting}[language=Python]
+# prepare_control（Canny / Depth）
+img_cond = ae.encode(encoder(img_cond))           # 条件图 -> VAE latent [B,16,H/8,W/8]
+img_cond = rearrange(img_cond, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+# img_cond shape: [B, N_patch, 64]  与 img 完全相同
+
+# prepare_fill（Inpainting）
+img_cond = ae.encode(img_cond * (1 - mask))       # mask 区域置零后编码
+mask = rearrange(mask, "b (h ph) (w pw) -> b (h w) (ph pw)", ph=8, pw=8)
+img_cond = torch.cat((img_cond, mask), dim=-1)
+# img_cond shape: [B, N_patch, 64+4=68]  <- 多了 mask 通道
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python]
+# denoise() 里的 channel concat
+def denoise(model, img, img_ids, ..., img_cond=None, ...):
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        img_input = img                             # 噪声 latent: [B, N, 64]
+
+        if img_cond is not None:
+            img_input = torch.cat((img, img_cond), dim=-1)
+            # 通道维度 concat！
+            # Canny/Depth: [B, N, 64] cat [B, N, 64] -> [B, N, 128]
+            # Fill:        [B, N, 64] cat [B, N, 68] -> [B, N, 132]
+
+        pred = model(img=img_input, img_ids=img_ids, ...)
+        # img_input 进入 img_in = nn.Linear(in_channels, hidden_size)
+        # Canny/Fill 的模型 in_channels 不是 64，而是 128 / 132！
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{本质}：让每个 patch 在进入 Transformer 之前就「知道」自己对应位置的条件信息。代价是需要对 \code{img\_in} 重新微调（输入维度变了）。
+\end{intubox}
+
+\subsubsection{方式二：Sequence Concat（Kontext）}
+
+\textbf{核心思路：}条件图像经过 VAE 编码后变成 patch tokens，直接\textbf{拼接到噪声图 tokens 的序列前面}，两者在 Attention 中完全平等地互相 attend。用 \key{RoPE 的第 0 轴（时间轴）区分条件图（id=1）和生成图（id=0）}。
+
+\begin{lstlisting}[language=Python]
+# prepare_kontext()
+img_cond = ae.encode(img_cond)
+img_cond = rearrange(img_cond, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+# img_cond: [B, N_cond, 64]
+
+# 关键：条件图的 img_ids，第 0 维设为 1（区别于生成图的 0）
+img_cond_ids = torch.zeros(height//2, width//2, 3)
+img_cond_ids[..., 0] = 1          # 时间轴 id = 1（条件帧）
+img_cond_ids[..., 1] = torch.arange(height//2)[:, None]   # row
+img_cond_ids[..., 2] = torch.arange(width//2)[None, :]    # col
+# 生成图的 img_ids[..., 0] = 0（默认）
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python]
+# denoise() 里的 sequence concat
+if img_cond_seq is not None:
+    img_input = torch.cat((img_input, img_cond_seq), dim=1)
+    # 序列维度 concat！
+    # [B, N_gen, 64] cat [B, N_cond, 64] -> [B, N_gen+N_cond, 64]
+
+    img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+
+pred = model(img=img_input, img_ids=img_input_ids, ...)
+pred = pred[:, :img.shape[1]]    # 只要前 N_gen 个 token 的输出
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{这才是 Kontext 能做 consistent 图像编辑的原因}：条件图的每个 patch 和生成图对应位置的 patch 可以直接通过 Attention 交互，空间对应关系由 RoPE 编码保留。
+
+\textbf{RoPE 区分方式：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{img\_noisy} 的 ids：\code{[0, row, col]} $\to$ 「这是第 0 帧的 (row,col) 位置」
+  \item \code{img\_cond} 的 ids：\code{[1, row, col]} $\to$ 「这是第 1 帧的 (row,col) 位置」
+\end{itemize}
+\end{intubox}
+
+\textbf{Channel concat vs Sequence concat 对比：}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+ & \textbf{Channel Concat} & \textbf{Sequence Concat} \\
+\hline
+条件信息粒度 & per-patch 局部特征混合 & 全局——任意 patch 可 attend 到任意条件 patch \\
+序列长度 & 不变 & 增加（$N_\text{gen} + N_\text{cond}$）\\
+空间对应 & 隐式（同位置 channel 对齐） & 显式（RoPE 编码空间坐标）\\
+计算量 & 不增加（仅 \code{img\_in} 变） & 增加（Attention 是 $O(N^2)$，N 增大）\\
+适合任务 & 结构控制（边缘、深度、mask） & 内容/风格参考（参考图编辑）\\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+\subsubsection{方式三：txt 侧 Concat（Redux）}
+
+\textbf{核心思路：}不把条件图当成 img tokens，而是把它的\textbf{视觉特征}（用 SigLIP 提取）拼接到 txt tokens 序列末尾，走文本流的路径影响生成。
+
+\begin{lstlisting}[language=Python]
+# prepare_redux()
+img_cond = encoder(img_cond)     # SigLIP -> [B, N_visual, D_visual]
+img_cond = img_cond.to(torch.bfloat16)
+
+# 直接 cat 到 T5 文本 tokens 后面
+txt = t5(prompt)                 # [B, N_text, 4096]
+txt = torch.cat((txt, img_cond.to(txt)), dim=-2)
+# txt: [B, N_text + N_visual, 4096]
+
+txt_ids = torch.zeros(bs, txt.shape[1], 3)  # txt_ids 全 0（无空间位置）
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{本质}：把参考图像当成「图像描述的 token」来用。优点：不增加 img 序列长度；缺点：丢失空间位置信息。
+\end{intubox}
+
+\subsubsection{denoise() 完整流程串联}
+
+\begin{lstlisting}[language=Python]
+def denoise(model, img, img_ids, txt, txt_ids, vec, timesteps,
+            guidance,
+            img_cond=None,        # channel concat 用（Fill/Canny）
+            img_cond_seq=None,    # sequence concat 用（Kontext）
+            img_cond_seq_ids=None):
+
+    guidance_vec = torch.full((img.shape[0],), guidance, ...)
+
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((img.shape[0],), t_curr, ...)
+
+        img_input = img
+        img_input_ids = img_ids
+
+        if img_cond is not None:                         # 方式一：通道拼接
+            img_input = torch.cat((img, img_cond), dim=-1)
+
+        if img_cond_seq is not None:                     # 方式二：序列拼接
+            img_input     = torch.cat((img_input, img_cond_seq), dim=1)
+            img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+
+        pred = model(img=img_input, img_ids=img_input_ids,
+                     txt=txt, txt_ids=txt_ids, y=vec,
+                     timesteps=t_vec, guidance=guidance_vec)
+
+        if img_cond_seq is not None:
+            pred = pred[:, :img.shape[1]]  # 丢掉条件图 tokens 的输出
+
+        img = img + (t_prev - t_curr) * pred  # Euler 步更新
+
+    return img
+\end{lstlisting}
+
+\subsubsection{源码追问 Q\&A}
+
+\paragraph{Q: Kontext 的条件图 token 也会被模型「去噪」吗？}
+不会。\code{denoise()} 里 \code{pred = pred[:, :img.shape[1]]} 直接截断，只取前 $N_\text{gen}$ 个 token 的预测速度，条件图对应的输出被丢弃。条件图 token 只是「只读的参考信息」。
+
+\paragraph{Q: Channel concat 为什么需要重训 img\_in，而 sequence concat 不需要？}
+Channel concat 改变了每个 token 的特征维度（$64 \to 128/132$），\code{img\_in = nn.Linear(in\_channels, hidden\_size)} 的 \code{in\_channels} 必须对应修改，所以权重不兼容，必须重新训练。Sequence concat 每个 token 维度不变（仍是 64），原有权重完全兼容。
+
+\paragraph{Q: Kontext 的条件图为什么第 0 维设为 1？}
+第 0 维是 RoPE 的「时间轴」，\code{axes\_dim[0]=16} 给时间轴分配了 16 维的旋转空间。这样同一空间位置 \code{(row, col)} 的条件帧 token 和生成帧 token 有不同的旋转编码，模型可以区分「这是参考的」还是「这是要生成的」。
+
+\paragraph{Q: Redux 的视觉 token 为什么用 txt\_ids 全零？}
+Redux 的目标是「风格/内容参考」而非像素级对齐。用全零 \code{txt\_ids} 意味着这些视觉 token 作为全局语义条件使用，不带空间位置。
+
+% -------------------- 十一B、源码逐层精读 --------------------
+\subsection{源码逐层精读（基础模块）}
+
+\subsubsection{math.py — RoPE 核心实现}
+
+\begin{lstlisting}[language=Python]
+def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
+    assert dim % 2 == 0
+    scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
+    omega = 1.0 / (theta**scale)                  # shape: [dim/2]
+    out = torch.einsum("...n,d->...nd", pos, omega) # shape: [..., seq, dim/2]
+    out = torch.stack([torch.cos(out), -torch.sin(out),
+                       torch.sin(out),  torch.cos(out)], dim=-1)
+    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    return out.float()
+
+def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    return xq_out.reshape(*xq.shape).type_as(xq), \
+           xk_out.reshape(*xk.shape).type_as(xk)
+
+def attention(q, k, v, pe):
+    q, k = apply_rope(q, k, pe)              # 先旋转再算注意力
+    x = F.scaled_dot_product_attention(q, k, v)  # Flash Attention
+    x = rearrange(x, "B H L D -> B L (H D)")     # 合并多头
+    return x
+\end{lstlisting}
+
+\begin{conceptbox}
+\textbf{关键理解：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{rope()} 只生成旋转矩阵，不直接改变 token——旋转在 \code{apply\_rope()} 里发生
+  \item 双流块中图像和文本的 ids 先 cat 再统一算 \code{pe}，所以图文位置编码共享同一套 $\theta$
+  \item FLUX 用 3 轴 ids：\code{[batch\_id, height\_id, width\_id]}，文本的 height/width 恒为 0
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{layers.py — 模块拆解}
+
+\paragraph{EmbedND：多维 RoPE 位置编码}
+
+\begin{lstlisting}[language=Python]
+class EmbedND(nn.Module):
+    def __init__(self, dim, theta, axes_dim: list[int]):
+        # axes_dim 例如 [16, 56, 56]，三轴分配的维度之和 = head_dim
+        self.axes_dim = axes_dim
+
+    def forward(self, ids: Tensor) -> Tensor:
+        # ids shape: [B, seq_len, 3]  (3轴: t/h/w)
+        emb = torch.cat(
+            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            dim=-3,
+        )
+        return emb.unsqueeze(1)  # 加 head 维度，供多头注意力广播
+\end{lstlisting}
+
+\note{axes\_dim=[16, 56, 56]：head\_dim=128 时，16 维给时间轴（txt 用），56+56 给 H/W 轴。文本 token 的 txt\_ids 全为 0，所以文本不带空间位置——只有图像 patch 有 H/W 位置。}
+
+\paragraph{QKNorm + RMSNorm：稳定大模型训练}
+
+\begin{lstlisting}[language=Python]
+class RMSNorm(nn.Module):
+    def forward(self, x):
+        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        return (x * rrms).to(x.dtype) * self.scale  # 可学习缩放
+
+class QKNorm(nn.Module):
+    def __init__(self, dim):
+        self.query_norm = RMSNorm(dim)  # 每个 head 独立 norm
+        self.key_norm   = RMSNorm(dim)
+
+    def forward(self, q, k, v):
+        q = self.query_norm(q)
+        k = self.key_norm(k)
+        return q.to(v), k.to(v)  # 对齐 dtype
+\end{lstlisting}
+
+\begin{intubox}
+为什么只 norm Q 和 K，不 norm V？注意力权重 $= \text{softmax}(QK^T/\sqrt{d})$，Q 和 K 的尺度决定权重分布；V 只是加权求和，尺度异常影响有限。
+\end{intubox}
+
+\paragraph{Modulation：替代 AdaLN 的条件调制}
+
+\begin{lstlisting}[language=Python]
+class Modulation(nn.Module):
+    def __init__(self, dim, double: bool):
+        # double=True（双流块）：输出 6 份（图/文各 shift+scale+gate）
+        # double=False（单流块）：输出 3 份（shift+scale+gate）
+        self.multiplier = 6 if double else 3
+        self.lin = nn.Linear(dim, self.multiplier * dim, bias=True)
+
+    def forward(self, vec):
+        out = self.lin(F.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
+        return ModulationOut(*out[:3]), ModulationOut(*out[3:]) if self.is_double else None
+\end{lstlisting}
+
+\textbf{调制应用方式对比：}
+
+\begin{summarybox}
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{5cm}p{4cm}}
+\hline
+\textbf{方式} & \textbf{公式} & \textbf{特点} \\
+\hline
+AdaLN & $\gamma \cdot \text{LN}(x) + \beta$ & 经典，无门控 \\
+FLUX Modulation & $(1 + \text{scale}) \cdot \text{LN}(x) + \text{shift}$，残差乘以 gate & 有 gate，可动态关闭某层 \\
+\hline
+\end{tabular}
+}
+\end{center}
+\end{summarybox}
+
+\textbf{实际使用示例：}
+
+\begin{lstlisting}[language=Python]
+img_modulated = (1 + img_mod1.scale) * self.img_norm1(img) + img_mod1.shift
+img = img + img_mod1.gate * self.img_attn.proj(img_attn)  # gate 控制残差强度
+\end{lstlisting}
+
+\paragraph{DoubleStreamBlock：双流块完整前向}
+
+\begin{lstlisting}[language=Python]
+def forward(self, img, txt, vec, pe):
+    img_mod1, img_mod2 = self.img_mod(vec)   # 图像流：2个调制（attn + mlp）
+    txt_mod1, txt_mod2 = self.txt_mod(vec)   # 文本流：2个调制（attn + mlp）
+
+    # Step 1: 各自准备 QKV
+    img_modulated = (1 + img_mod1.scale) * self.img_norm1(img) + img_mod1.shift
+    img_q, img_k, img_v = split(self.img_attn.qkv(img_modulated))
+    img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)  # QK-Norm
+
+    txt_modulated = (1 + txt_mod1.scale) * self.txt_norm1(txt) + txt_mod1.shift
+    txt_q, txt_k, txt_v = split(self.txt_attn.qkv(txt_modulated))
+    txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)  # QK-Norm
+
+    # Step 2: 图文 QKV 拼接，统一算注意力（核心！）
+    q = torch.cat((txt_q, img_q), dim=2)   # [B, H, N_txt+N_img, D]
+    k = torch.cat((txt_k, img_k), dim=2)
+    v = torch.cat((txt_v, img_v), dim=2)
+    attn = attention(q, k, v, pe=pe)
+
+    # Step 3: 切分回各自的流，更新残差
+    txt_attn = attn[:, :txt.shape[1]]
+    img_attn = attn[:, txt.shape[1]:]
+
+    img = img + img_mod1.gate * self.img_attn.proj(img_attn)
+    img = img + img_mod2.gate * self.img_mlp(...)
+    txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
+    txt = txt + txt_mod2.gate * self.txt_mlp(...)
+
+    return img, txt
+\end{lstlisting}
+
+\begin{conceptbox}
+\textbf{精华：}图文 Q/K/V 来自各自独立的线性层（不共享权重），但 Attention 矩阵是联合计算的。图像 token 的 Q 可以 attend 到文本 token 的 K，实现\key{隐式 Cross-Attention}——比显式 Cross-Attn 更高效。
+\end{conceptbox}
+
+\paragraph{SingleStreamBlock：并行注意力的实现}
+
+\begin{lstlisting}[language=Python]
+def forward(self, x, vec, pe):
+    mod, _ = self.modulation(vec)
+    x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
+
+    # 并行的关键：一个 linear1 同时输出 QKV 和 MLP 的输入
+    qkv, mlp = torch.split(
+        self.linear1(x_mod),
+        [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
+    )
+
+    q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+    q, k = self.norm(q, k, v)
+
+    attn = attention(q, k, v, pe=pe)
+
+    # linear2: (hidden + mlp_hidden) -> hidden，两路结果在这里合并
+    output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), dim=2))
+    return x + mod.gate * output
+\end{lstlisting}
+
+\textbf{并行注意力图解：}
+
+\begin{lstlisting}
+x_mod -> linear1 -> QKV -> Attention -> attn    |
+                 -> mlp -> GELU   -> mlp_act    | -> cat -> linear2 -> output
+\end{lstlisting}
+
+\begin{intubox}
+串行：\code{x -> Attn -> x' -> FFN -> x''}（两次完整前向）\\
+并行：Attn 和 FFN 共用同一次 Norm 和第一个 Linear，节省约 1/3 计算量（GPT-J 的思路）
+\end{intubox}
+
+\subsubsection{model.py — 完整前向流程}
+
+\begin{lstlisting}[language=Python]
+class Flux(nn.Module):
+    def forward(self, img, img_ids, txt, txt_ids, timesteps, y, guidance=None):
+        # 1. 输入 Embedding
+        img = self.img_in(img)        # [B, N_patch, 64] -> [B, N_patch, hidden]
+        txt = self.txt_in(txt)        # [B, N_txt, 4096] -> [B, N_txt, hidden]
+
+        # 2. 构造全局条件向量 vec
+        vec = self.time_in(timestep_embedding(timesteps, 256))
+        # 时间步 t -> sinusoidal 256d -> MLP -> hidden_size
+
+        if self.params.guidance_embed:            # dev 模型才有
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
+            # schnell 没有 guidance_embed，是 nn.Identity()
+
+        vec = vec + self.vector_in(y)
+        # y 是 CLIP pooled embedding -> MLP -> 加到 vec
+        # 最终 vec = f(t) + f(guidance) + f(CLIP)，调制所有 block
+
+        # 3. 位置编码
+        ids = torch.cat((txt_ids, img_ids), dim=1)  # 图文 ids 拼接
+        pe  = self.pe_embedder(ids)                  # 统一算 RoPE
+
+        # 4. 双流块
+        for block in self.double_blocks:
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+
+        # 5. 单流块
+        img = torch.cat((txt, img), dim=1)  # 文本拼到前面！
+        for block in self.single_blocks:
+            img = block(img, vec=vec, pe=pe)
+        img = img[:, txt.shape[1]:, ...]   # 去掉文本部分，只保留图像
+
+        # 6. 输出
+        img = self.final_layer(img, vec)
+        return img
+\end{lstlisting}
+
+\textbf{FluxParams 对应 FLUX.1-dev 的实际配置：}
+
+\begin{lstlisting}[language=Python]
+FluxParams(
+    in_channels        = 64,    # 16ch VAE x 2x2 patch = 64
+    out_channels       = 64,
+    vec_in_dim         = 768,   # CLIP ViT-L pooled dim
+    context_in_dim     = 4096,  # T5-XXL hidden dim
+    hidden_size        = 3072,  # Transformer hidden dim
+    mlp_ratio          = 4.0,
+    num_heads          = 24,    # head_dim = 3072/24 = 128
+    depth              = 19,    # 19 个双流块
+    depth_single_blocks= 38,    # 38 个单流块（单流是双流的 2 倍！）
+    axes_dim           = [16, 56, 56],   # RoPE 三轴维度，合计 128 = head_dim
+    theta              = 10000,
+    qkv_bias           = True,
+    guidance_embed     = True,  # dev=True, schnell=False
+)
+\end{lstlisting}
+
+\begin{conceptbox}
+\textbf{38 个单流 vs 19 个双流：}单流块参数少（权重共享），堆更多层来补偿表达能力，是性价比权衡。
+\end{conceptbox}
+
+\subsubsection{sampling.py — 数据预处理（prepare 函数）}
+
+\begin{lstlisting}[language=Python]
+def prepare(t5, clip, img, prompt):
+    bs, c, h, w = img.shape  # latent 尺寸，如 [1, 16, 128, 128]
+
+    # Patchify：2x2 patch 化
+    img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+    # [B, 16, 128, 128] -> [B, 64x64, 64]
+
+    # 图像位置 id：记录每个 patch 的 (0, row, col)
+    img_ids = torch.zeros(h//2, w//2, 3)
+    img_ids[..., 1] = torch.arange(h//2)[:, None]  # row 坐标
+    img_ids[..., 2] = torch.arange(w//2)[None, :]  # col 坐标
+    # img_ids[..., 0] = 0，保留给多图/视频场景
+
+    # 文本编码
+    txt = t5(prompt)           # T5 sequence tokens: [B, seq_len, 4096]
+    txt_ids = torch.zeros(bs, txt.shape[1], 3)  # 文本无空间位置，全 0
+    vec = clip(prompt)         # CLIP pooled: [B, 768]
+
+    return {"img": img, "img_ids": img_ids, "txt": txt,
+            "txt_ids": txt_ids, "vec": vec}
+\end{lstlisting}
+
+\begin{intubox}
+\code{img\_ids} 第 0 维（时间轴）全为 0，这是为视频/多图扩展预留的设计：在 FLUX.1 Kontext 中，把多帧图像的 \code{img\_ids} 的第 0 维设为帧编号，就实现了时序感知。
+\end{intubox}
+
+% -------------------- 十二、面试高频问题 --------------------
+\subsection{面试高频问题 \& 答案思路}
+
+\paragraph{Q1: FLUX 的双流和单流分别做什么，为什么要这样设计？}
+双流在前：图文各自提取特征，通过联合 Attention 相互影响，各保留模态独立性。单流在后：concat 后联合处理，实现深度融合。源码中双流共 19 层，单流 38 层，单流更多因为权重参数少（共享）。
+
+\paragraph{Q2: FLUX 双流块的图文交互是 Cross-Attention 吗？}
+不是传统 Cross-Attention。图文各有独立 QKV 线性层，但 Attention 计算时 Q/K/V 被 cat 在一起统一做 Self-Attention（\code{q = cat(txt\_q, img\_q)}）。效果等价于双向 Cross-Attention，但只需一次矩阵乘，更高效。
+
+\paragraph{Q3: FLUX 和 SD3 的 MMDiT 有什么区别？}
+FLUX 在 SD3 双流基础上增加了：
+\begin{enumerate}[leftmargin=1.5em]
+  \item 大量 Single Stream Blocks
+  \item QK-Norm 和并行注意力
+  \item Guidance Distillation
+  \item 规模扩到 12B
+  \item RoPE 三轴位置编码（新增时间轴）
+\end{enumerate}
+
+\paragraph{Q4: Flow Matching 和 DDPM 的核心区别？}
+Flow Matching 学速度场，轨迹是直线，训练目标 $v = \epsilon - x_0$；DDPM 学噪声 $\epsilon$，轨迹是弯曲的马尔可夫链。FM 采样步数更少，概念更简洁。
+
+\paragraph{Q5: dev 和 schnell 的蒸馏有什么本质区别？}
+dev 是 Guidance Distillation（单次前向替代 CFG 两次前向，步数不变仍需 50 步）；schnell 是在此基础上再加 Timestep Distillation+LADD（4 步即可）。源码体现：dev 的 \code{guidance\_embed=True} 有 \code{guidance\_in} MLP 层，schnell 是 \code{nn.Identity()}。
+
+\paragraph{Q6: guidance scale 是怎么传入模型的？}
+\code{guidance} $\to$ \code{timestep\_embedding(guidance, 256)} $\to$ \code{MLP(guidance\_in)} $\to$ 加到 \code{vec}。\code{vec} 再经每层的 Modulation 预测 shift/scale/gate，作用于每个 token。所以 guidance 信号渗透到所有层的所有 token，不只是输入层。
+
+\paragraph{Q7: 为什么 FLUX 要同时用 T5 和 CLIP？}
+CLIP 擅长图文对齐，输出 pooled embedding 加入 \code{vec} 做全局调制；T5 理解复杂长文本，输出 sequence tokens 参与双流块的联合 Attention。两者角色完全不同，互补而非冗余。
+
+\paragraph{Q8: RoPE 相比传统位置编码的优势？}
+RoPE 编码相对位置，支持任意分辨率外推；FLUX 用 3 轴 RoPE（时间/高/宽），其中 \code{axes\_dim=[16,56,56]}，文本 token 的空间轴为 0（无空间位置），天然区分图文。
+
+\begin{summarybox}
+\textbf{演化路径：}\\
+SD 1.x（U-Net + CLIP + 4ch VAE）\\
+$\to$ SD3（MMDiT 双流 + T5/CLIP + 16ch VAE + FM）\\
+$\to$ FLUX.1（12B MMDiT + 双流/单流 + RoPE + 2 种蒸馏）
+\end{summarybox}
+
+% -------------------- 十三、推荐资源 --------------------
+\subsection{推荐资源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 官方博客：\href{https://bfl.ai/announcing-black-forest-labs/}{Black Forest Labs 公告}
+  \item Hugging Face Model Card：FLUX.1-dev
+  \item 代码仓库：\href{https://github.com/black-forest-labs/flux}{black-forest-labs/flux on GitHub}
+  \item Flow Matching 原理：\href{https://arxiv.org/abs/2210.02747}{Flow Matching for Generative Modeling (Lipman et al., 2022), arXiv:2210.02747}
+  \item RoPE 原理：\href{https://arxiv.org/abs/2104.09864}{RoFormer (Su et al., 2021), arXiv:2104.09864}
+  \item FLUX.1 Kontext 论文：\href{https://arxiv.org/abs/2506.15742}{arXiv:2506.15742}
+\end{itemize}
+
+% ============================================================
+% 十四、FLUX.1 Kontext 与 FLUX.2 Klein 系列
+% ============================================================
+\subsection{FLUX.1 Kontext 与 FLUX.2 Klein 系列}
+
+\begin{conceptbox}
+\textbf{一句话：} FLUX.1 Kontext（2025.06，arXiv:2506.15742）将参考图以\key{序列拼接}的方式送入视觉流，用 3D RoPE 时间轴区分"目标帧"与"参考帧"，实现统一的 T2I+图像编辑单模型。FLUX.2 Klein（2026.01）则是面向推理效率的独立轻量系列（4B/9B），与 Kontext 编辑能力线并行。
+\end{conceptbox}
+
+% -------------------- 14.1 FLUX 全系列变体对比 --------------------
+\subsubsection{FLUX 全系列变体一览}
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\textbf{模型} & \textbf{条件注入方式} & \textbf{主要任务} & \textbf{蒸馏} & \textbf{发布时间} \\
+\midrule
+FLUX.1 [pro]       & 文本条件          & T2I              & —                 & 2024.08 \\
+FLUX.1 [dev]       & 文本条件          & T2I              & Guidance Distill  & 2024.08 \\
+FLUX.1 [schnell]   & 文本条件          & T2I              & LADD              & 2024.08 \\
+FLUX.1 Fill        & Channel concat    & Inpainting       & —                 & 2024.11 \\
+FLUX.1 Canny       & Channel concat    & 边缘控制          & —                 & 2024.11 \\
+FLUX.1 Depth       & Channel concat    & 深度控制          & —                 & 2024.11 \\
+FLUX.1 Redux       & txt-side concat   & 图像变体          & —                 & 2024.11 \\
+FLUX.1 Kontext [pro] & Sequence concat & T2I + 编辑       & LADD              & 2025.06 \\
+FLUX.1 Kontext [dev] & Sequence concat & 图像编辑          & Guidance Distill  & 2025.06 \\
+FLUX.1 Kontext [max] & Sequence concat & T2I + 编辑       & —（增强计算）      & 2025.06 \\
+FLUX.2 Klein 9B    & —                & T2I + 编辑        & 4步蒸馏           & 2026.01 \\
+FLUX.2 Klein 4B    & —                & T2I + 编辑        & 4步蒸馏           & 2026.01 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------- 14.2 FLUX.1 Kontext 架构 --------------------
+\subsubsection{FLUX.1 Kontext：核心架构创新}
+
+\begin{intubox}
+Kontext 的核心思路：参考图不走"条件通道"也不走"独立编码器"，而是直接作为\key{视觉 token 序列}拼到目标图的 token 前面，用 RoPE 时间轴 $t=0$（目标）/$t=i$（第 $i$ 张参考）区分身份。
+\end{intubox}
+
+\textbf{Token 构造方式}
+
+目标图像 token 的 3D RoPE 坐标：
+$$u_x = (0,\, h,\, w)$$
+第 $i$ 张参考图像 token 的坐标：
+$$u_{y_i} = (i,\, h,\, w), \quad i = 1, 2, \ldots, N$$
+
+在代码中（\code{sampling.py :: prepare\_kontext}）：
+\begin{lstlisting}[language=Python]
+# 目标图 img_ids：时间轴=0
+img_ids[..., 0] = 0  # axis 0 = time
+
+# 参考图 img_cond_ids：时间轴=1
+img_cond_ids = get_2d_sincos_pos_embed(...)
+img_cond_ids[..., 0] = 1  # 区分为"参考帧"
+
+# 序列维度拼接：N_gen + N_cond
+img_seq   = torch.cat((img, img_cond_seq),   dim=1)
+img_ids_full = torch.cat((img_ids, img_cond_ids), dim=1)
+\end{lstlisting}
+
+在 \code{denoise()} 中，只预测目标部分，参考 token 只读：
+\begin{lstlisting}[language=Python]
+# img_cond_seq 存在时走 sequence concat 分支
+if img_cond_seq is not None:
+    img = torch.cat((img, img_cond_seq), dim=1)
+    img_ids = torch.cat((img_ids, img_cond_ids), dim=1)
+
+# 前向传播后只取目标帧的预测
+pred = model(img, ...)
+pred = pred[:, :orig_img_len]   # 丢弃参考 token 的输出
+\end{lstlisting}
+
+\textbf{与其他注入方式对比：}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{方式} & \textbf{改变维度} & \textbf{代表模型} \\
+\midrule
+Channel concat & 特征维度 $64 \to 128$（或 $132$） & Fill / Canny / Depth \\
+Sequence concat & 序列长度 $N \to N + N_\text{cond}$ & \textbf{Kontext} \\
+txt-side concat & txt token 数量增加 & Redux \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{为什么 Sequence Concat 更优雅？}
+\begin{itemize}[leftmargin=1.5em]
+  \item 参考图保留完整的空间结构（每个 patch 都有独立坐标），而不是被压缩成 pooled embedding
+  \item 同一套 Attention 权重即可让目标 token 自由 attend 到参考 token，无需额外的 cross-attention 模块
+  \item $N=0$ 时自然退化为标准 T2I，一个 checkpoint 覆盖两种任务
+  \item 可以拼多张参考图：$u_{y_1}=(1,h,w),\; u_{y_2}=(2,h,w),\ldots$
+\end{itemize}
+
+% -------------------- 14.3 训练流程与蒸馏 --------------------
+\subsubsection{Kontext 训练流程}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Stage 1 — 联合微调}：从 FLUX.1 T2I checkpoint 出发，同时训练 T2I 和 图像编辑任务。数据为数百万对 $(x \mid y, c)$（目标图 $\mid$ 参考图 $+$ 文本描述），经分类器过滤和对抗训练进行数据清洗。
+  \item \textbf{Stage 2 — 变体蒸馏}：
+    \begin{itemize}
+      \item \code{[pro]}：Flow matching 训练后接 \key{LADD}（Latent Adversarial Diffusion Distillation）——在 latent 空间加判别器进行对抗微调，消除高 CFG 引起的过饱和/过锐化伪影。
+      \item \code{[dev]}：\key{Guidance Distillation}（类似 Meng et al.）——把 CFG 折入权重，单次前向替代双次前向，\code{guidance\_scale $\approx$ 2.5}。
+    \end{itemize}
+\end{enumerate}
+
+\textbf{训练基础设施：}FSDP2 分布式，\code{bfloat16}/\code{float32} 混合精度，Flash Attention 3，选择性 Activation Checkpointing。
+
+% -------------------- 14.4 KontextBench --------------------
+\subsubsection{KontextBench 评测基准}
+
+\begin{conceptbox}
+KontextBench 是论文提出的 \key{1026 对图文测试集}（108 张基础图像），覆盖五类任务：
+\end{conceptbox}
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+\textbf{类别} & \textbf{数量} \\
+\midrule
+局部编辑（Local instruction editing） & 416 \\
+全局编辑（Global instruction editing） & 262 \\
+角色参考（Character reference）        & 193 \\
+文字编辑（Text editing）               & 92 \\
+风格参考（Style reference）            & 63 \\
+\midrule
+\textbf{合计} & \textbf{1026} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+身份一致性评测使用 \key{AuraFace} 人脸 embedding 余弦相似度，衡量多轮迭代编辑后面部身份的漂移程度。结果：Kontext [pro] 在局部编辑、文字编辑、角色参考上排名第一；全局编辑次于 GPT-Image-1；AuraFace 漂移显著低于 GPT-Image-1 和 Runway Gen-4。
+
+% -------------------- 14.5 FLUX.2 Klein --------------------
+\subsubsection{FLUX.2 Klein 系列（2026.01）}
+
+\begin{intubox}
+Klein 是独立的轻量化模型系列，主打\key{极速推理}（4步，亚秒级），通过统一架构同时支持 T2I、图像编辑和 Inpainting，4B 版本采用 \key{Apache 2.0} 开源协议。
+\end{intubox}
+
+\textbf{模型规格对比：}
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\textbf{变体} & \textbf{参数量} & \textbf{蒸馏} & \textbf{协议} & \textbf{VRAM（BF16）} \\
+\midrule
+Klein 9B（蒸馏版） & 9B  & 4步步蒸馏 & Non-Commercial & 19.6 GB \\
+Klein 9B（基础版） & 9B  & —          & Non-Commercial & 21.7 GB \\
+Klein 4B（蒸馏版） & 4B  & 4步步蒸馏 & \textbf{Apache 2.0} & 8.4 GB \\
+Klein 4B（基础版） & 4B  & —          & \textbf{Apache 2.0} & 9.2 GB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{核心特点：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{统一单模型}：T2I + 图像编辑 + Inpainting 不需要切换变体
+  \item \key{4步蒸馏}：蒸馏版 4步即可生成高质量图像（类似 LADD 思路）
+  \item 支持最高 \textbf{4MP} 分辨率输出
+  \item 提供 FP8 / NVFP4 量化版本，4B 蒸馏版仅需约 13 GB VRAM
+  \item RTX 5090 上：Klein 4B 蒸馏版 $\approx 1.2$s，Klein 9B 蒸馏版 $\approx 2$s（1024×1024）
+\end{itemize}
+
+\textbf{与 Kontext 的关系：}Klein 不是 Kontext 的直接衍生，两者是并行产品线——Kontext 主攻编辑质量和身份一致性，Klein 主攻推理效率和开源可用性。
+
+% -------------------- 14.6 面试高频问题 --------------------
+\subsubsection{面试高频问题 · Kontext \& Klein}
+
+\paragraph{Q1: Kontext 和 FLUX.1 Fill 都能做图像编辑，核心区别是什么？}
+Fill 用\key{通道拼接}：把 mask + 条件图在特征维度 cat（$64 \to 132$），需要显式的 mask 输入，\code{img\_in} 线性层权重要重新初始化；Kontext 用\key{序列拼接}：参考图作为独立 token 拼在序列维度，用 3D RoPE 时间轴区分目标/参考，不需要 mask，也不改变任何线性层尺寸，一个 checkpoint 无缝处理 T2I 和编辑。
+
+\paragraph{Q2: 为什么序列拼接不改变 Attention 权重但仍能区分目标/参考？}
+因为 RoPE 是位置无关的相对位置编码，但 Kontext 利用\key{时间轴（axis=0）}作为离散帧索引：目标 token 时间轴=0，参考 token 时间轴=1。\code{axes\_dim=[16,56,56]} 中 16 维用于编码时间轴，这 16 维的旋转频率差异使 Attention 的 QK 内积自然区分两类 token，而无需修改任何权重。
+
+\paragraph{Q3: Kontext [dev] 和 [pro] 的蒸馏方式有何不同？}
+\code{[dev]} 用 \key{Guidance Distillation}：把 CFG 折入权重（类 Meng et al.），保留完整推理步数，\code{guidance\_scale$\approx$2.5}；\code{[pro]} 用 \key{LADD}：在 latent 空间添加判别器对抗训练，大幅减少步数，同时修复高 CFG 的过饱和伪影，生成质量更高。
+
+\paragraph{Q4: FLUX.2 Klein 4B Apache 2.0 意味着什么？}
+这是 BFL \textbf{首个}允许商业使用的开源权重。此前 dev/schnell 均为非商业协议。Klein 4B Apache 2.0 使得开发者可以将其集成到商业产品中而无需授权费用，是 BFL 向开源社区的重要妥协/让步。
+
+\begin{summarybox}
+\textbf{演化路径（完整版）：}\\
+SD 1.x（U-Net + CLIP + 4ch VAE）\\
+$\to$ SD3（MMDiT 双流 + T5/CLIP + 16ch VAE + FM）\\
+$\to$ FLUX.1（12B MMDiT + 双流/单流 + RoPE + 2种蒸馏）\\
+$\to$ FLUX.1 工具链（Fill/Canny/Depth/Redux：通道/序列/txt concat）\\
+$\to$ FLUX.1 Kontext（序列拼接 + 3D RoPE时间轴，统一T2I+编辑，LADD/GD蒸馏）\\
+$\to$ FLUX.2 Klein（4B/9B轻量模型，4步蒸馏，Apache 2.0，统一T2I+编辑+Inpainting）
+\end{summarybox}
+
+% ============================================================
+\subsection{补充高频面试题（来源：知乎 / 牛客 / CSDN）}
+% ============================================================
+
+\begin{summarybox}
+本节覆盖 FLUX.1 系列模型高频面试考点，共 11 个主题，35 道题，包括
+\key{Flow Matching}、\key{双流/单流 Block}、\key{RoPE 位置编码}、\key{双编码器}、
+\key{16 通道 VAE}、\key{蒸馏策略}、\key{三种条件注入}、\key{FLUX.1 Kontext}、
+\key{训练稳定性}、\key{综合细节}。
+\end{summarybox}
+
+% ------- 主题一：Flow Matching 与 Rectified Flow -------
+\subsubsection{主题一：Flow Matching 与 Rectified Flow}
+
+\begin{conceptbox}{Q1：FLUX.1 使用的训练目标是什么？与 DDPM 的噪声预测有何本质区别？}
+FLUX.1 基于 \key{Rectified Flow}，使用线性插值轨迹：
+\[
+x_t = (1-t)\,x_0 + t\,\varepsilon, \quad \varepsilon \sim \mathcal{N}(0,I)
+\]
+训练目标为\key{速度场预测}（Velocity Prediction）：
+\[
+\mathcal{L} = \mathbb{E}_{t,x_0,\varepsilon}\bigl[\|v_\theta(x_t, t) - (\varepsilon - x_0)\|^2\bigr]
+\]
+目标 $v^* = \varepsilon - x_0$ 是从数据指向噪声的\textbf{恒定速度向量}。
+
+\begin{center}
+\small
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{特性} & \textbf{Rectified Flow} & \textbf{DDPM} \\
+\hline
+预测目标 & 速度 $v = \varepsilon - x_0$ & 噪声 $\varepsilon$ \\
+轨迹 & 线性插值（直线） & 余弦/线性 Markov 链（弯曲）\\
+采样 & ODE（确定性） & SDE（随机）\\
+推理步数 & 少（4--25 步） & 多（50--1000 步）\\
+\hline
+\end{tabular}
+\end{center}
+
+\good{直线轨迹优势}：ODE 积分离散化误差极小，同等步数下精度远高于 DDPM 弯曲轨迹。
+\end{conceptbox}
+
+\begin{warnbox}{常见误区：FLUX 是"扩散模型"还是"Flow Matching 模型"？}
+\warn{误区}：认为 FLUX.1 仍在做 DDPM 式的"加噪去噪"。
+
+\good{正确}：FLUX.1 使用 \key{Flow Matching（Rectified Flow）}，数学上是学习 ODE 速度场：
+\begin{itemize}
+  \item DDPM：$x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\varepsilon$（非线性，弯曲路径）
+  \item Rectified Flow：$x_t = (1-t)x_0 + t\varepsilon$（线性，直线路径）
+  \item 预测目标 $v = \varepsilon - x_0$ \textbf{不等同于} DDPM 的噪声预测 $\varepsilon$
+\end{itemize}
+\end{warnbox}
+
+\begin{conceptbox}{Q2：推理时 FLUX.1 如何用 Euler Solver 生成图像？}
+从纯噪声 $x_1 \sim \mathcal{N}(0,I)$ 出发，Euler 离散更新：
+\[
+x_{t-\Delta t} = x_t - \Delta t \cdot v_\theta(x_t,\, t,\, c)
+\]
+\begin{itemize}
+  \item FLUX.1 [dev]：通常 20--50 步（Euler 或 Heun 二阶）
+  \item FLUX.1 [schnell]：经 LADD 蒸馏后 \good{1--4 步}即可高质量生成
+\end{itemize}
+直线轨迹使得 Euler 离散误差远小于 DDIM（弯曲轨迹的数值积分误差更大）。
+\end{conceptbox}
+
+\begin{intubox}
+\textbf{直觉类比}：DDPM 走\bad{弯曲山路}——需要很多步猜转弯；Rectified Flow 走\good{高速直线}——模型直接预测速度 $(\varepsilon - x_0)$，步少误差小。
+\end{intubox}
+
+\begin{conceptbox}{Q3：Flow Matching 训练时时间步 $t$ 如何采样？为什么不均匀？}
+FLUX.1（继承自 SD3）使用\key{Logit-Normal 时间步采样}：
+\[
+t \sim \text{Logistic-Normal}(\mu, \sigma) \quad \Longrightarrow \quad u = \text{sigmoid}(z),\; z \sim \mathcal{N}(\mu,\sigma)
+\]
+\textbf{原因}：接近 $t=0$（数据）和 $t=1$（纯噪声）的区域梯度信号弱、训练价值低；Logit-Normal 将训练步集中在 $t \approx 0.5$ 的"难样本区域"，提升训练效率。
+
+\note{这是 FLUX/SD3 区别于 DDPM 均匀时间步采样的重要细节，面试中常被追问。}
+\end{conceptbox}
+
+% ------- 主题二：双流 Block -------
+\subsubsection{主题二：双流 Block（Double Stream Blocks）}
+
+\begin{conceptbox}{Q4：双流 Block 为什么让图像流和文本流分开处理？跨模态如何交互？}
+\textbf{设计动机}：图像 token（VAE patchify）与文本 token（T5/CLIP）特征分布差异极大，过早合并会导致模态干扰，无法充分提取各模态特征。双流结构让两个模态先在\textbf{独立参数流}中发展表征，再通过联合 Attention 交互。
+
+\textbf{跨模态交互——隐式 Cross-Attention（QKV Concat）}：
+\[
+Q = \text{cat}(Q_\text{img}, Q_\text{txt}),\quad K = \text{cat}(K_\text{img}, K_\text{txt}),\quad V = \text{cat}(V_\text{img}, V_\text{txt})
+\]
+全序列 Self-Attention 后按长度切分回各自流并更新残差。\textbf{没有独立的 Cross-Attention 层}，信息流双向对称。
+\end{conceptbox}
+
+\begin{warnbox}{常见混淆：FLUX 的"Cross-Attention"在哪里？}
+\warn{误区}：认为双流 Block 里有独立的 Cross-Attention 模块（如 U-Net 式）。
+
+\good{正确}：FLUX.1 通过\key{拼接 Q/K/V 后做全序列 Self-Attention} 实现跨模态交互，没有独立 Cross-Attention 层。这继承自 SD3 的 MMDiT 设计，允许图文 token 完全对称地互相 attend。
+\end{warnbox}
+
+\begin{conceptbox}{Q5：Modulation 机制与 AdaLN 有何区别？}
+\textbf{AdaLN}（SD3/DiT）：
+\[
+\text{AdaLN}(x, c) = \gamma(c) \cdot \text{LayerNorm}(x) + \beta(c)
+\]
+条件 $c$ 经 MLP 生成 scale + shift，无门控。
+
+\textbf{FLUX.1 Modulation}：增加了\key{Gate 门控机制}（3 组参数）：
+\[
+(s, b, g) = \text{MLP}_\text{mod}(\mathbf{vec}), \quad x \leftarrow x + g \cdot \text{Attn/FFN}\bigl((1+s)\cdot\text{Norm}(x) + b\bigr)
+\]
+$g$ 为 Sigmoid 门控，\good{可动态关闭某层的残差贡献}，表达能力更强。图像流和文本流使用\textbf{独立的 Modulation MLP}。
+\end{conceptbox}
+
+% ------- 主题三：单流 Block 与整体架构 -------
+\subsubsection{主题三：单流 Block 与整体架构}
+
+\begin{conceptbox}{Q6：单流 Block 与双流 Block 有何不同？为什么 38 个单流、19 个双流？}
+\textbf{单流 Block}：img 和 txt token 已合并为统一序列，使用\key{并行注意力（Parallel Attention）}：
+\[
+x \leftarrow x + g_1 \cdot \text{Attn}(\text{Norm}(x)) + g_2 \cdot \text{FFN}(\text{Norm}(x))
+\]
+Attn 和 FFN 共享同一个 Norm 输入，并行计算，输出加权求和。
+
+\textbf{数量设计直觉}：
+\begin{itemize}
+  \item 双流（19 个）：\good{早期模态专化}——各流充分表达自身特征
+  \item 单流（38 个）：\good{后期深度融合}——合并后做大量跨模态联合推理
+  \item 38 ≈ 2×19：单流每块参数少（共享），堆更多层补偿表达能力；总计 \textbf{12B 参数}
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q7：FLUX.1 与 SD3 的 MMDiT 有何区别？}
+SD3 MMDiT 基础上，FLUX.1 新增/改进：
+\begin{enumerate}
+  \item \good{双流阶段 + 单流阶段}（先模态专化，后深度融合）
+  \item \good{增强 Modulation}：加 Gate 门控（AdaLN-Gate）
+  \item \good{CLIP-G 换为 T5-XXL 为主文本流}，CLIP-L pooled 仅用于 vec
+  \item \good{全面 RoPE} 替代绝对位置编码（支持可变分辨率）
+  \item \good{QK-Norm + HybridNorm}（训练稳定性）
+  \item \good{规模扩展至 12B}（SD3 约 2B）
+  \item \good{Guidance Distillation / LADD 蒸馏}变体
+\end{enumerate}
+\end{conceptbox}
+
+% ------- 主题四：RoPE 位置编码 -------
+\subsubsection{主题四：RoPE 位置编码}
+
+\begin{conceptbox}{Q8：FLUX.1 如何使用 RoPE？图像用 2D，文本为何 txt\_ids 全零？}
+\textbf{RoPE 基本原理}：对 Q、K 向量应用复数旋转，注意力得分只与\key{相对位置}有关：
+\[
+\langle\text{RoPE}(q, m),\, \text{RoPE}(k, n)\rangle = f(m - n)
+\]
+
+\textbf{FLUX.1 三轴 RoPE，axes\_dim = [16, 56, 56]}（总和 128 = head\_dim/2）：
+\begin{itemize}
+  \item \textbf{轴 0（时间轴）}：16 维，区分目标帧/参考帧（Kontext 中使用）
+  \item \textbf{轴 1（$h$ 轴）}：56 维，编码 patch 行位置
+  \item \textbf{轴 2（$w$ 轴）}：56 维，编码 patch 列位置
+\end{itemize}
+
+\textbf{txt\_ids 为何全零}：文本 token 无空间位置语义，全零意味着 RoPE 对 txt token 不引入任何位置偏置，注意力分数与顺序无关（纯内容 attention）。文本顺序信息已由 T5 自身位置编码处理。
+\end{conceptbox}
+
+\begin{warnbox}{常见误区：RoPE 应用在 Q、K、V 上？}
+\warn{错误}：认为 RoPE 应用在所有 Q/K/V 上。
+
+\good{正确}：RoPE \textbf{只应用在 Q 和 K 上}，不应用在 V 上。
+
+V 是"被加权求和的内容"，其幅度携带语义信息；对 V 做旋转会破坏信息完整性。这与 QK-Norm 只 norm Q/K 的逻辑完全一致：位置/路由信号只影响"选择注意哪里"，不影响"被注意到的内容"。
+\end{warnbox}
+
+\begin{conceptbox}{Q9：为什么 RoPE 比绝对位置编码更适合变分辨率生成？}
+\begin{itemize}
+  \item \textbf{绝对位置编码}：$PE(i)$ 是可学习向量表，分辨率变化时 token 数变化，需\bad{插值引入误差}。
+  \item \textbf{RoPE}：注意力得分只与相对位置差有关，无"查表"操作。任意分辨率只需改变坐标数值，不新增可学习参数。
+  \item \good{天然支持外推}：见过 $64\times64$ 网格，未见过 $128\times128$ 网格，但相对关系（邻近/远离）的旋转角意义相同。
+\end{itemize}
+
+这是 FLUX.1 支持\textbf{多分辨率、多宽高比}灵活生成的核心技术。
+\end{conceptbox}
+
+% ------- 主题五：双编码器 -------
+\subsubsection{主题五：T5-XXL + CLIP 双编码器}
+
+\begin{conceptbox}{Q10：为什么同时用 T5-XXL 和 CLIP？各自起什么作用？}
+\begin{center}
+\small
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{特性} & \textbf{T5-XXL} & \textbf{CLIP-L} \\
+\hline
+参数量 & $\sim$4.7B & $\sim$307M \\
+训练目标 & 文本重建（Seq2Seq） & 图文对比 \\
+输出形式 & 序列 token（细粒度） & pooled embedding（全局语义）\\
+长文本理解 & 强（512 token） & 弱（77 token 上限）\\
+图文对齐 & 弱 & 强 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{FLUX.1 中用途}：
+\begin{itemize}
+  \item \textbf{T5 序列输出} $\to$ $\mathbf{txt\_tokens}$：进入双流/单流 Block 参与全序列 Attention，提供词级细粒度语义
+  \item \textbf{CLIP pooled 输出} $\to$ $\mathbf{vec}$：与时间步嵌入、guidance 嵌入拼接，通过 Modulation 在每层注入全局条件
+\end{itemize}
+
+\good{二者互补}：T5 提供细粒度文本流，CLIP 提供视觉对齐的全局锚点——缺一不可。
+\end{conceptbox}
+
+% ------- 主题六：16 通道 VAE -------
+\subsubsection{主题六：16 通道 VAE 与 Patchify}
+
+\begin{conceptbox}{Q11：为什么用 16 通道 VAE？Patchify 后 token 维度为何是 64？}
+\textbf{16 通道 vs 4 通道的优势}：
+\begin{itemize}
+  \item \good{更丰富的潜空间}：16 通道 = 4× 更多特征维度，压缩时信息损失更少
+  \item \good{细节保留更好}：文字、纹理等高频细节不易在 VAE 瓶颈丢失
+  \item \good{多轮编辑误差积累小}：重编码/解码时偏移更小
+\end{itemize}
+
+\textbf{Patchify 计算}：
+\[
+[B,\, 16,\, H/8,\, W/8] \xrightarrow{2\times2\text{ patchify}} [B,\; \tfrac{H}{16}\cdot\tfrac{W}{16},\; 16\times4] = [B,\; N,\; \mathbf{64}]
+\]
+$16 \times 4 = 64$（通道 × 块内像素数）。总下采样 $8 \times 2 = 16\times$，1024px 图像 $\to$ 4096 tokens。
+
+\note{FLUX.1 与 SD3 共享 16 通道 VAE，VAE 权重可直接从 SD3 初始化。}
+\end{conceptbox}
+
+% ------- 主题七：蒸馏策略 -------
+\subsubsection{主题七：蒸馏策略——Guidance Distillation 与 LADD}
+
+\begin{conceptbox}{Q12：Guidance Distillation（dev）的原理是什么？如何替代 CFG？}
+\textbf{CFG 的问题}：每步需两次前向（条件 + 无条件），计算量翻倍：
+\[
+\tilde{v} = v_\theta(x_t, c) + w\cdot\bigl(v_\theta(x_t, c) - v_\theta(x_t, \varnothing)\bigr)
+\]
+
+\textbf{Guidance Distillation 的做法}：将 guidance scale $w$ 编码为额外嵌入加入 $\mathbf{vec}$：
+\[
+\mathbf{vec} = \text{MLP}\bigl(\text{ts\_emb}(t) \oplus \text{CLIP\_pooled} \oplus \text{TimestepEmb}(w)\bigr)
+\]
+训练时让 student（单次前向）匹配 teacher（CFG 双次前向）的输出，\textbf{内化 CFG 效果}。
+
+推理时设 \texttt{guidance\_scale=3.5}，单次前向即可，质量接近 CFG，速度提升 $\approx 2\times$。
+\end{conceptbox}
+
+\begin{conceptbox}{Q13：LADD（schnell）是什么？与 Guidance Distillation 的本质区别？}
+\textbf{LADD（Latent Adversarial Diffusion Distillation）}：\textbf{步数蒸馏}，目标是将 20--50 步压缩至 \key{1--4 步}。
+
+\begin{center}
+\small
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{维度} & \textbf{Guidance Distillation (dev)} & \textbf{LADD (schnell)} \\
+\hline
+蒸馏目标 & 替代 CFG 双次前向 & 大幅减少采样步数 \\
+推理步数 & 20--50 步（不变） & \textbf{1--4 步} \\
+训练机制 & MSE 监督 & \textbf{对抗训练 + 蒸馏损失} \\
+CFG 支持 & \good{是}（传入 guidance scale） & \bad{否}（固定） \\
+许可证 & 非商用 & \good{Apache 2.0} \\
+\hline
+\end{tabular}
+\end{center}
+
+LADD 在\textbf{潜空间}（非像素空间）做对抗训练，避免了像素级 GAN 的不稳定问题。
+\end{conceptbox}
+
+\begin{warnbox}{常见误区：schnell 是 dev 的量化压缩版？}
+\warn{错误}：FLUX.1 [schnell] 不是 [dev] 的量化或加速推理版本。
+
+\good{正确}：两者通过\textbf{不同蒸馏方法}独立训练——[dev] 是 Guidance Distillation（步数不变），[schnell] 是 LADD（步数压缩至 1-4，无 CFG 支持）。
+\end{warnbox}
+
+% ------- 主题八：三种条件注入 -------
+\subsubsection{主题八：三种条件注入方式}
+
+\begin{conceptbox}{Q14：FLUX.1 Tools 的三种条件注入方式各适用什么场景？}
+\begin{center}
+\small
+\begin{tabular}{|l|l|l|l|l|}
+\hline
+\textbf{方式} & \textbf{模型} & \textbf{注入维度} & \textbf{序列长度} & \textbf{适用场景} \\
+\hline
+通道 concat & Canny/Depth/Fill & 特征通道 $64\to128$ & 不变 & 像素级空间对齐控制 \\
+img 侧序列 concat & Kontext & 序列 $N\to N+N_\text{cond}$ & 增加 & 参考图内容/角色一致性 \\
+txt 侧序列 concat & Redux & txt token 数增加 & 增加 & 图像风格/内容参考 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{通道 concat 原理}：控制信号与噪声 latent 在通道维度逐 patch 对齐拼接，每个 patch 进入 Transformer 前即"知道"对应位置的控制信息，\good{空间对齐精确、计算量不增}，适合 Canny/Depth/Fill。
+
+\textbf{序列 concat 优势}：参考 token 参与完整 Attention，空间对应关系由 RoPE 坐标保留，\good{上下文感知强}；\warn{代价是 Attention 计算量 $O(N^2)$ 增大}。
+\end{conceptbox}
+
+\begin{conceptbox}{Q15：为什么 Canny/Depth 用通道 concat，而 Kontext 用序列 concat？}
+\begin{itemize}
+  \item \textbf{通道 concat 的本质}：让模型在每个空间位置上同时看到噪声 latent 和控制信号的对应特征，\good{天然像素级对齐}，无需通过 Attention 学习空间对应。
+  \item \textbf{序列 concat 的问题}（若用于 Canny）：深度图 token 和目标图 token 的空间对应需 Attention 自行学习，训练难度更高，精度可能不及直接通道对齐。
+  \item \textbf{计算量对比}：通道 concat 序列长度不变 $O(N^2)$；序列 concat 变 $O((2N)^2) = 4O(N^2)$，\bad{翻 4 倍}。
+\end{itemize}
+
+\key{结论}：像素级精确控制用通道 concat，内容/风格参考用序列 concat——这是对不同任务需求的最优工程选择。
+\end{conceptbox}
+
+% ------- 主题九：FLUX.1 Kontext -------
+\subsubsection{主题九：FLUX.1 Kontext}
+
+\begin{conceptbox}{Q16：Kontext 的 3D RoPE 时间轴如何区分目标帧和参考帧？}
+\key{axes\_dim=[16, 56, 56]} 中第一轴（16 维）作为\textbf{帧索引轴}：
+\[
+\text{目标图 token}:\; \text{ids} = (0,\, h,\, w), \quad
+\text{参考图 token}:\; \text{ids} = (i,\, h,\, w),\quad i \geq 1
+\]
+由于 RoPE 的相对性，时间轴 $t=0$ 和 $t=1$ 的 token 在注意力点积中有不同的旋转角，\textbf{无需额外标记}即可区分"要生成的"和"参考材料"。
+
+推理时只取目标图（$t=0$）对应 token 的输出预测速度，参考 token 的输出被丢弃：
+\begin{lstlisting}[language=Python]
+pred = model(img=img_seq, img_ids=img_ids_full, ...)
+pred = pred[:, :orig_img_len]   # 只保留目标帧的速度预测
+\end{lstlisting}
+\end{conceptbox}
+
+\begin{conceptbox}{Q17：Kontext 的序列 concat 与 IP-Adapter 有何本质不同？}
+\begin{center}
+\small
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{维度} & \textbf{IP-Adapter} & \textbf{Kontext} \\
+\hline
+参考图编码 & CLIP 全局 pooled（信息压缩） & VAE 16ch 全分辨率 latent（无损）\\
+注入方式 & 额外 Cross-Attention 层（adapter 权重） & 序列 concat，共享原始 Attention \\
+空间对应 & 无（全局语义） & 有（token 级 RoPE 坐标）\\
+额外模块 & 需要 & \good{不需要}（零额外参数）\\
+多轮编辑一致性 & 一般 & 强（AuraFace < 0.07\% 偏差）\\
+\hline
+\end{tabular}
+\end{center}
+\end{conceptbox}
+
+% ------- 主题十：训练稳定性 -------
+\subsubsection{主题十：训练稳定性——QK-Norm 与 HybridNorm}
+
+\begin{conceptbox}{Q18：为什么只对 Q 和 K 做 Norm，而不对 V 做 Norm？}
+\textbf{为什么要 QK-Norm}：
+\[
+\text{Attn} = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)
+\]
+Q/K 点积量级随深度失控 $\to$ softmax 饱和 $\to$ \bad{注意力坍缩}（只关注一个 token）。对 Q/K 做 RMSNorm 限制幅度，允许更大学习率，是 12B 大模型稳定训练的关键。
+
+\textbf{为什么不 Norm V}：
+\begin{itemize}
+  \item V 是"被聚合的内容"，其幅度携带语义信息（重要特征幅度大）
+  \item 对 V 做 Norm 会\bad{丢失幅度信息}，损害表达能力
+  \item 梯度爆炸主要来源于 Q·K 点积，不来自 V 的加权求和
+\end{itemize}
+
+\key{直觉}：Q/K 控制"注意到哪里"（路由），需要稳定量纲；V 携带"被注意到的内容"（信息），应保留原始幅度。
+\end{conceptbox}
+
+\begin{conceptbox}{Q19：HybridNorm 为什么比纯 Pre-Norm 或纯 Post-Norm 更好？}
+\begin{itemize}
+  \item \textbf{Pure Pre-Norm}：训练稳定，但深层特征多样性下降（rank collapse）
+  \item \textbf{Pure Post-Norm}：特征多样性好，但梯度容易爆炸，训练不稳定
+\end{itemize}
+
+\textbf{FLUX.1 HybridNorm}：
+\begin{itemize}
+  \item Attention 模块：\good{Pre-Norm}（QKV 投影前对输入 Norm，即 QK-Norm）
+  \item FFN 模块：\good{Post-Norm}（FFN 输出后加 LayerNorm，增强特征多样性）
+\end{itemize}
+
+同时获得 Pre-Norm 的\good{训练稳定性}和 Post-Norm 的\good{表征丰富性}，是 12B 规模稳定收敛的关键因素之一。
+\end{conceptbox}
+
+\begin{conceptbox}{Q20：guidance 信号是如何渗透到模型所有层的？}
+\[
+w \xrightarrow{\text{TimestepEmb}} \mathbf{g\_emb} \;\oplus\; \mathbf{ts\_emb} \;\oplus\; \mathbf{CLIP\_pooled} \xrightarrow{\text{MLP}} \mathbf{vec}
+\]
+$\mathbf{vec}$ 在\textbf{每一个 Block}（19 双流 + 38 单流 = 57 个）的 Modulation MLP 中输入，生成每层的 scale/shift/gate 参数，作用于每个 token。
+
+\key{关键设计}：不同 Block 的 Modulation MLP 权重独立，不同层可以对同一 guidance 信号做出不同响应——浅层调整全局构图，深层调整细节风格。这也解释了为什么 guidance\_scale 对生成质量影响如此显著。
+\end{conceptbox}
+
+% ------- 主题十一：综合高频问题 -------
+\subsubsection{主题十一：综合细节与高阶问题}
+
+\begin{conceptbox}{Q21：FLUX.1 的 vec 包含哪些信息？T5 序列 token 为何不通过 vec 注入？}
+\textbf{vec 的构成}：
+\[
+\mathbf{vec} = \text{MLP}\bigl(\underbrace{\text{ts\_emb}(t)}_{\text{时间步}} \oplus \underbrace{\text{CLIP\_pooled}}_{\text{全局语义}} \oplus \underbrace{\text{guidance\_emb}(w)}_{\text{guidance，仅 dev}}\bigr)
+\]
+vec 承载\textbf{全局摘要信息}，通过每层 Modulation 的 scale/shift/gate 调制所有 token。
+
+\textbf{T5 为何不通过 vec}：T5 序列 token 含有逐词细粒度信息，压缩成单一全局向量会\warn{严重丢失细节}；它通过直接参与 Attention 计算与图像 token 逐 token 交互，保留完整语义精度。
+\end{conceptbox}
+
+\begin{conceptbox}{Q22：为什么单流 Block 结束后文本 token 被丢弃？}
+最终任务是生成图像（预测速度场），不需要文本的重建/预测。txt token 的\textbf{存在目的}是为 img token 提供上下文信息，通过 Attention 影响图像特征——使命完成后直接丢弃：
+\begin{lstlisting}[language=Python]
+img = img[:, txt.shape[1]:, ...]   # 去掉文本部分，只保留图像
+\end{lstlisting}
+类似于 BERT 的 [CLS] 做法：利用聚合信息后丢弃辅助 token。
+\end{conceptbox}
+
+\begin{conceptbox}{Q23：FLUX.1 如何支持可变分辨率和不同宽高比？}
+三大核心机制：
+\begin{enumerate}
+  \item \textbf{RoPE 分辨率无关性}：相对位置编码，推理时只需调整 \texttt{img\_ids} 的 $(h,w)$ 范围
+  \item \textbf{无固定位置嵌入表}：不存在位置嵌入插值问题
+  \item \textbf{多分辨率 Bucket 训练}：多种分辨率和宽高比（$512^2$，$768\times1024$，$1024^2$ 等）联合训练
+\end{enumerate}
+
+推理时建议使用 64 的倍数（与 $8\times$ VAE + $2\times2$ patchify 对齐），极端宽高比可能因训练数据少见而质量下降。
+\end{conceptbox}
+
+\begin{conceptbox}{Q24：FLUX.1 的推理速度瓶颈在哪？有哪些优化手段？}
+\textbf{主要瓶颈}：
+\begin{itemize}
+  \item \textbf{Attention}：$O(N^2)$，1024px 约 4352 tokens（4096 img + 256 txt）
+  \item \textbf{T5-XXL 编码}：4.7B 参数，约占推理时间 20\%
+  \item \textbf{步数}：[dev] 需 20--50 步，每步一次完整 12B 前向
+\end{itemize}
+
+\textbf{常用优化}：
+\begin{itemize}
+  \item \key{Flash Attention 2/3}：速度提升 2--4×
+  \item \key{FP8 量化}（Nunchaku 等）：显存从 24GB 降至 12GB，速度约 2×
+  \item \key{步数蒸馏}：使用 [schnell]（1--4 步）或 Hyper-FLUX LoRA（8 步）
+  \item \key{T5 输出缓存}：同一 prompt 多次采样时缓存 T5 结果
+  \item \key{xDiT/DistriFusion}：多 GPU 序列并行处理超高分辨率
+\end{itemize}
+\end{conceptbox}
+
+\begin{conceptbox}{Q25：比较 FLUX.1 三个版本（pro/dev/schnell）的技术差异和适用场景}
+\begin{center}
+\small
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{维度} & \textbf{[pro]} & \textbf{[dev]} & \textbf{[schnell]} \\
+\hline
+权重开放 & \bad{否}（API） & \good{是}（非商用） & \good{是}（Apache 2.0）\\
+蒸馏方式 & 无 & Guidance Distillation & LADD \\
+推理步数 & 20--50 & 20--50 & \good{1--4} \\
+CFG 支持 & \good{是} & \good{是}（内嵌） & \bad{否} \\
+负向提示词 & \good{是} & 弱支持 & \bad{否} \\
+质量排名 & 最高 & 次之 & 略低 \\
+适用场景 & 商业 API 最优质量 & 研究/非商业高质量 & 实时生成/商业部署 \\
+\hline
+\end{tabular}
+\end{center}
+\end{conceptbox}
+
+\begin{conceptbox}{Q26：为什么 FLUX.1 的文字渲染比 SDXL 强？}
+\begin{enumerate}
+  \item \textbf{T5-XXL 的字符级理解}：T5 分词粒度更细（BPE 子词），对字母拼写的建模远强于 CLIP（CLIP 对稀有词/字母序列理解差）
+  \item \textbf{16 通道 VAE 保真度}：4 通道 VAE 对高频细节（字母线条）压缩损失大，16 通道保留更多频率信息
+  \item \textbf{12B 参数容量}：大模型见过更多字体/排版，泛化能力强
+  \item \textbf{更高分辨率训练数据}：文字在高分辨率下细节更清晰
+  \item \textbf{RoPE 空间精度}：字母间距、行间距等空间关系建模更精确
+\end{enumerate}
+
+\note{FLUX.1 文字渲染主要支持英文，中文/日文等非拉丁文字效果参差不齐，是当前研究热点。}
+\end{conceptbox}
+
+\begin{conceptbox}{Q27：FLUX.1 相比 SDXL 图像质量更高的根本原因？（综合分析）}
+\begin{enumerate}
+  \item \textbf{训练目标更高效}：Flow Matching 直线轨迹 vs DDPM 弯曲轨迹，同等步数精度更高
+  \item \textbf{文本理解更强}：T5-XXL（512 token）vs CLIP（77 token 上限），复杂语义处理能力天差地别
+  \item \textbf{架构更灵活}：Transformer 双流 + RoPE，图文 token 自由交互 vs U-Net Cross-Attention 的信息瓶颈
+  \item \textbf{潜空间容量更大}：16ch VAE vs 4ch VAE，信息损失更少
+  \item \textbf{规模更大}：12B vs $\sim$3B，表达能力显著提升
+\end{enumerate}
+\end{conceptbox}
+
+\begin{conceptbox}{Q28：FLUX.2 Klein 的设计目标是什么？Apache 2.0 有何商业意义？}
+\textbf{设计目标}：
+\begin{itemize}
+  \item \key{轻量化}：4B 和 9B（vs FLUX.1 的 12B），面向消费级 GPU（8--16GB 显存）
+  \item \key{4 步蒸馏}：极速推理（RTX 5090 上 $\approx 1.2$s @ 1024px）
+  \item \key{统一单模型}：T2I + 图像编辑 + Inpainting 无需切换变体
+\end{itemize}
+
+\textbf{Apache 2.0 的商业意义}：
+\begin{itemize}
+  \item 这是 BFL \good{首个}允许商业使用的开源权重（FLUX.1 schnell 也是 Apache 2.0）
+  \item 商业团队可直接基于 Klein 构建产品，无需授权费用
+  \item 可对 Klein 进行 LoRA 微调并商用发布衍生模型，大幅降低商业应用门槛
+\end{itemize}
+\end{conceptbox}
+
+\begin{warnbox}{FLUX.1 面试十大高频陷阱速查}
+\begin{enumerate}
+  \item \warn{预测目标是速度 $v = \varepsilon - x_0$，不是噪声 $\varepsilon$}——两者数值上可转换，但语义和物理意义不同
+  \item \warn{RoPE 只应用在 Q 和 K 上，不应用在 V 上}——与 QK-Norm 动机一致
+  \item \warn{txt\_ids 是全零，不是顺序编号}——文本无空间位置，RoPE 对 txt token 不产生位置偏置
+  \item \warn{[dev] 和 [schnell] 是不同蒸馏方式，不是同一模型的量化版}——[dev] 替代 CFG（步数不变），[schnell] 压缩步数（LADD）
+  \item \warn{双流 Block 没有独立的 Cross-Attention 层}——通过 QKV cat 隐式实现，这是 MMDiT 核心设计
+  \item \warn{CLIP pooled 进 vec，T5 序列进 txt\_tokens}——两者走不同信息注入路径
+  \item \warn{Patchify 后 token 维度是 64，不是 16}——$16 \times 4 = 64$（16 通道 × 2×2 patchify）
+  \item \warn{单流 Block 的并行 Attention 不等于 Cross-Attention}——img 和 txt 已 concat，是 Self-Attention
+  \item \warn{Kontext 用 img 侧序列 concat，Redux 用 txt 侧序列 concat}——两种方式对应不同任务
+  \item \warn{channel concat（Canny/Fill）改变 in\_channels，需要重训 img\_in 线性层；序列 concat（Kontext）不改变任何权重形状}
+\end{enumerate}
+\end{warnbox}
+
+\begin{conceptbox}{Q29：快问快答——FLUX.1 关键技术数字}
+\begin{center}
+\small
+\begin{tabular}{|l|l|}
+\hline
+\textbf{参数} & \textbf{数值} \\
+\hline
+总参数量 & $\approx$ \textbf{12B} \\
+双流 Block 数量 & \textbf{19} 个 \\
+单流 Block 数量 & \textbf{38} 个 \\
+VAE 通道数 & \textbf{16}（vs SD 的 4）\\
+VAE 下采样倍率 & $\times$\textbf{8} \\
+Patchify 大小 & $\mathbf{2\times2}$（总下采样 $\times$16）\\
+Patchify 后 token 维度 & $16 \times 4 = \mathbf{64}$ \\
+RoPE axes\_dim & $[\mathbf{16, 56, 56}]$（和 = 128 = head\_dim/2）\\
+txt\_ids 值 & \textbf{全零}（无空间位置）\\
+T5-XXL 序列长度上限 & \textbf{256} tokens \\
+CLIP-L pooled dim & \textbf{768} \\
+默认 guidance\_scale & \textbf{3.5}（dev）\\
+schnell 推理步数 & \textbf{1--4} 步 \\
+dev 推理步数 & \textbf{20--50} 步 \\
+Kontext 时间轴 id（目标帧） & \textbf{0} \\
+Kontext 时间轴 id（参考帧 1） & \textbf{1} \\
+\hline
+\end{tabular}
+\end{center}
+\end{conceptbox}
+
+\begin{summarybox}
+\textbf{FLUX.1 面试知识体系速记}：
+\begin{enumerate}
+  \item \key{Flow Matching}：直线轨迹，预测速度 $v = \varepsilon - x_0$，ODE 推理，步少误差小
+  \item \key{双流/单流架构}：19 双流（模态专化）+ 38 单流（深度融合），共 12B 参数
+  \item \key{隐式 Cross-Attention}：QKV cat 后做 Self-Attention，无独立 Cross-Attention 层
+  \item \key{Modulation vs AdaLN}：前者多 Gate 门控（scale+shift+gate），表达力更强
+  \item \key{RoPE}：只应用在 Q/K，txt\_ids 全零，天然支持变分辨率，Kontext 用时间轴区分帧
+  \item \key{双编码器}：T5 序列 $\to$ txt\_tokens，CLIP pooled $\to$ vec，互补不冗余
+  \item \key{16ch VAE + 2×2 Patchify}：token 维度 64，总下采样 16×
+  \item \key{蒸馏}：[dev] = Guidance Distillation（CFG内化），[schnell] = LADD（步数压缩）
+  \item \key{三种条件注入}：通道 concat（Canny/Fill），img 侧序列 concat（Kontext），txt 侧序列 concat（Redux）
+  \item \key{训练稳定性}：QK-Norm（只 norm Q/K）+ HybridNorm（Pre+Post 混合）
+\end{enumerate}
+\end{summarybox}

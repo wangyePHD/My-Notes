@@ -1,0 +1,176 @@
+% ============================================================
+% GRPO 算法笔记
+% 论文：DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models
+% ============================================================
+
+\section{GRPO：Group Relative Policy Optimization}
+
+\begin{conceptbox}
+\textbf{一句话：} GRPO 是一种\key{在线强化学习}算法——用模型自己生成的数据迭代改进自己，目标是在最大化生成结果 Advantage 的同时，保证策略不偏离参考模型太远。\\
+\textbf{核心创新：} 用\key{组内相对排名}替代 Critic 网络估计 Advantage，去掉了 PPO 中昂贵的价值函数模型。
+\end{conceptbox}
+
+% -------------------- 动机 --------------------
+\subsection{为什么需要 GRPO？}
+
+\textbf{PPO 的问题：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \bad{需要独立的 Critic 网络}：估计每个状态的 value，参数量与 policy 相当，显存翻倍
+  \item \bad{GAE 计算复杂}：需要按时间步展开，实现复杂
+  \item \bad{训练不稳定}：Critic 本身也在学习，估计偏差会影响 policy 更新
+\end{itemize}
+
+\textbf{GRPO 的解法：} 同一个 prompt 生成 $G$ 个输出，\key{组内奖励的均值和方差}就是天然的 baseline，无需 Critic。
+
+% -------------------- 四步算法 --------------------
+\subsection{算法四步}
+
+算法流程：\textbf{生成补全 $\to$ 计算 Advantage $\to$ 估计 KL 散度 $\to$ 计算 Loss}
+
+\subsubsection{Step 1：生成补全（Generating Completions）}
+
+对同一个 prompt $q$，用当前（旧）策略 $\pi_{\theta_\text{old}}$ 采样 $G$ 个输出，形成一个"组"：
+
+\[
+\{o_1, o_2, \ldots, o_G\} \sim \pi_{\theta_\text{old}}(\cdot \mid q)
+\]
+
+每个输出送入奖励函数，得到标量分数：
+
+\[
+\{r_1, r_2, \ldots, r_G\} = \{r(o_1, q),\; r(o_2, q),\; \ldots,\; r(o_G, q)\}
+\]
+
+\begin{intubox}
+\textbf{为什么要生成一组 $G$ 个？}\\
+单个奖励没有参照基准，无法判断"好"还是"差"。$G$ 个输出放在一起，通过\key{组内相对比较}衡量优劣——这就是 GRPO 名字里 "Group Relative" 的含义。
+\end{intubox}
+
+\subsubsection{Step 2：计算 Advantage（Computing the Advantage）}
+
+\textbf{组内归一化}：每个输出的 Advantage 等于其奖励相对组内均值的标准化偏差：
+
+\[
+\hat{A}_i = \frac{r_i - \mathrm{mean}(\{r_j\}_{j=1}^G)}{\mathrm{std}(\{r_j\}_{j=1}^G) + \varepsilon}
+\]
+
+\begin{center}
+\begin{tabular}{p{3cm}p{10cm}}
+\hline
+$\hat{A}_i > 0$ & 比组内平均好 $\to$ 增大其生成概率 \\
+$\hat{A}_i < 0$ & 比组内平均差 $\to$ 减小其生成概率 \\
+$\hat{A}_i \approx 0$ & 与均值持平 $\to$ 梯度接近零，几乎不更新 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+\textbf{对比 PPO 的 Advantage 估计：}\\
+PPO 用 Critic 网络 $V_\phi(s)$ 估计状态价值，再通过 GAE 计算 Advantage：
+\[
+A_t^\text{GAE} = \sum_{k=0}^\infty (\gamma\lambda)^k \delta_{t+k}, \quad \delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)
+\]
+GRPO 直接用\key{同组奖励的均值和标准差}归一化，\bad{无需 Critic，无需 GAE}。
+\end{warnbox}
+
+\subsubsection{Step 3：估计 KL 散度（Estimating the KL Divergence）}
+
+KL 正则项防止策略偏离参考模型（$\pi_\text{ref}$，通常是 SFT 模型），避免 reward hacking。
+
+GRPO 使用解析近似，而非采样估计 KL：
+
+\[
+\mathbb{D}_\text{KL}\!\left[\pi_\theta(\cdot|q) \,\big\|\, \pi_\text{ref}(\cdot|q)\right] \approx \frac{\pi_\text{ref}(o_i|q)}{\pi_\theta(o_i|q)} - \log\frac{\pi_\text{ref}(o_i|q)}{\pi_\theta(o_i|q)} - 1
+\]
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 当 $\pi_\theta = \pi_\text{ref}$ 时，KL $= 0$
+  \item 策略偏离越远，KL 惩罚越大（凸函数，最小值在 0）
+  \item 此近似\key{方差更小、更稳定}，无需额外采样
+\end{itemize}
+
+\subsubsection{Step 4：计算 Loss（Computing the Loss）}
+
+完整的 GRPO 目标函数：
+
+\[
+\mathcal{J}_\text{GRPO}(\theta) = \mathbb{E}_{q,\,\{o_i\}}\!\left[\frac{1}{G}\sum_{i=1}^G \frac{1}{|o_i|}\sum_{t=1}^{|o_i|} \left(\min\!\left(r_i^t\hat{A}_i,\;\mathrm{clip}(r_i^t,1{-}\varepsilon,1{+}\varepsilon)\hat{A}_i\right) - \beta\,\mathbb{D}_\text{KL}[\pi_\theta\|\pi_\text{ref}]\right)\right]
+\]
+
+其中\textbf{重要性权重比}（新策略 / 旧策略）：
+
+\[
+r_i^t(\theta) = \frac{\pi_\theta(o_i^t \mid q,\, o_i^{<t})}{\pi_{\theta_\text{old}}(o_i^t \mid q,\, o_i^{<t})} = \exp\!\left(\log\pi_\theta - \log\pi_{\theta_\text{old}}\right)
+\]
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.5cm}p{9cm}}
+\hline
+\textbf{组件} & \textbf{作用} \\
+\hline
+$\min(\cdot,\;\mathrm{clip}(\cdot))$ & PPO-clip：限制每步更新幅度，防止策略突变 \\
+$r_i^t$ & 重要性权重：纠正新旧策略的分布偏差 \\
+$\hat{A}_i$ & Advantage：正值鼓励、负值惩罚，组内相对排名 \\
+$\beta\,\mathbb{D}_\text{KL}$ & KL 正则：保持策略不偏离参考模型，防 reward hacking \\
+$\dfrac{1}{|o_i|}$ & 长度归一化：避免长输出主导梯度 \\
+$\dfrac{1}{G}$ & 组平均：每组 $G$ 个输出贡献相等 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+% -------------------- 直觉图 --------------------
+\subsection{算法流程直觉}
+
+\begin{center}
+\begin{tabular}{c}
+\hline \\
+同一 Prompt $q$ \\
+$\downarrow$ 用旧策略采样 $G$ 次 \\
+$[o_1, o_2, \ldots, o_G]$ \\
+$\downarrow$ 奖励函数打分 \\
+$[r_1, r_2, \ldots, r_G]$ \\
+$\downarrow$ 组内归一化 \\
+$[\hat{A}_1, \hat{A}_2, \ldots, \hat{A}_G]$ \\
+$\downarrow$ 新策略重算 log prob，算 $r_i^t$ \\
+PPO-clip Loss + $\beta \cdot$ KL 惩罚 \\
+$\downarrow$ \\
+梯度更新 $\theta$ \\
+\\ \hline
+\end{tabular}
+\end{center}
+
+% -------------------- 与 PPO 对比 --------------------
+\subsection{GRPO vs PPO}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{imgs/ppo-grpo.png}
+  \caption{GRPO 与 PPO 算法对比}
+\end{figure}
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{4.5cm}p{4.5cm}}
+\hline
+ & \textbf{PPO} & \textbf{GRPO} \\
+\hline
+Advantage 估计 & Critic 网络 + GAE & 组内奖励归一化 \\
+额外模型 & Critic（与 policy 等大） & \good{无需 Critic} \\
+显存开销 & 高（policy + critic） & \good{低（只有 policy）} \\
+实现复杂度 & 高（GAE、Critic 更新） & \good{低} \\
+Baseline 来源 & 状态价值函数 $V(s)$ & 同组奖励均值 \\
+适用场景 & 连续动作、密集奖励 & 稀疏奖励、LLM/生成任务 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+% -------------------- 总结 --------------------
+\begin{summarybox}
+\textbf{GRPO 的本质：}\\
+\key{无 Critic 的 PPO}。用"同组生成结果的相对排名"代替 Critic 网络估计的 Advantage，在保留 PPO-clip 稳定性的同时，大幅降低了显存占用和实现复杂度。\\[4pt]
+特别适合 LLM / 图像生成这类\textbf{单步奖励、输出即终态}的任务——因为此时整条生成序列只有一个最终奖励，Critic 估计中间状态价值本身就意义不大。
+\end{summarybox}
