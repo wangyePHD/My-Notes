@@ -1,0 +1,198 @@
+% ============================================================
+% Round 02: Reward Model
+% ============================================================
+
+\subsection{Round 02：Reward Model}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解为什么 SFT 之后需要 Reward Model，以及 Reward Model 如何把人类偏好变成可优化的标量奖励。\\
+\textbf{主线位置：}
+\[
+\text{SFT} \to \text{Reward Model} \to \text{PPO / RLHF} \to \text{DPO} \to \text{GRPO / RLVR}
+\]
+\end{conceptbox}
+
+\subsubsection{为什么 SFT 后需要 Reward Model}
+
+SFT 只能模仿数据里的标准答案，但它没有直接学习：
+
+\[
+\text{回答 A 比回答 B 更好}
+\]
+
+实际对齐问题里，我们经常更容易获得\key{偏好比较}，而不是完美标准答案。例如同一个 prompt：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.2cm}p{10.8cm}}
+\hline
+\textbf{Prompt} & 解释什么是 GRPO \\
+\textbf{Answer A} & 正确，但啰嗦、结构混乱 \\
+\textbf{Answer B} & 正确、简洁、结构清楚 \\
+\textbf{偏好} & B 优于 A \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+Reward Model 的作用是把这种偏好数据转成一个函数：
+
+\[
+r_\phi(x, y) \in \mathbb{R}
+\]
+
+其中 $x$ 是 prompt，$y$ 是回答，$r_\phi(x, y)$ 是模型给这个回答打的奖励分数。
+
+\begin{summarybox}
+\textbf{一句话：} Reward Model = 学一个打分器，让好回答分数高，差回答分数低。
+\end{summarybox}
+
+\subsubsection{Reward Model 的训练数据}
+
+Reward Model 通常不需要人工写一个绝对分数，而是使用 pairwise preference：
+
+\[
+(x, y_w, y_l)
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $x$：用户 prompt；
+  \item $y_w$：chosen / winner，人类更喜欢的回答；
+  \item $y_l$：rejected / loser，人类不喜欢的回答。
+\end{itemize}
+
+这类数据比直接给回答打 0--10 分更稳定，因为人类判断“哪个更好”通常比判断“绝对几分”更一致。
+
+\subsubsection{核心公式：Bradley--Terry 模型}
+
+Reward Model 希望满足：
+
+\[
+r_\phi(x, y_w) > r_\phi(x, y_l)
+\]
+
+常用建模方式是 Bradley--Terry preference model：
+
+\[
+P(y_w \succ y_l \mid x)
+=
+\sigma\left(r_\phi(x, y_w) - r_\phi(x, y_l)\right)
+\]
+
+其中 $\sigma$ 是 sigmoid 函数。
+
+训练 loss 是负对数似然：
+
+\[
+\mathcal{L}_\text{RM}
+=
+-
+\log
+\sigma\left(r_\phi(x, y_w) - r_\phi(x, y_l)\right)
+\]
+
+\begin{intubox}
+\textbf{直觉：} 如果 winner 的奖励比分 loser 高很多，那么 $r_w - r_l$ 很大，sigmoid 接近 1，loss 很小。\\
+如果 winner 的奖励不比 loser 高，甚至更低，那么 sigmoid 小，loss 大，模型会被强烈更新。
+\end{intubox}
+
+\subsubsection{Reward Model 学到了什么}
+
+Reward Model 学的不是“标准答案长什么样”，而是：
+
+\[
+\text{什么样的回答更符合人类偏好}
+\]
+
+它可能学习到的偏好维度包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 正确性；
+  \item 指令遵循；
+  \item 简洁性；
+  \item 结构清晰；
+  \item 安全性；
+  \item 有用性；
+  \item 推理过程是否可靠。
+\end{itemize}
+
+但要注意：Reward Model 不保证真的理解这些维度。它只是从偏好数据中学习一个可预测人类选择的打分函数。
+
+\subsubsection{Reward Model 和 SFT 的差别}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+ & \textbf{SFT} & \textbf{Reward Model} \\
+\hline
+训练数据 & prompt + 标准答案 & prompt + chosen / rejected \\
+学习目标 & 模仿目标答案 & 判断哪个回答更好 \\
+输出 & 下一个 token 概率 & 一个标量奖励分数 \\
+能力重点 & 任务遵循和回答格式 & 偏好比较和质量排序 \\
+核心限制 & 不会比较好坏 & 可能被 policy 利用或 reward hacking \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{Reward Model 如何用于 RLHF}
+
+Reward Model 训练好之后，就可以给模型自己生成的回答打分：
+
+\[
+y \sim \pi_\theta(\cdot \mid x), \qquad R = r_\phi(x, y)
+\]
+
+然后使用 PPO 等 RL 算法更新 policy，让模型更倾向于生成高 reward 的回答：
+
+\[
+\max_\theta \mathbb{E}_{y \sim \pi_\theta(\cdot \mid x)}[r_\phi(x, y)]
+\]
+
+但实际训练不能只最大化 reward，因为模型可能为了骗 Reward Model 而偏离原来的语言能力。因此还需要 reference model 或 KL 约束：
+
+\[
+\max_\theta
+\mathbb{E}[r_\phi(x, y)]
+-
+\beta \mathbb{D}_\text{KL}
+\left(
+\pi_\theta(\cdot \mid x)
+\|
+\pi_\text{ref}(\cdot \mid x)
+\right)
+\]
+
+\begin{warnbox}
+\textbf{关键风险：} Reward Model 不是完美的人类价值函数。Policy 如果过度优化 RM，可能学会钻 RM 的漏洞，这就是 reward hacking。因此 RLHF 通常需要 KL 约束、数据过滤、人工评估和训练稳定性控制。
+\end{warnbox}
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{Reward Model = 把偏好比较变成奖励函数。}\\
+核心公式：
+\[
+\mathcal{L}_\text{RM}
+=
+-
+\log
+\sigma\left(r_\phi(x, y_w) - r_\phi(x, y_l)\right)
+\]
+核心作用：补上 SFT 不会比较答案好坏的缺口，为 PPO / RLHF 提供可优化的 reward。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Reward Model 为什么通常用 chosen / rejected，而不是直接让人类给每个回答打绝对分？
+  \item Bradley--Terry 公式里的 $r_\phi(x, y_w) - r_\phi(x, y_l)$ 代表什么？
+  \item 如果 Reward Model 给差回答高分，会对后续 PPO / RLHF 造成什么问题？
+  \item Reward Model 和 SFT 的本质区别是什么？
+  \item 为什么 RLHF 不能只最大化 Reward Model 分数，还需要 KL / reference model？
+\end{enumerate}
