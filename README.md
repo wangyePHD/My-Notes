@@ -22,7 +22,7 @@
 ├── bib/
 │   └── references.bib        # 参考文献库
 ├── reading/
-│   └── arxiv_weekly/         # arXiv 阅读记录，不参与 main.tex 编译
+│   └── arxiv_weekly/         # arXiv 论文速读，已转为 LaTeX 并接入 main.tex
 ├── scripts/                  # 辅助脚本
 └── latexmkrc                 # 本地使用 XeLaTeX 编译
 ```
@@ -48,6 +48,24 @@ git add .
 git commit -m "Add new method note"
 git push
 ```
+
+## 新增一篇 arXiv 速读
+
+推荐直接写成 `.tex`，放在：
+
+```text
+reading/arxiv_weekly/
+```
+
+然后在 `Notes/index.tex` 的 `arXiv 论文速读` 部分加入对应 `\input`。
+
+如果先写成 Markdown，可以运行转换脚本：
+
+```bash
+python3 scripts/convert_arxiv_md_to_tex.py
+```
+
+脚本会把 `reading/arxiv_weekly/*.md` 转成同名 `.tex`，并删除原 `.md`。
 
 ## 编译约定
 

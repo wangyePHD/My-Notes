@@ -1,0 +1,386 @@
+% ============================================================
+% Converted from arxiv_daily_2026_04_24.md
+% ============================================================
+
+\section{arXiv cs.CV 日报：2026年4月24日}
+
+\begin{conceptbox}
+\textbf{方向}：后训练技术 · 世界模型 · 图像编辑 · 视频模型\\
+\textbf{数据来源}：\href{https://arxiv.org/list/cs.CV/recent}{arxiv.org/list/cs.CV/recent} · \href{https://huggingface.co/papers}{Hugging Face Daily Papers}\\
+\textbf{整理日期}：2026-04-24
+\end{conceptbox}
+
+\subsection{一、后训练技术（Post-Training）}
+
+\subsubsection{1. S-GRPO：面向大型视觉语言模型的统一后训练框架}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.16557}{2604.16557}
+
+提出将监督模仿学习融入多轨迹偏好优化（GRPO）的统一框架：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 当模型陷入完全探索失败时，引入带有最大奖励的真实轨迹作为锚点（\textbf{CGI 机制}）
+  \item 有效防止灾难性遗忘，同时提升收敛速度
+  \item 在多个视觉语言任务上超越标准 GRPO 基线
+\end{itemize}
+
+\subsubsection{2. HP-Edit：人类偏好驱动的图像编辑后训练框架 \textit{(亦属图像编辑方向)}}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19406}{2604.19406}
+
+将 RLHF 系统性引入扩散模型图像编辑对齐：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 构建\textbf{RealPref-50K}真实偏好数据集（覆盖 8 种常见编辑任务）
+  \item 提出\textbf{HP-Scorer}自动评估器（结合人类偏好数据与 VLM 打分）
+  \item 在 Qwen-Image-Edit 等模型上验证，显著提升人类偏好对齐度
+  \item 配套\textbf{RealPref-Bench}专项评测基准
+\end{itemize}
+
+\subsubsection{3. 大型视觉语言模型强化微调的收敛性、奖励分解与泛化分析}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19857}{2604.19857}
+
+从理论层面系统分析 VLM 的强化微调机制：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 证明复合奖励下 GRPO 的\textbf{O(1/√T) 收敛速率}
+  \item 提出\textbf{奖励分解定理}，明确分项优化与联合优化的适用边界
+  \item 建立工具增强策略的\textbf{PAC-Bayes 泛化界}，为多模态视觉 Agent 的 RL 后训练提供严格理论基础
+\end{itemize}
+
+\subsubsection{4. HalluVL-DPO：提示诱导幻觉的 DPO 抑制方案}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21911}{2604.21911}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 揭示 VLM 幻觉的主要来源是\textbf{文本指令中的先验知识偏差}而非视觉能力不足
+  \item 构建\textbf{HalluScope}评测基准量化提示诱导幻觉
+  \item 提出\textbf{HalluVL-DPO}偏好优化框架，通过 DPO 训练引导模型回归视觉感知，同时保持整体能力
+\end{itemize}
+
+\subsubsection{5. ParetoSlider：扩散模型的帕累托前沿多目标 RL 后训练}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.20816}{2604.20816}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 训练单一扩散模型近似整个\textbf{帕累托前沿}，以偏好权重为条件
+  \item 推理时用户可\textbf{实时调节}互相冲突的生成目标（如提示忠实度 vs 源图保真度）无需重新训练
+  \item 在 SD3.5、FluxKontext、LTX-2 三个 Flow Matching 骨干上得到验证
+\end{itemize}
+
+\subsubsection{6. OTCA：目标感知轨迹信用分配}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19234}{2604.19234}
+
+针对扩散模型 GRPO 训练中"奖励信号时机不匹配"问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 提出\textbf{目标感知轨迹信用分配框架（OTCA）}
+  \item 通过轨迹级功劳分解与多目标自适应加权，将粗粒度奖励转化为\textbf{时步感知的精细训练信号}
+  \item 更好适配扩散模型渐进式去噪的生成特性
+\end{itemize}
+
+\subsubsection{7. VG-CoT：基于接地思维链的可信视觉推理}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21396}{2604.21396}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 构建\textbf{VG-CoT}数据集，通过三阶段自动化流程将视觉推理每个步骤显式锚定到图像证据
+  \item 设计三维评测体系：推理质量 + 答案精度 + 推理-结论一致性
+  \item SFT + RL 联合训练，使 LLaVA-1.5 和 Qwen2-VL 在可信视觉推理上显著提升
+\end{itemize}
+
+\subsubsection{8. S1-VL：支持"图像驱动推理"的科学多模态推理模型}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21409}{2604.21409}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 支持结构化思维链与\textbf{图像驱动推理}（通过 Python 代码在推理中操作图像）两种互补范式
+  \item 设计六维质量过滤框架筛选高效视觉操作轨迹
+  \item SFT + 强化学习四阶段训练流程，在 5 个 Thinking-with-Images 基准上取得 SOTA
+\end{itemize}
+
+\subsection{二、世界模型（World Model）}
+
+\subsubsection{9. WorldMark：交互式视频世界模型统一评测基准}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21686}{2604.21686}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 首个\textbf{统一的交互式视频世界模型评测框架}
+  \item 通过统一动作映射层（WASD 风格控制）和 500 个分层测试用例，首次实现 Genie、YUME、HY-World、Matrix-Game 等主流模型的公平横向对比
+  \item 提供模块化评测工具套件（视觉质量、控制对齐、世界一致性）及在线竞技场排行榜
+\end{itemize}
+
+\subsubsection{10. Hi-WM：人在回路的机器人可扩展后训练世界模型}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21741}{2604.21741}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 将世界模型重新定位为\textbf{人机交互校正基底}
+  \item 操作者可在模型模拟环境中直接干预并缓存修正动作，无需反复重置物理机器人
+  \item 校正轨迹增强训练数据，平均成功率提升\textbf{37.9 个百分点}
+  \item 世界模型评估与真实表现相关性高达\textbf{r = 0.953}
+\end{itemize}
+
+\subsubsection{11. MultiWorld：可扩展多智能体多视角视频世界模型}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.18564}{2604.18564}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 突破现有世界模型仅支持单智能体的局限
+  \item 多智能体条件模块 + 全局状态编码器，支持智能体数量和摄像机视角的灵活扩展
+  \item 在多人游戏场景和协作机器人操作任务中验证动作跟随精度和跨视角一致性
+\end{itemize}
+
+\subsubsection{12. X-Cache：少步自回归世界模型的跨块残差缓存推理加速}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.20289}{2604.20289}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 提出\textbf{跨生成块的块级残差缓存策略}，专为少步蒸馏的自回归世界模型加速推理
+  \item 双指标门控机制（结构感知 + 动作感知指纹）决定每块是重算还是复用
+  \item 实现\textbf{71\% 的块跳过率}和\textbf{2.6× 实时加速}，性能几乎无损
+  \item 适用于自动驾驶多摄像头世界模型场景
+\end{itemize}
+
+\subsubsection{13. HY-World 2.0：多模态 3D 生成式世界模型}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.14268}{2604.14268}
+
+腾讯混元发布，支持文本、单/多视图图像、视频等多模态输入：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 四阶段流水线：\textbf{全景生成（HY-Pano 2.0）→ 轨迹规划（WorldNav）→ 关键帧生成（WorldStereo 2.0）→ 前馈重建（WorldMirror 2.0）}
+  \item 输出可交互的 3D Gaussian Splatting 场景
+  \item 配套 WorldLens 渲染平台支持角色、光照、碰撞检测等功能
+\end{itemize}
+
+\subsubsection{14. Mask World Model：预测语义掩码替代 RGB 像素的机器人世界模型}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19683}{2604.19683}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 以预测\textbf{语义掩码}替代 RGB 像素，构建几何信息瓶颈
+  \item 迫使模型聚焦于物理动力学和接触关系，过滤背景、光照等视觉噪声
+  \item 与扩散策略融合形成端到端控制，在 LIBERO 和 RLBench 上超越 RGB 世界模型
+  \item 对纹理信息丢失表现更强的泛化能力
+\end{itemize}
+
+\subsubsection{15. RoboWM-Bench：机器人操作世界模型评测基准}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19092}{2604.19092}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 以\textbf{真实机器人执行}为检验标准，弥补"视觉真实感 ≠ 物理可执行性"的评测盲区
+  \item 统一测试协议覆盖多样化操作场景
+  \item 揭示当前主流模型在\textbf{空间推理、接触预测、形变仿真}上的主要失效模式
+\end{itemize}
+
+\subsection{三、图像编辑（Image Editing）}
+
+\subsubsection{16. 任务感知定位：指令图像编辑的定位策略重思}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.20258}{2604.20258}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 发现现有方法对"增加/删除/替换"等不同操作类型采用\textbf{统一定位策略}的根本缺陷
+  \item 提出免训练的\textbf{任务感知定位框架}
+  \item 利用编辑模型内部的双图像流（源图 + 目标图）提取注意力编辑线索并构建特征中心
+  \item 通过统一掩码策略选择性融合，显著减少对无关区域的过度编辑
+\end{itemize}
+
+\subsubsection{17. AttDiff-GAN：扩散-GAN 混合人脸属性编辑框架}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21289}{2604.21289}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 提出\textbf{扩散模型与 GAN 的混合框架}，通过特征级对抗学习解耦属性编辑与图像合成
+  \item \textbf{PriorMapper}将面部先验融入风格生成
+  \item \textbf{RefineExtractor}利用 Transformer 捕捉全局语义关系
+  \item 实现精准属性控制的同时保留非目标区域，在 CelebA-HQ 上超越 SOTA
+\end{itemize}
+
+\subsubsection{18. LatRef-Diff：潜在与参考引导的人脸风格操纵}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21279}{2604.21279}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 以\textbf{风格码}替代传统语义方向，通过潜在引导与参考引导两种方式生成风格码
+  \item 风格调制模块结合可学习向量、交叉注意力和层次化设计
+  \item 创新的\textbf{前向-后向一致性训练策略}无需配对前后图像即可训练
+  \item 在 CelebA-HQ 上实现 SOTA 风格操纵效果
+\end{itemize}
+
+\subsubsection{19. UniGeo：几何统一引导的相机可控图像编辑}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.17565}{2604.17565}
+
+利用视频模型实现相机可控图像编辑（新视角合成）：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 在\textbf{表示、架构、损失函数}三个层次统一注入几何引导
+  \item 帧解耦几何参考注入 + 几何锚注意力 + 轨迹端点几何监督
+  \item 显著提升多视角编辑的几何一致性与视觉质量
+\end{itemize}
+
+\subsubsection{20. FluSplat：无测试时优化的稀疏视角 3D 场景编辑}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.20038}{2604.20038}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 将文本引导图像编辑与\textbf{3D Gaussian Splatting}相结合
+  \item 关键创新：\textbf{训练期}引入跨视角正则化监督，而非测试时的逐场景优化
+  \item 单次前馈即可输出视角一致的 3D 编辑结果，大幅降低推理时间
+  \item 适合稀疏视角输入的 3D 场景编辑场景
+\end{itemize}
+
+\subsubsection{21. HP-Edit \textit{(亦属后训练方向)}}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19406}{2604.19406}
+
+构建专用于真实图像编辑偏好对齐的 RealPref-50K 数据集和 RealPref-Bench 基准，详见后训练部分。
+
+\subsection{四、视频模型（Video Generation / Understanding）}
+
+\subsubsection{22. Sparse Forcing：实时自回归扩散视频生成的原生稀疏注意力}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21221}{2604.21221}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 通过实证分析发现自回归视频扩散模型的注意力在滑动窗口内呈现\textbf{持久块稀疏模式}
+  \item 提出可训练的原生稀疏机制（Sparse Forcing）+ 持久块稀疏注意力 GPU 内核（\textbf{PBSA}）
+  \item VBench\textbf{+0.26 分}提升、\textbf{1.11–1.17× 解码加速}、峰值内存降低\textbf{42\%}
+  \item 长序列收益更显著，适合实时视频生成场景
+\end{itemize}
+
+\subsubsection{23. Sculpt4D：基于稀疏注意力扩散 Transformer 的 4D 内容生成}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21592}{2604.21592}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 以预训练 3D 扩散 Transformer（Hunyuan3D 2.1）为基础集成时序建模
+  \item 块稀疏注意力通过锚定初始帧并采用\textbf{时间衰减稀疏掩码}捕捉运动
+  \item 计算量较全注意力降低\textbf{56\%}，实现时空保真的动态 3D 内容生成
+\end{itemize}
+
+\subsubsection{24. ReImagine：图像优先的可控高质量人物视频生成}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19720}{2604.19720}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 将可控人物视频生成重新定义为"\textbf{图像优先}"问题
+  \item 以预训练图像生成模型处理外观建模，再通过免训练视频扩散模型进行时序一致性精炼
+  \item 接受\textbf{SMPL-X}骨骼模型提供姿态与视角引导
+  \item 公开代码及标准人物数据集
+\end{itemize}
+
+\subsubsection{25. Seeing Fast and Slow：自监督视频时序理解与速度控制生成}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21931}{2604.21931}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 以\textbf{自监督}方式训练模型识别视频速度变化并估计播放速率，将时间视为可学习的视觉概念
+  \item 利用该能力从嘈杂互联网视频中策划大规模\textbf{慢动作数据集}
+  \item 开发\textbf{速度条件视频生成}与\textbf{时序超分辨率}两大应用
+\end{itemize}
+
+\subsubsection{26. Reshoot-Anything：野外视频重拍的自监督模型}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21776}{2604.21776}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 提出\textbf{自监督视频重拍框架}，从单目视频中创建伪多视角训练三元组
+  \item 主动引入空间错位和人工遮挡，迫使模型学习 4D 时空结构
+  \item 推理时扩散 Transformer 利用\textbf{点云锚点}实现动态场景的时序一致性与精确相机控制
+  \item 无需稀缺的配对多视角数据
+\end{itemize}
+
+\subsubsection{27. MMControl：音视频联合生成的统一多模态控制框架}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19679}{2604.19679}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 通过\textbf{双流条件注入}（视觉控制信号 + 声学控制信号）接入联合音视频扩散 Transformer
+  \item 用户可在推理时\textbf{独立调节}各视觉/声学条件的强度
+  \item 实现对角色身份、声音特征、肢体动作和场景构图的\textbf{细粒度同步控制}
+\end{itemize}
+
+\subsubsection{28. 物理信号接地的视频推理评测}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21873}{2604.21873}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 覆盖 4 类视频源、\textbf{6 个物理领域}、3 种提示族的视频理解综合评测框架
+  \item 含\textbf{1560 个}带接地事件记录的视频片段
+  \item 揭示当前模型的\textbf{空间接地能力}是最薄弱环节，且提示族鲁棒性因领域而异
+\end{itemize}
+
+\subsubsection{29. CHAI：人机协同监督构建精确视频语言}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21718}{2604.21718}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 以职业电影人术语为基础的\textbf{结构化视频描述规范}（覆盖主体、场景、运动、摄像机动态）
+  \item 构建\textbf{CHAI 人机协同框架}，让专家对模型生成字幕进行批评与修订
+  \item 利用批评数据训练字幕生成、奖励模型和批评生成器
+  \item 支持\textbf{长达 400 词}的精细提示控制视频生成
+\end{itemize}
+
+\subsection{五、今日趋势洞察}
+
+\small
+\begin{longtable}{p{3.2cm}p{10.5cm}}
+\toprule
+趋势 & 说明 \\
+\midrule
+\textbf{GRPO 席卷多模态} & GRPO 从纯文本 LLM 全面扩展至 VLM 和扩散模型，S-GRPO、OTCA、S1-VL 均在利用 GRPO 优化视觉/多模态任务 \\
+\textbf{世界模型评测标准化} & WorldMark、RoboWM-Bench 的提出标志着世界模型从"炫技"走向"可量化比较"阶段 \\
+\textbf{扩散推理加速} & Sparse Forcing、X-Cache、Sculpt4D 均采用稀疏注意力机制，实时视频生成加速成主旋律 \\
+\textbf{3D/4D 内容创作} & FluSplat（3D 编辑）、Sculpt4D（4D 生成）、HY-World 2.0（3D 世界模型）说明内容创作正从 2D 向 3D/4D 演进 \\
+\textbf{偏好对齐下沉} & HP-Edit、HalluVL-DPO、ParetoSlider 将 RLHF/DPO 带入图像编辑和生成，偏好对齐正成为视觉生成新标配 \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\subsection{六、汇总速查表}
+
+\small
+\begin{longtable}{p{0.7cm}p{2.5cm}p{2.6cm}p{2.3cm}p{5.0cm}}
+\toprule
+\# & 简称 & arXiv ID & 方向 & 关键词 \\
+\midrule
+1 & S-GRPO & \href{https://arxiv.org/abs/2604.16557}{2604.16557} & 后训练 & GRPO, VLM, 统一后训练 \\
+2 & HP-Edit & \href{https://arxiv.org/abs/2604.19406}{2604.19406} & 后训练 / 图像编辑 & RLHF, 偏好对齐, 图像编辑 \\
+3 & RFT in LVLM & \href{https://arxiv.org/abs/2604.19857}{2604.19857} & 后训练 & GRPO 理论, 收敛性, VLM \\
+4 & HalluVL-DPO & \href{https://arxiv.org/abs/2604.21911}{2604.21911} & 后训练 & DPO, 幻觉抑制, VLM \\
+5 & ParetoSlider & \href{https://arxiv.org/abs/2604.20816}{2604.20816} & 后训练 & 多目标 RL, 帕累托前沿, 扩散模型 \\
+6 & OTCA & \href{https://arxiv.org/abs/2604.19234}{2604.19234} & 后训练 & GRPO, 信用分配, 扩散模型 \\
+7 & VG-CoT & \href{https://arxiv.org/abs/2604.21396}{2604.21396} & 后训练 & SFT+RL, 思维链, 视觉推理 \\
+8 & S1-VL & \href{https://arxiv.org/abs/2604.21409}{2604.21409} & 后训练 & SFT+RL, 科学推理, 图像驱动推理 \\
+9 & WorldMark & \href{https://arxiv.org/abs/2604.21686}{2604.21686} & 世界模型 & 评测基准, 交互式, 统一对比 \\
+10 & Hi-WM & \href{https://arxiv.org/abs/2604.21741}{2604.21741} & 世界模型 & 人在回路, 机器人, 后训练 \\
+11 & MultiWorld & \href{https://arxiv.org/abs/2604.18564}{2604.18564} & 世界模型 & 多智能体, 多视角 \\
+12 & X-Cache & \href{https://arxiv.org/abs/2604.20289}{2604.20289} & 世界模型 & 推理加速, 缓存, 自动驾驶 \\
+13 & HY-World 2.0 & \href{https://arxiv.org/abs/2604.14268}{2604.14268} & 世界模型 & 3D, 多模态, 3DGS, 腾讯 \\
+14 & Mask World Model & \href{https://arxiv.org/abs/2604.19683}{2604.19683} & 世界模型 & 语义掩码, 机器人策略学习 \\
+15 & RoboWM-Bench & \href{https://arxiv.org/abs/2604.19092}{2604.19092} & 世界模型 & 评测基准, 机器人操作 \\
+16 & Task-Aware Localization & \href{https://arxiv.org/abs/2604.20258}{2604.20258} & 图像编辑 & 任务感知, 局部编辑, 免训练 \\
+17 & AttDiff-GAN & \href{https://arxiv.org/abs/2604.21289}{2604.21289} & 图像编辑 & 扩散-GAN 混合, 人脸属性编辑 \\
+18 & LatRef-Diff & \href{https://arxiv.org/abs/2604.21279}{2604.21279} & 图像编辑 & 风格操纵, 潜在引导, 人脸 \\
+19 & UniGeo & \href{https://arxiv.org/abs/2604.17565}{2604.17565} & 图像编辑 & 几何引导, 相机可控, 新视角合成 \\
+20 & FluSplat & \href{https://arxiv.org/abs/2604.20038}{2604.20038} & 图像编辑 & 3D 编辑, 3DGS, 稀疏视角 \\
+21 & Sparse Forcing & \href{https://arxiv.org/abs/2604.21221}{2604.21221} & 视频模型 & 稀疏注意力, 自回归扩散, 加速 \\
+22 & Sculpt4D & \href{https://arxiv.org/abs/2604.21592}{2604.21592} & 视频模型 & 4D 生成, 稀疏扩散, Hunyuan3D \\
+23 & ReImagine & \href{https://arxiv.org/abs/2604.19720}{2604.19720} & 视频模型 & 可控人物视频, 图像优先, SMPL-X \\
+24 & Seeing Fast and Slow & \href{https://arxiv.org/abs/2604.21931}{2604.21931} & 视频模型 & 时序理解, 速度控制, 自监督 \\
+25 & Reshoot-Anything & \href{https://arxiv.org/abs/2604.21776}{2604.21776} & 视频模型 & 相机可控, 视频重拍, 自监督 \\
+26 & MMControl & \href{https://arxiv.org/abs/2604.19679}{2604.19679} & 视频模型 & 音视频联合生成, 多模态控制 \\
+27 & 物理接地视频推理 & \href{https://arxiv.org/abs/2604.21873}{2604.21873} & 视频理解 & 评测基准, 物理推理, 空间接地 \\
+28 & CHAI & \href{https://arxiv.org/abs/2604.21718}{2604.21718} & 视频理解 & 视频字幕, 人机协同, 标注 \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+*共收录论文\textbf{28 篇}（含 1 篇跨方向），覆盖后训练 8 篇、世界模型 7 篇、图像编辑 6 篇、视频模型 8 篇。*
