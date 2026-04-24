@@ -23,6 +23,10 @@ env/
 *.run.xml
 *.synctex.gz
 *.toc
+*.pdf
+_minted-*/
+build/
+out/
 
 # Temporary files
 *.tmp

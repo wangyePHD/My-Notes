@@ -1,0 +1,157 @@
+% ========== 基础包 ==========
+\usepackage[UTF8]{ctex}               % 中文支持
+\usepackage[margin=2.5cm]{geometry}   % 页边距
+\usepackage{amsmath, amssymb}         % 数学公式
+\usepackage{xcolor}                   % 颜色
+\usepackage{mdframed}                 % 高亮框
+\usepackage{listings}                 % 代码块
+\usepackage{enumitem}                 % 列表样式
+\usepackage{titlesec}                 % 标题样式
+\usepackage{fancyhdr}                 % 页眉页脚
+\usepackage{tocloft}                  % 目录样式
+\usepackage{parskip}                  % 段落间距
+\usepackage{graphicx}                 % 图片
+\usepackage{pgfplots}                 % 函数图像
+\pgfplotsset{compat=1.18}
+\usepackage{tikz}                     % 绘图
+\usetikzlibrary{arrows.meta, positioning, fit}  % tikz 库（bagel.tex 架构图需要）
+\usepackage{array}                    % 高级表格列格式（>{\bfseries} 等）
+\usepackage{booktabs}                 % 三线表（\toprule / \midrule / \bottomrule）
+
+% ========== 资源路径 ==========
+\graphicspath{{assets/figures/}}
+
+% ========== 颜色定义 ==========
+\definecolor{primary}{RGB}{52, 120, 246}      % 主色：蓝
+\definecolor{accent}{RGB}{255, 149, 0}        % 强调：橙
+\definecolor{success}{RGB}{52, 199, 89}       % 成功：绿
+\definecolor{danger}{RGB}{255, 59, 48}        % 警告：红
+\definecolor{codebg}{RGB}{246, 248, 250}      % 代码背景
+\definecolor{codeborder}{RGB}{208, 215, 222}  % 代码边框
+\definecolor{blockbg}{RGB}{240, 247, 255}     % 信息框背景
+\definecolor{textgray}{RGB}{100, 100, 100}    % 灰色文字
+
+% ========== 标题样式 ==========
+\titleformat{\section}
+  {\Large\bfseries\color{primary}}
+  {\thesection}{0.8em}{}
+  [\vspace{-0.3em}\textcolor{primary}{\rule{\linewidth}{1.5pt}}\vspace{0.3em}]
+
+\titleformat{\subsection}
+  {\large\bfseries\color{black!80}}
+  {\thesubsection}{0.8em}{}
+
+\titleformat{\subsubsection}
+  {\normalsize\bfseries\color{textgray}}
+  {\thesubsubsection}{0.8em}{}
+
+% ========== 页眉页脚 ==========
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{textgray}{\leftmark}}
+\fancyhead[R]{\small\textcolor{textgray}{KillerWang 的学习笔记}}
+\fancyfoot[C]{\small\textcolor{textgray}{\thepage}}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{codeborder}\leaders\hrule height \headrulewidth\hfill}}
+
+% ========== 代码块样式 ==========
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{primary}\bfseries,
+  commentstyle=\color{textgray}\itshape,
+  stringstyle=\color{success},
+  frame=single,
+  framerule=0.8pt,
+  rulecolor=\color{codeborder},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  xleftmargin=8pt,
+  xrightmargin=8pt,
+  aboveskip=8pt,
+  belowskip=8pt,
+  numbers=left,
+  numberstyle=\tiny\color{textgray},
+  numbersep=8pt,
+}
+
+% ========== 自定义模块化环境 ==========
+
+% 【关键概念框】蓝色
+\newmdenv[
+  backgroundcolor=blockbg,
+  linecolor=primary,
+  linewidth=2pt,
+  leftline=true, rightline=false, topline=false, bottomline=false,
+  innerleftmargin=12pt,
+  innerrightmargin=8pt,
+  innertopmargin=8pt,
+  innerbottommargin=8pt,
+  skipabove=8pt,
+  skipbelow=8pt,
+]{conceptbox}
+
+% 【直觉理解框】橙色
+\newmdenv[
+  backgroundcolor={orange!8},
+  linecolor=accent,
+  linewidth=2pt,
+  leftline=true, rightline=false, topline=false, bottomline=false,
+  innerleftmargin=12pt,
+  innerrightmargin=8pt,
+  innertopmargin=8pt,
+  innerbottommargin=8pt,
+  skipabove=8pt,
+  skipbelow=8pt,
+]{intubox}
+
+% 【警告/注意框】红色
+\newmdenv[
+  backgroundcolor={red!5},
+  linecolor=danger,
+  linewidth=2pt,
+  leftline=true, rightline=false, topline=false, bottomline=false,
+  innerleftmargin=12pt,
+  innerrightmargin=8pt,
+  innertopmargin=8pt,
+  innerbottommargin=8pt,
+  skipabove=8pt,
+  skipbelow=8pt,
+]{warnbox}
+
+% 【总结框】绿色
+\newmdenv[
+  backgroundcolor={green!6},
+  linecolor=success,
+  linewidth=2pt,
+  leftline=true, rightline=false, topline=false, bottomline=false,
+  innerleftmargin=12pt,
+  innerrightmargin=8pt,
+  innertopmargin=8pt,
+  innerbottommargin=8pt,
+  skipabove=8pt,
+  skipbelow=8pt,
+]{summarybox}
+
+% ========== 快捷命令 ==========
+\newcommand{\key}[1]{\textbf{\textcolor{primary}{#1}}}        % 关键词
+\newcommand{\warn}[1]{\textbf{\textcolor{danger}{#1}}}         % 警告
+\newcommand{\note}[1]{\textit{\textcolor{textgray}{#1}}}       % 备注
+\newcommand{\code}[1]{\texttt{\colorbox{codebg}{#1}}}          % 行内代码
+\newcommand{\good}[1]{\textcolor{success}{\textbf{#1}}}        % 好的
+\newcommand{\bad}[1]{\textcolor{danger}{\textbf{#1}}}          % 坏的
+
+% ========== 超链接样式 ==========
+\usepackage{hyperref}                 % 超链接
+\hypersetup{
+  colorlinks=true,
+  linkcolor=primary,
+  urlcolor=primary,
+  citecolor=textgray,
+}
+
+% ========== 目录样式 ==========
+\renewcommand{\cftsecfont}{\bfseries\color{primary}}
+\renewcommand{\cftsecpagefont}{\bfseries\color{primary}}
