@@ -1,0 +1,282 @@
+% ============================================================
+% Round 03: PPO / RLHF
+% ============================================================
+
+\subsection{Round 03：PPO / RLHF}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解 Reward Model 的分数如何真正用来更新语言模型，以及 PPO 为什么需要 old policy、ratio、clip、value model 和 KL 约束。\\
+\textbf{主线位置：}
+\[
+\text{SFT} \to \text{Reward Model} \to \text{PPO / RLHF} \to \text{DPO} \to \text{GRPO / RLVR}
+\]
+\end{conceptbox}
+
+\subsubsection{从 RM 到 RLHF}
+
+Reward Model 只会打分：
+
+\[
+R = r_\phi(x, y)
+\]
+
+但它不会直接改变语言模型。RLHF 要解决的问题是：
+
+\[
+\text{如何让 policy 更倾向于生成高 reward 的回答？}
+\]
+
+这里的 policy 就是语言模型：
+
+\[
+\pi_\theta(y \mid x)
+\]
+
+它给定 prompt $x$，生成回答 $y$。RLHF 的核心目标可以先粗略写成：
+
+\[
+\max_\theta \mathbb{E}_{y \sim \pi_\theta(\cdot \mid x)}
+\left[
+r_\phi(x, y)
+\right]
+\]
+
+也就是：让模型自己采样回答，然后用 Reward Model 打分，再更新模型，使高分回答更容易被生成。
+
+\begin{summarybox}
+\textbf{一句话：} RLHF = 用 Reward Model 作为奖励函数，对 SFT 模型继续做强化学习。
+\end{summarybox}
+
+\subsubsection{把 LLM 看成 RL 问题}
+
+在 LLM 里，一次生成可以看成一条 trajectory：
+
+\[
+y = (y_1, y_2, \ldots, y_T)
+\]
+
+对应 RL 里的状态、动作和奖励：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{9.8cm}}
+\hline
+\textbf{RL 概念} & \textbf{LLM 中的含义} \\
+\hline
+State $s_t$ & prompt $x$ 加上已经生成的 tokens $y_{<t}$ \\
+Action $a_t$ & 当前要生成的下一个 token $y_t$ \\
+Policy $\pi_\theta$ & 语言模型的 next-token distribution \\
+Trajectory & 一整段回答 $y_1,\ldots,y_T$ \\
+Reward & Reward Model 对最终回答的评分，通常在序列末尾给出 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+这说明 LLM 的 RL 和游戏 RL 有一个重要差别：奖励通常不是每一步都有，而是整段回答生成完以后才得到一个最终分数。
+
+\subsubsection{为什么不能直接最大化 Reward}
+
+如果只优化：
+
+\[
+\max_\theta \mathbb{E}[r_\phi(x, y)]
+\]
+
+模型可能会学会利用 Reward Model 的漏洞，而不是变得真正更好。例如：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 生成 Reward Model 偏爱的固定模板；
+  \item 输出看起来很自信但事实错误的回答；
+  \item 变得过度冗长，因为 RM 误以为长答案更有帮助；
+  \item 偏离 SFT 模型的正常语言分布，导致可读性下降。
+\end{itemize}
+
+因此 RLHF 通常加入 reference model 约束。reference model 通常是冻结的 SFT 模型：
+
+\[
+\pi_\text{ref}
+\]
+
+实际优化目标更接近：
+
+\[
+\max_\theta
+\mathbb{E}
+\left[
+r_\phi(x, y)
+-
+\beta
+\mathbb{D}_\text{KL}
+\left(
+\pi_\theta(\cdot \mid x)
+\|
+\pi_\text{ref}(\cdot \mid x)
+\right)
+\right]
+\]
+
+\begin{intubox}
+\textbf{直觉：} Reward Model 负责告诉模型“往哪里变好”，KL / reference model 负责告诉模型“不要跑太远”。
+\end{intubox}
+
+\subsubsection{PPO 的核心对象：概率比值}
+
+PPO 更新时会区分两个 policy：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $\pi_{\theta_\text{old}}$：采样数据时使用的旧模型；
+  \item $\pi_\theta$：当前正在更新的新模型。
+\end{itemize}
+
+对于每个 token，定义概率比值：
+
+\[
+\rho_t(\theta)
+=
+\frac{
+\pi_\theta(y_t \mid x, y_{<t})
+}{
+\pi_{\theta_\text{old}}(y_t \mid x, y_{<t})
+}
+\]
+
+它表示：新模型相比旧模型，是否更想生成这个 token。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{9.8cm}}
+\hline
+\textbf{比值} & \textbf{含义} \\
+\hline
+$\rho_t > 1$ & 新模型提高了这个 token 的概率 \\
+$\rho_t < 1$ & 新模型降低了这个 token 的概率 \\
+$\rho_t \approx 1$ & 新旧模型变化不大 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{Advantage：这个回答该鼓励还是惩罚}
+
+Reward 本身只是一个分数。PPO 需要知道某个 token / trajectory 相比预期到底好多少，这就是 Advantage：
+
+\[
+A_t = R_t - V_\psi(s_t)
+\]
+
+其中 $V_\psi(s_t)$ 是 value model / critic，估计当前状态后续大概能拿到多少 reward。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $A_t > 0$：比预期更好，应该提高概率；
+  \item $A_t < 0$：比预期更差，应该降低概率；
+  \item $A_t \approx 0$：和预期差不多，更新很小。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{注意：} PPO 需要额外训练 value model / critic。这会增加显存、训练复杂度和不稳定性。后面的 GRPO 一个核心动机就是去掉 critic，用组内相对奖励估计 advantage。
+\end{warnbox}
+
+\subsubsection{PPO-Clip 目标函数}
+
+PPO 的基本思想是：如果某个 token 来自高 advantage 的回答，就提高它的概率；如果来自低 advantage 的回答，就降低它的概率。但每次更新不能太大。
+
+clip 目标函数：
+
+\[
+\mathcal{J}_\text{PPO}(\theta)
+=
+\mathbb{E}_t
+\left[
+\min
+\left(
+\rho_t(\theta) A_t,\;
+\operatorname{clip}(\rho_t(\theta), 1-\epsilon, 1+\epsilon) A_t
+\right)
+\right]
+\]
+
+其中 $\epsilon$ 通常是一个小常数，例如 $0.1$ 或 $0.2$。
+
+\begin{intubox}
+\textbf{直觉：} PPO 允许模型朝高 reward 方向移动，但用 clip 限制每一步别走太远。它解决的是 policy gradient 更新过猛、训练崩掉的问题。
+\end{intubox}
+
+\subsubsection{RLHF 的典型流程}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 从 prompt dataset 采样一批 prompts；
+  \item 用当前 policy $\pi_{\theta_\text{old}}$ 生成回答；
+  \item 用 Reward Model 给回答打分；
+  \item 计算 KL penalty，得到最终 reward；
+  \item 用 value model 估计 advantage；
+  \item 用 PPO-clip 更新 policy；
+  \item 同时训练或更新 value model；
+  \item 重复采样和更新。
+\end{enumerate}
+
+简化成一条链：
+
+\[
+\text{Prompt}
+\to
+\text{Policy 生成}
+\to
+\text{RM 打分}
+\to
+\text{KL 约束}
+\to
+\text{Advantage}
+\to
+\text{PPO 更新}
+\]
+
+\subsubsection{PPO / RLHF 的代价}
+
+PPO/RLHF 很强，但工程代价高：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 需要 policy model；
+  \item 需要 reference model；
+  \item 需要 reward model；
+  \item 通常还需要 value model / critic；
+  \item 训练时要保存 log probability、reward、advantage 等中间量；
+  \item 超参数敏感，例如 KL 系数、clip range、reward normalization。
+\end{itemize}
+
+这也是为什么后来出现 DPO 和 GRPO：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item DPO：希望不用显式训练 RM、也不用在线 PPO；
+  \item GRPO：希望保留在线 RL 的能力，但去掉 critic。
+\end{itemize}
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{PPO/RLHF = 用 RM 分数训练 policy，但用 clip 和 KL 控制更新幅度。}\\
+关键对象：
+\[
+\rho_t(\theta)
+=
+\frac{
+\pi_\theta(y_t \mid x, y_{<t})
+}{
+\pi_{\theta_\text{old}}(y_t \mid x, y_{<t})
+}
+\]
+关键思想：高 advantage 的 token 增大概率，低 advantage 的 token 降低概率；clip 和 KL 防止模型为了 reward 跑偏。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 在 LLM RLHF 里，state、action、trajectory、reward 分别是什么？
+  \item PPO 里的 $\rho_t(\theta)$ 表示什么？为什么需要 old policy？
+  \item Advantage $A_t$ 的作用是什么？为什么只看 reward 不够？
+  \item PPO-clip 为什么能提高训练稳定性？
+  \item KL / reference model 在 RLHF 里起什么作用？
+  \item PPO/RLHF 的工程代价在哪里？这如何引出 DPO 和 GRPO？
+\end{enumerate}
