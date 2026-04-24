@@ -11,7 +11,7 @@
 │   └── preamble.tex          # 全局宏包、颜色、样式、快捷命令
 ├── Notes/
 │   ├── index.tex             # 正文编译顺序；新增笔记后在这里加 \input
-│   ├── 00_learning_system/   # 学习系统：新领域学习法、模板、专题学习路线
+│   ├── 00_learning_system/   # 学习系统：新领域学习法、模板、专题学习路线、学习对话记录
 │   ├── 01_foundations/       # 基础理论：Diffusion / Flow Matching 等
 │   ├── 02_model_architectures/# 模型架构：FLUX / BAGEL / Z-Image 等
 │   ├── 03_rl_post_training/  # RL 后训练：GRPO / Flow-GRPO / UniGRPO 等
@@ -48,6 +48,26 @@ Notes/03_rl_post_training/new_method.tex
 git add .
 git commit -m "Add new method note"
 git push
+```
+
+## 新增一轮学习对话
+
+每个专题学习放在一个 session 子目录，例如：
+
+```text
+Notes/00_learning_system/study_sessions/post_training_2026_04_24/
+```
+
+每一轮对话单独写一个 `.tex`：
+
+```text
+round_02_reward_model.tex
+```
+
+然后在该 session 的 `index.tex` 中加入：
+
+```tex
+\input{Notes/00_learning_system/study_sessions/post_training_2026_04_24/round_02_reward_model}
 ```
 
 ## 新增一篇 arXiv 速读

@@ -1,0 +1,157 @@
+% ============================================================
+% Round 01: SFT
+% ============================================================
+
+\subsection{Round 01：SFT}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 先理解 LLM 后训练链条里的第一步：SFT。\\
+\textbf{主线位置：}
+\[
+\text{SFT} \to \text{Reward Model} \to \text{PPO / RLHF} \to \text{DPO} \to \text{GRPO / RLVR}
+\]
+\end{conceptbox}
+
+\subsubsection{后训练在解决什么}
+
+预训练模型学到的是：
+
+\[
+\text{给定上下文，预测下一个 token}
+\]
+
+它会语言、知识和模式，但不一定会按人类想要的方式工作。例如：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 不一定听指令；
+  \item 不一定给结构化答案；
+  \item 不一定安全；
+  \item 不一定偏向高质量推理；
+  \item 不一定知道什么回答更好。
+\end{itemize}
+
+所以后训练的目标是：
+
+\[
+\text{Base Model} \to \text{Assistant / Reasoner / Agent}
+\]
+
+\begin{summarybox}
+\textbf{最小定义：} Post-training = 用额外信号重塑模型的输出分布。
+\end{summarybox}
+
+\subsubsection{SFT 是什么}
+
+SFT = Supervised Fine-Tuning，即监督微调。
+
+数据形式：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{10cm}}
+\hline
+\textbf{输入 $x$} & 请解释什么是 GRPO \\
+\textbf{目标答案 $y^\ast$} & GRPO 是一种不使用 critic 的 policy optimization 方法…… \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+训练目标：
+
+\[
+\mathcal{L}_\text{SFT} = - \log \pi_\theta(y^\ast \mid x)
+\]
+
+展开到 token 级别：
+
+\[
+\mathcal{L}_\text{SFT}
+=
+-\sum_{t=1}^{T}
+\log \pi_\theta(y_t^\ast \mid x, y_{<t}^\ast)
+\]
+
+含义是：让模型在看到 prompt $x$ 时，更倾向于生成人工写好的目标答案 $y^\ast$。
+
+\subsubsection{SFT 的直觉}
+
+Base model 的行为更像：
+
+\[
+\text{看到一句话，继续往下写}
+\]
+
+SFT 之后，模型更像：
+
+\[
+\text{看到一个任务，给出符合格式和意图的回答}
+\]
+
+因此 SFT 主要学习：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 指令格式；
+  \item 回答风格；
+  \item 任务模板；
+  \item 基础对齐行为。
+\end{itemize}
+
+\begin{intubox}
+\textbf{例子：} 对于“总结这篇论文”这个 prompt，SFT 前模型可能只是续写论文风格文本；SFT 后模型更可能输出“背景、方法、实验、结论”这样的任务型结构。
+\end{intubox}
+
+\subsubsection{SFT 的本质}
+
+SFT 本质上是：
+
+\[
+\text{Behavior Cloning / Imitation Learning}
+\]
+
+它不是在判断哪个答案更好，而是在模仿给定的标准答案。因此能力上限高度依赖数据质量：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{8.5cm}}
+\hline
+\textbf{数据质量} & \textbf{结果} \\
+\hline
+高质量 SFT 数据 & 行为更稳定，格式更清晰，任务遵循更好 \\
+低质量 SFT 数据 & 学会啰嗦、幻觉、格式污染或错误偏好 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{SFT 的局限}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{不能区分多个答案的相对好坏。} 如果两个答案都正确，但一个更清晰，SFT 只会模仿数据里的那个，不天然知道哪个更好。
+  \item \textbf{不会主动探索更优答案。} SFT 只学已有示范，不会自己采样、比较和改进。
+  \item \textbf{强依赖人工答案质量。} 示范答案差，模型会稳定地学到差行为。
+  \item \textbf{对推理能力提升有限。} SFT 可以教模型输出推理格式，但不一定真正提升找对答案的能力。
+\end{enumerate}
+
+这就是后面需要 Reward Model、PPO、DPO、GRPO 的原因：它们试图从“模仿标准答案”进一步走向“优化更好的答案”。
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{SFT = 给模型标准答案，让它模仿。}\\
+核心公式：
+\[
+\mathcal{L}_\text{SFT} = - \log \pi_\theta(y^\ast \mid x)
+\]
+核心局限：SFT 只能学数据里怎么答，不能直接学哪个答案更好。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item SFT 为什么能让 base model 变得更像 assistant？
+  \item SFT 的 loss 在优化什么？
+  \item 为什么 SFT 之后还需要 RLHF / DPO / GRPO？
+\end{enumerate}
