@@ -1,0 +1,69 @@
+% ============================================================
+% 学习系统：如何快速进入一个新领域
+% ============================================================
+
+\section{领域学习操作系统}
+
+\begin{conceptbox}
+\textbf{目标：} 学一个新领域时，不只是收集资料，而是快速建立三层能力：
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{地图感}：知道这个领域有哪些问题、方法、流派和关键论文。
+  \item \key{原理感}：能把核心方法还原成目标函数、数据流、训练流程和工程约束。
+  \item \key{判断力}：能判断一个新方法解决了什么痛点、代价是什么、是否真的重要。
+\end{itemize}
+\end{conceptbox}
+
+\subsection{核心循环}
+
+学习一个领域时，固定走下面六步：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{建地图：} 先列出 5--10 个核心问题，而不是先读论文。
+  \item \textbf{抓主干：} 找到最小闭环：输入是什么，输出是什么，训练信号是什么，优化什么。
+  \item \textbf{读经典：} 每条路线只选 1--2 篇代表作，先读懂方法结构。
+  \item \textbf{拆公式：} 把损失函数、采样流程、奖励定义拆成自己的符号系统。
+  \item \textbf{做复现：} 不一定完整复现，至少复现一个 toy example、loss 计算或流程图。
+  \item \textbf{写判断：} 最后用自己的话写：它解决了什么、失败在哪里、下一步会怎么演化。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{一句话：} 领域学习不是从资料开始，而是从\key{问题结构}开始；不是以“看完多少论文”为目标，而是以“能解释、能比较、能预测”为目标。
+\end{summarybox}
+
+\subsection{三遍阅读法}
+
+\textbf{第一遍：地图阅读。}
+只看标题、摘要、图 1、方法总览和实验表，目标是判断它属于哪条技术路线。
+
+\textbf{第二遍：机制阅读。}
+重点看方法章节，提取：
+\begin{itemize}[leftmargin=1.5em]
+  \item 优化目标是什么；
+  \item 数据从哪里来；
+  \item 训练时哪些模型参与；
+  \item 推理时和原方法相比多了什么。
+\end{itemize}
+
+\textbf{第三遍：批判阅读。}
+问四个问题：
+\begin{itemize}[leftmargin=1.5em]
+  \item 这个方法真正的新东西是什么？
+  \item 它绕开了什么困难，又引入了什么代价？
+  \item 实验是否能支撑论文的主张？
+  \item 如果迁移到我的方向，会卡在哪里？
+\end{itemize}
+
+\subsection{每天的学习产物}
+
+每天至少留下四种产物之一：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{一张地图：} 方法谱系、模块关系、训练流程。
+  \item \textbf{一张表：} 方法对比、假设对比、损失函数对比。
+  \item \textbf{一个公式拆解：} 从原论文公式翻译成自己的变量解释。
+  \item \textbf{一个最小实验：} toy code、伪代码、loss 计算、数据流模拟。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{避免低效学习：} 不要把“读了很多论文”等价于“懂了这个领域”。真正的掌握标准是：给你一篇新论文，你能很快判断它属于哪条路线、解决了哪个旧问题、核心假设是否可靠。
+\end{warnbox}

@@ -11,6 +11,7 @@
 │   └── preamble.tex          # 全局宏包、颜色、样式、快捷命令
 ├── Notes/
 │   ├── index.tex             # 正文编译顺序；新增笔记后在这里加 \input
+│   ├── 00_learning_system/   # 学习系统：新领域学习法、模板、专题学习路线
 │   ├── 01_foundations/       # 基础理论：Diffusion / Flow Matching 等
 │   ├── 02_model_architectures/# 模型架构：FLUX / BAGEL / Z-Image 等
 │   ├── 03_rl_post_training/  # RL 后训练：GRPO / Flow-GRPO / UniGRPO 等

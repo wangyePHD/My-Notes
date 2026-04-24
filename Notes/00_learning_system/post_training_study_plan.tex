@@ -1,0 +1,104 @@
+% ============================================================
+% 后训练技术学习路线
+% ============================================================
+
+\section{后训练技术学习路线}
+
+\begin{conceptbox}
+\textbf{今日目标：} 建立一个统一视角理解后训练：模型已经会生成之后，如何利用偏好、奖励、验证器或人类反馈，把生成分布推向更有用、更可靠、更符合目标的区域。
+\end{conceptbox}
+
+\subsection{统一抽象}
+
+后训练可以抽象为：
+
+\[
+\text{Base Model} \xrightarrow{\text{SFT / Preference / RL / Verifier}} \text{Aligned Model}
+\]
+
+其中关键问题是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{信号来源：} 人类偏好、规则奖励、自动评测器、视觉奖励模型、任务成功率。
+  \item \textbf{优化对象：} token 概率、整段回答概率、扩散轨迹、flow 轨迹、图像编辑结果。
+  \item \textbf{约束方式：} KL、reference model、clip ratio、reward normalization、offline preference constraint。
+  \item \textbf{信用分配：} 最终结果的好坏如何分配给中间 token 或 denoising step。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{核心统一句：} LLM 后训练和图像生成后训练，本质上都是\key{用偏好或奖励重塑生成分布}；区别在于 LLM 的轨迹是 token 序列，图像生成的轨迹是 denoising / flow 过程。
+\end{summarybox}
+
+\subsection{LLM 侧主线}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.6cm}p{4.2cm}p{6.2cm}}
+\hline
+\textbf{阶段} & \textbf{代表方法} & \textbf{要掌握的问题} \\
+\hline
+SFT & Instruction tuning & 为什么行为克隆能改变模型行为？数据质量如何影响泛化？ \\
+Reward Modeling & Bradley--Terry RM & 如何从 chosen / rejected 学出标量奖励？ \\
+Online RL & PPO, GRPO & 如何用模型自己采样的数据继续优化？KL 和 clip 如何稳定训练？ \\
+Offline Preference & DPO, IPO, KTO, ORPO, SimPO & 能否不训练 reward model，直接从偏好对优化 policy？ \\
+Verifier / RLVR & Rule-based reward, process reward & 当奖励可验证时，为什么推理能力会显著提升？ \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{图像生成侧主线}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.2cm}p{5.8cm}}
+\hline
+\textbf{路线} & \textbf{代表方法} & \textbf{核心问题} \\
+\hline
+Diffusion RL & DDPO, DPOK & 把 denoising 过程视为多步策略，如何计算每一步 log probability？ \\
+Diffusion Preference & Diffusion-DPO & 如何把 chosen / rejected 图像偏好转成扩散模型的直接优化目标？ \\
+Reward Backprop & AlignProp, DRaFT & 如果奖励模型可微，能否直接把奖励梯度传回生成模型？ \\
+Flow RL & Flow-GRPO & Flow Matching 原本是确定性 ODE，如何引入随机性并做 RL？ \\
+Discrete / Unified Models & UDM-GRPO, LeapAlign & 多模态或离散扩散里，如何稳定地做组相对优化和轨迹信用分配？ \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{今天的学习顺序}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{先画地图：} 用一页纸画出 SFT、RM、PPO、DPO、GRPO、DDPO、Diffusion-DPO、Flow-GRPO 的关系。
+  \item \textbf{再拆 LLM：} 写清楚 SFT、RM、DPO、GRPO 的输入、loss、reference model 和训练数据。
+  \item \textbf{迁移到图像：} 把 token trajectory 换成 denoising trajectory，重新问一次：reward 在哪里、log prob 怎么来、KL 怎么约束。
+  \item \textbf{做统一表：} 每个方法都填四列：信号、优化对象、约束、信用分配。
+  \item \textbf{最后写判断：} 哪些方法适合文本推理，哪些适合图像审美，哪些适合可验证任务。
+\end{enumerate}
+
+\subsection{必须掌握的公式}
+
+\textbf{SFT：}
+\[
+\mathcal{L}_\text{SFT} = - \log \pi_\theta(y^\ast \mid x)
+\]
+
+\textbf{Reward Model：}
+\[
+P(y_w \succ y_l \mid x) = \sigma(r_\phi(x, y_w) - r_\phi(x, y_l))
+\]
+
+\textbf{Preference Optimization：}
+\[
+\log \frac{\pi_\theta(y_w \mid x)}{\pi_\text{ref}(y_w \mid x)}
+-
+\log \frac{\pi_\theta(y_l \mid x)}{\pi_\text{ref}(y_l \mid x)}
+\]
+
+\textbf{GRPO Advantage：}
+\[
+\hat{A}_i = \frac{R_i - \mathrm{mean}(\{R_j\}_{j=1}^G)}{\mathrm{std}(\{R_j\}_{j=1}^G) + \varepsilon}
+\]
+
+\begin{intubox}
+\textbf{学习抓手：} 不要把每个方法当成独立名词背。每看到一个新 post-training 方法，就问：它的 reward 是什么？reference 是什么？trajectory 是什么？credit assignment 怎么做？
+\end{intubox}
