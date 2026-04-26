@@ -148,6 +148,259 @@ final clean sample as action, forward trajectory reconstruction
 }
 \end{center}
 
+\subsubsection{二次检索补充：不要漏掉的工作}
+
+为了避免只围绕 Flow-GRPO 这条线看，我又按以下关键词做了二次检索：
+
+\[
+\text{GRPO image generation}
+\quad
+\text{visual generation GRPO}
+\quad
+\text{image editing GRPO}
+\quad
+\text{video GRPO}
+\quad
+\text{autoregressive image GRPO}
+\quad
+\text{masked image generation RL}
+\]
+
+下面这些工作也应该放进我们的前沿阅读地图里。
+
+{\small
+\begin{longtable}{p{2.7cm}p{2.1cm}p{4.2cm}p{4.2cm}}
+\hline
+\textbf{工作（链接）} & \textbf{时间} & \textbf{核心问题} & \textbf{关键词} \\
+\hline
+\endfirsthead
+\hline
+\textbf{工作（链接）} & \textbf{时间} & \textbf{核心问题} & \textbf{关键词} \\
+\hline
+\endhead
+\href{https://arxiv.org/abs/2505.07818}{DanceGRPO}
+&
+2025-05
+&
+把 GRPO 统一用到 diffusion、rectified flow、T2I、T2V、I2V
+&
+unified visual GRPO, diffusion + flow, video
+\\
+\href{https://arxiv.org/abs/2505.17574}{InfLVG}
+&
+2025-05
+&
+长视频生成时上下文越来越长，如何用 GRPO 学 context selection
+&
+long video, inference-time policy, context selection
+\\
+\href{https://arxiv.org/abs/2505.24875}{ReasonGen-R1}
+&
+2025-05
+&
+AR 图像生成先用 CoT 做文本规划，再用 GRPO 优化视觉结果
+&
+reasoning before image generation, SFT + GRPO
+\\
+\href{https://arxiv.org/abs/2508.06924}{AR-GRPO}
+&
+2025-08
+&
+把 GRPO 直接迁移到 autoregressive image generation
+&
+AR image generation, token policy, visual rewards
+\\
+\href{https://arxiv.org/abs/2508.18032}{Visual-CoG}
+&
+2025-08
+&
+最终 reward 太粗，给语义推理、过程优化、结果评价三个阶段分别设计 guidance
+&
+stage-aware RL, chain of guidance
+\\
+\href{https://arxiv.org/abs/2509.25027}{STAGE}
+&
+2025-09
+&
+AR 图像生成里普通 GRPO 会破坏预训练分布，且 token 梯度互相冲突
+&
+stable AR-GRPO, advantage / KL reweighting, entropy reward
+\\
+\href{https://arxiv.org/abs/2509.22485}{GCPO}
+&
+2025-09
+&
+AR 图像生成中不是所有 image token 都同等重要
+&
+critical-token policy optimization, AR visual generation
+\\
+\href{https://arxiv.org/abs/2509.25774}{PCPO}
+&
+2025-09
+&
+policy gradient 中不同 timestep credit 不成比例，导致高方差和训练不稳
+&
+proportionate credit, timestep reweighting
+\\
+\href{https://arxiv.org/abs/2511.18719}{ViPO}
+&
+2025-11
+&
+单个 scalar reward 太粗，忽略图像/视频的空间和时间结构
+&
+pixel-level advantage, perceptual structuring
+\\
+\href{https://arxiv.org/abs/2511.19356}{TaRoS}
+&
+2025-11
+&
+Video GRPO 中 reward score 会饱和并被当成目标本身，出现 Goodhart 问题
+&
+target-robust reward signaling, video GRPO
+\\
+\href{https://arxiv.org/abs/2512.18766}{MaskFocus}
+&
+2025-12
+&
+masked generative model 里全轨迹优化成本高，随机挑 step 又不稳定
+&
+critical steps, information gain, masked generation
+\\
+\href{https://arxiv.org/abs/2512.13276}{CogniEdit}
+&
+2025-12
+&
+细粒度图像编辑只在单步优化，反馈太稀疏，难以控制整条 denoising 轨迹
+&
+dense GRPO, fine-grained editing, trajectory-level supervision
+\\
+\href{https://arxiv.org/abs/2512.16864}{RePlan}
+&
+2025-12
+&
+复杂指令图像编辑需要先做区域规划，再把规划可靠交给 editor
+&
+reasoning-guided region planning, planner GRPO, IV-Edit
+\\
+\href{https://arxiv.org/abs/2601.02256}{VAR RL Done Right}
+&
+2026-01
+&
+VAR 生成不同 step 的输入结构异步，普通 GRPO 有 policy conflict
+&
+asynchronous policy conflict, VAR, mask propagation
+\\
+\href{https://arxiv.org/abs/2601.03467}{ThinkRL-Edit}
+&
+2026-01
+&
+复杂图像编辑需要先推理再生成，不能只靠 denoising 随机性探索
+&
+reasoning-centric image editing, CoT planning, checklist reward
+\\
+\href{https://arxiv.org/abs/2602.14186}{UniRef-Image-Edit}
+&
+2026-02
+&
+多参考图编辑 / 合成时多个 reference 之间约束冲突
+&
+multi-reference editing, SELF, MSGRPO
+\\
+\href{https://www.mdpi.com/1424-8220/26/4/1120}{Flow-Multi}
+&
+2026-02
+&
+单 reward 容易 reward hacking，多目标之间会互相冲突
+&
+multi-reward, Pareto dominance, advantage masking
+\\
+\href{https://arxiv.org/abs/2603.06623}{GRPO Survey}
+&
+2026-02
+&
+Flow-GRPO 之后分支增长太快，需要系统整理方法改进和跨模态扩展
+&
+survey, credit assignment, reward design, modality extension
+\\
+\href{https://arxiv.org/abs/2603.09538}{Unified Interleaved GRPO}
+&
+2026-03
+&
+统一视觉语言模型要在同一条轨迹里交替生成文本和图像
+&
+multimodal interleaved generation, hybrid reward, process reward
+\\
+\href{https://arxiv.org/abs/2603.12648}{MV-GRPO}
+&
+2026-03
+&
+单 prompt 单视角评价太稀疏，组内样本关系没有被充分利用
+&
+augmented condition space, multi-view advantage, dense reward mapping
+\\
+\href{https://arxiv.org/abs/2603.17461}{AR-CoPO}
+&
+2026-03
+&
+streaming AR 视频生成轨迹短、随机性低，SDE-GRPO 不自然
+&
+contrastive policy optimization, chunk-level neighborhood
+\\
+\href{https://arxiv.org/abs/2603.26599}{VGGRPO}
+&
+2026-03
+&
+视频生成几何一致性差，RGB-space reward 反复 VAE decode 成本高
+&
+4D latent reward, world consistency, video GRPO
+\\
+\href{https://arxiv.org/abs/2604.09386}{RC-GRPO-Editing}
+&
+2026-04
+&
+图像编辑中全局探索会扰动背景，导致组内 reward 方差变大
+&
+region-constrained GRPO, localized exploration, attention reward
+\\
+\href{https://arxiv.org/abs/2604.19234}{OTCA}
+&
+2026-04
+&
+多 reward 被压成一个静态标量，并均匀传给整条轨迹
+&
+objective-aware credit, timestep-aware reward allocation
+\\
+\href{https://arxiv.org/abs/2604.19406}{HP-Edit}
+&
+2026-04
+&
+真实图像编辑缺少可扩展人类偏好数据、scorer 和 benchmark
+&
+RealPref-50K, HP-Scorer, RealPref-Bench
+\\
+\hline
+\end{longtable}
+}
+
+\begin{summarybox}
+\textbf{二次检索后的修正：}\\
+如果只看 Flow-GRPO、UDM-GRPO、LeapAlign，会漏掉四条很重要的支线：
+\[
+\begin{aligned}
+&
+\text{图像编辑专属 RL}
+\quad
+\text{AR / VAR / masked generation 的 GRPO}
+\\
+&
+\text{视频生成的结构化 reward / credit assignment}
+\quad
+\text{统一多模态生成的 GRPO}
+\end{aligned}
+\]
+所以后续前沿阅读不应该只沿 Flow Matching 走，而要分成“图像编辑、连续 flow、离散/AR/VAR、视频、统一多模态生成”五条线。
+\end{summarybox}
+
 \subsubsection{主线一：Flow-GRPO 的信用分配改进}
 
 Flow-GRPO 的基本做法是：
