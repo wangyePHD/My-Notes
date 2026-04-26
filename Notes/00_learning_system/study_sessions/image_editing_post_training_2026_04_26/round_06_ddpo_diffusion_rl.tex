@@ -189,6 +189,192 @@ z_{t-1}
 \textbf{直觉：} 如果这次采样出的 $z_{t-1}$ 很靠近模型均值 $\mu_\theta$，那这一步 logprob 高；如果偏得很远，logprob 低。
 \end{intubox}
 
+\subsubsection{追问：这个高斯 Logprob 公式怎么来的}
+
+这个公式来自多维高斯分布的概率密度。
+
+先从一个抽象变量写起。假设：
+
+\[
+a\sim\mathcal{N}(\mu,\sigma^2 I)
+\]
+
+其中 $a,\mu\in\mathbb{R}^d$。多维高斯密度是：
+
+\[
+p(a)
+=
+\frac{1}
+{(2\pi)^{d/2}|\Sigma|^{1/2}}
+\exp
+\left(
+-
+\frac{1}{2}
+(a-\mu)^\top
+\Sigma^{-1}
+(a-\mu)
+\right)
+\]
+
+这里协方差矩阵是：
+
+\[
+\Sigma=\sigma^2 I
+\]
+
+所以它的逆矩阵是：
+
+\[
+\Sigma^{-1}
+=
+\frac{1}{\sigma^2}I
+\]
+
+行列式是：
+
+\[
+|\Sigma|
+=
+|\sigma^2 I|
+=
+(\sigma^2)^d
+\]
+
+把这两个代入高斯密度：
+
+\[
+p(a)
+=
+\frac{1}
+{(2\pi)^{d/2}(\sigma^2)^{d/2}}
+\exp
+\left(
+-
+\frac{\|a-\mu\|^2}{2\sigma^2}
+\right)
+\]
+
+也就是：
+
+\[
+p(a)
+=
+\frac{1}
+{(2\pi\sigma^2)^{d/2}}
+\exp
+\left(
+-
+\frac{\|a-\mu\|^2}{2\sigma^2}
+\right)
+\]
+
+现在对两边取 log：
+
+\[
+\log p(a)
+=
+\log
+\left[
+\frac{1}
+{(2\pi\sigma^2)^{d/2}}
+\exp
+\left(
+-
+\frac{\|a-\mu\|^2}{2\sigma^2}
+\right)
+\right]
+\]
+
+利用：
+
+\[
+\log(AB)=\log A+\log B
+\]
+
+以及：
+
+\[
+\log(\exp(u))=u
+\]
+
+得到：
+
+\[
+\log p(a)
+=
+-
+\frac{d}{2}\log(2\pi\sigma^2)
+-
+\frac{\|a-\mu\|^2}{2\sigma^2}
+\]
+
+通常把误差项放前面：
+
+\[
+\log p(a)
+=
+-
+\frac{\|a-\mu\|^2}{2\sigma^2}
+-
+\frac{d}{2}\log(2\pi\sigma^2)
+\]
+
+现在把 diffusion 里的变量代进去：
+
+\[
+a=z_{t-1}
+\]
+
+\[
+\mu=\mu_\theta(z_t,t,x)
+\]
+
+\[
+\sigma^2=\sigma_t^2
+\]
+
+就得到：
+
+\[
+\log
+p_\theta(z_{t-1}\mid z_t,x,t)
+=
+-
+\frac{
+\left\|
+z_{t-1}
+-
+\mu_\theta(z_t,t,x)
+\right\|^2
+}{
+2\sigma_t^2
+}
+-
+\frac{d}{2}\log(2\pi\sigma_t^2)
+\]
+
+\begin{summarybox}
+\textbf{一句话：} 这个 logprob 就是在问：真实采样出来的下一步 $z_{t-1}$，在以模型均值 $\mu_\theta(z_t,t,x)$ 为中心、方差为 $\sigma_t^2 I$ 的高斯分布下，概率密度有多大。
+\end{summarybox}
+
+\begin{warnbox}
+\textbf{和 SDE 记号的差别：} 如果一步更新写成
+\[
+x_{t-\Delta t}
+=
+\mu_\theta(x_t,t,c)
++
+\sigma_t\sqrt{\Delta t}\epsilon
+\]
+那么高斯方差是 $\sigma_t^2\Delta t I$，logprob 里的分母和常数项也要变成：
+\[
+2\sigma_t^2\Delta t,
+\qquad
+\frac{d}{2}\log(2\pi\sigma_t^2\Delta t)
+\]
+本节 DDPO 公式里写的是 scheduler 已经给定一步方差 $\sigma_t^2 I$ 的形式。
+\end{warnbox}
+
 \subsubsection{整条 Trajectory 的 Logprob}
 
 一条完整去噪轨迹的概率是每一步概率相乘：
