@@ -602,6 +602,276 @@ b_{u,v}
 \text{最终编辑质量}
 \]
 
+\begin{center}
+\includegraphics[width=\linewidth]{imgs/thinkRL.png}
+
+{\small\textbf{图：ThinkRL-Edit 架构图。}它把 reasoning sampling、checklist reward、unbiased chain preference grouping、decoupled Und-Gen optimization 放在同一个 RL 闭环里。}
+\end{center}
+
+这张图可以按 4 个模块读。
+
+\textbf{模块 1：CoT-based Reasoning Sampling。}
+
+普通 Flow-GRPO 的探索主要发生在 denoising / flow trajectory：
+
+\[
+x_t
+\rightarrow
+x_{t-1}
+\rightarrow
+\cdots
+\rightarrow
+x_0
+\]
+
+也就是改变采样噪声。但 ThinkRL-Edit 认为 reasoning-centric editing 的关键随机性应该发生在语义空间：
+
+\[
+\text{reasoning path}
+\rightarrow
+\text{understanding}
+\rightarrow
+\text{generation}
+\]
+
+论文算法里，初始 policy 被拆成：
+
+\[
+\pi_\theta
+=
+\left(
+\pi_\theta^\text{Und},
+\pi_\theta^\text{Gen}
+\right)
+\]
+
+给定输入图像 $\mathbf{p}$ 和编辑指令 $\mathbf{c}$，先用旧的 understanding policy 生成 reasoning-enhanced prompt：
+
+\[
+\mathbf{c}'
+\sim
+\pi_{\theta_\text{old}}^\text{Und}
+(\cdot\mid \mathbf{p},\mathbf{c})
+\]
+
+然后用 $\mathbf{c}'$ 生成第一批 $G$ 个编辑结果：
+
+\[
+\{\mathbf{o}_i\}_{i=1}^{G}
+\sim
+\pi_{\theta_\text{old}}
+(\cdot\mid \mathbf{p},\mathbf{c}')
+\]
+
+接着模型对这些结果做一次 reflection，得到反思后的 prompt：
+
+\[
+\mathbf{c}''_i
+\sim
+\pi_{\theta_\text{old}}^\text{Und}
+(\cdot\mid \mathbf{o}_i,\mathbf{p},\mathbf{c}')
+\]
+
+再用 $\mathbf{c}''$ 生成第二批 reflected samples：
+
+\[
+\{\mathbf{o}_i\}_{i=G+1}^{2G}
+\sim
+\pi_{\theta_\text{old}}
+(\cdot\mid \mathbf{p},\mathbf{c}'')
+\]
+
+所以它不是只采样不同图像，而是采样不同“思考路径”和“反思路径”。
+
+\begin{intubox}
+\textbf{直觉：}\\
+Flow-GRPO 是在“怎么画”上探索；ThinkRL-Edit 还要在“怎么理解这条编辑指令”上探索。复杂编辑里，理解错了，后面的生成轨迹再怎么优化也只是把错误画得更漂亮。
+\end{intubox}
+
+\textbf{模块 2：Fine-Grained Reasoning Reward。}
+
+普通 VLM reward 常见做法是让 VLM 给一个区间分：
+
+\[
+\text{score}
+\in
+\{1,2,3,4,5\}
+\]
+
+ThinkRL-Edit 认为这种 interval score 在复杂推理编辑里不稳定，于是改成 sample-specific checklist。比如图里的指令是修正图像中不合理部分，checklist 会拆成：
+
+\[
+\begin{aligned}
+q_1 &: \text{马的后半身是否完整可见？}\\
+q_2 &: \text{车的前半部分是否可见并且连接到马？}\\
+q_3 &: \text{原来的汽车是否已经不在图中？}
+\end{aligned}
+\]
+
+VLM 不再给模糊分数，而是对每个问题回答 yes / no。对第 $i$ 个样本：
+
+\[
+R_\text{check}(\mathbf{o}_i)
+=
+\frac{1}{M}
+\sum_{m=1}^{M}
+\mathbb{I}
+\left[
+\text{VLM says yes to } q_m
+\right]
+\]
+
+图中每张候选图下面的 0.76、0.00、1.00，就是 checklist 通过率式的分数。
+
+\textbf{模块 3：Unbiased Chain Preference Grouping。}
+
+图像编辑的 reward 不是一维的。论文同时看：
+
+\[
+\text{Instruction Following}
+\quad
+\text{Image Consistency}
+\quad
+\text{Image Quality}
+\]
+
+如果直接加权：
+
+\[
+R_i
+=
+\sum_{k=1}^{K}
+w_k r_i^k
+\]
+
+权重 $w_k$ 会引入偏置。比如 consistency 权重大，模型可能什么都不改；instruction 权重大，模型可能过度编辑。
+
+ThinkRL-Edit 的做法是保留多维 reward：
+
+\[
+\mathbf{r}_i
+=
+\left(
+r_i^1,
+r_i^2,
+\ldots,
+r_i^K
+\right)
+\]
+
+然后找一条在多个维度上排序一致的 preference chain：
+
+\[
+\mathbf{r}_{i_1}
+\preceq
+\mathbf{r}_{i_2}
+\preceq
+\cdots
+\preceq
+\mathbf{r}_{i_N}
+\]
+
+也就是：被放进同一条链的样本，不能是“这个样本 instruction 高但 quality 低，另一个 quality 高但 consistency 低”这种互相打架的关系。链上的样本才参与 advantage 计算。
+
+论文算法里，对链上第 $i$ 个样本：
+
+\[
+A_i
+=
+\frac{
+\sum_{k=1}^{K}r_i^k
+-
+K\mu
+}{
+K\sigma
+}
+\]
+
+其中 $\mu,\sigma$ 是当前 preference chain 上的均值和标准差统计。
+
+\begin{warnbox}
+\textbf{为什么叫 unbiased：}\\
+它不是说完全没有偏差，而是相对“手写权重加权求和”更少引入人为目标偏置。只有在多个 reward 维度上形成一致偏好顺序的样本，才被用来更新策略。
+\end{warnbox}
+
+\textbf{模块 4：Decoupled Und-Gen Optimization。}
+
+普通 Flow-GRPO 只更新 generation trajectory：
+
+\[
+r_{\text{Gen},t}^{i}
+=
+\frac{
+p_\theta(x_{t-1}^i\mid x_t^i,c)
+}{
+p_{\theta_\text{old}}(x_{t-1}^i\mid x_t^i,c)
+}
+\]
+
+ThinkRL-Edit 还要更新 understanding / reasoning 侧。对第 $i$ 条 reasoning / understanding token 序列 $y^i$，它计算：
+
+\[
+r_\text{Und}^{i}
+=
+\frac{
+p_\theta^\text{Und}(y^i\mid x)
+}{
+p_{\theta_\text{old}}^\text{Und}(y^i\mid x)
+}
+\]
+
+展开就是整段 token logprob 的差：
+
+\[
+r_\text{Und}^{i}
+=
+\exp
+\left(
+\sum_t
+\log p_\theta^\text{Und}
+(y_t^i\mid x,y_{<t}^{i})
+-
+\sum_t
+\log p_{\theta_\text{old}}^\text{Und}
+(y_t^i\mid x,y_{<t}^{i})
+\right)
+\]
+
+于是同一个 grouped advantage $A_i$ 会用于两类更新：
+
+\[
+\mathcal{J}_\text{Und}
+=
+\mathbb{E}
+\left[
+f(r_\text{Und},A)
+\right]
+\]
+
+\[
+\mathcal{J}_\text{Gen}
+=
+\mathbb{E}
+\left[
+f(r_\text{Gen},A)
+\right]
+\]
+
+图里右下角的火焰符号就在表示：reasoning / understanding / generation 都会被 GRPO loss 更新，但它们用的 ratio 不同。
+
+\begin{summarybox}
+\textbf{ThinkRL-Edit 的核心：}\\
+它把图像编辑策略从单一的“生成策略”扩展成：
+\[
+\text{理解 / 推理策略}
+\quad
++
+\quad
+\text{图像生成策略}
+\]
+再用 checklist reward 和 unbiased preference chain 给这两部分共同分配 advantage。这样 RL 优化的不只是“生成结果像不像”，而是“推理路径是否帮助最终编辑成功”。
+\end{summarybox}
+
 \begin{summarybox}
 \textbf{这条主线的核心：}\\
 RePlan 和 ThinkRL-Edit 都在说：复杂图像编辑不能只靠 denoising 随机性探索。更重要的是先把编辑任务变成显式 plan，再用 RL 奖励好的 plan。
