@@ -334,6 +334,233 @@ c
 普通编辑模型像是“看一句话然后整张图一起改”。RePlan 像是先拿笔在图上圈出每个要处理的区域，再给每个区域单独贴一张小纸条：这里改什么、那里保持什么。这样复杂编辑就不再完全依赖模型自己在隐空间里猜。
 \end{intubox}
 
+\textbf{RePlan 细节：Patch Grouping 和 Attention Mask Injection。}
+
+论文里 RePlan 的编辑器基于 MMDiT。普通 MMDiT 会把文本 token、原图 image token、当前 noised latent token 拼成一条序列：
+
+\[
+F^\text{text}
+=
+E_\text{text}(\mathcal{T}),
+\qquad
+F^\text{img}
+=
+E_\text{img}(I)
+\]
+
+\[
+X^{(0)}
+=
+\left[
+F^\text{text}
+\;\|\;
+F^\text{img}
+\;\|\;
+\mathbf{z}_t
+\right]
+\]
+
+其中 $\mathbf{z}_t$ 是当前 diffusion / flow step 的 noisy target latent。
+
+普通 full self-attention 的问题是：
+
+\[
+\text{Region 1 的 patch}
+\longleftrightarrow
+\text{Region 2 的 hint}
+\]
+
+也可能发生交互。这样 Region 1 可能被 Region 2 的指令污染，导致 target confusion。
+
+\textbf{第一步：先把 text hint 分组。}
+
+VLM planner 输出：
+
+\[
+\{(B_0,h_0),(B_1,h_1),\ldots,(B_K,h_K)\}
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $B_0$ 表示整张图，对应 global hint $h_0$；
+  \item $B_k$ 是第 $k$ 个局部编辑区域的 bounding box；
+  \item $h_k$ 是第 $k$ 个区域的 editing hint，也可以是 keep unchanged 这种负向提示。
+\end{itemize}
+
+这些 hint 不是拼成一句话一起编码，而是分别编码再拼接：
+
+\[
+F^\text{text}
+=
+\left[
+E_\text{text}(h_0)
+\;\|\;
+E_\text{text}(h_1)
+\;\|\;
+\cdots
+\;\|\;
+E_\text{text}(h_K)
+\right]
+\]
+
+于是得到文本 token group：
+
+\[
+G^\text{text}_0,\,
+G^\text{text}_1,\,
+\ldots,\,
+G^\text{text}_K
+\]
+
+\textbf{第二步：把 image patch 按 bbox 分组。}
+
+原图 $I$ 经过 VAE encoder 后得到二维 feature map，再 reshape 成 patch tokens：
+
+\[
+\{f_{i,j}\}_{i=1,\ldots,M;\,j=1,\ldots,N}
+\]
+
+每个 bbox $B_k$ 会被映射到这个 patch grid 上：
+
+\[
+G^\text{img}_k
+=
+\left\{
+f_{i,j}
+\mid
+(i,j)\in B_k
+\right\},
+\qquad
+k=1,\ldots,K
+\]
+
+背景组就是不属于任何局部 region 的 patch：
+
+\[
+G^\text{img}_\text{bg}
+=
+\{f_{i,j}\}_{i,j}
+\setminus
+\bigcup_{k=1}^{K}
+G^\text{img}_k
+\]
+
+\begin{warnbox}
+\textbf{注意：}\\
+这里的 bbox 不是直接在原始像素上做 attention，而是先映射到 VAE latent / patch grid。也就是说，一个 region 最后对应的是一组 image patch tokens。
+\end{warnbox}
+
+\textbf{第三步：在 attention 里注入 mask。}
+
+RePlan 不改 MMDiT 主干参数，也不额外训练 ControlNet 之类的模块，而是在每一层 attention 里加入一个二值 mask：
+
+\[
+M
+\in
+\{0,1\}^{|X|\times |X|}
+\]
+
+如果：
+
+\[
+M_{u,v}=1
+\]
+
+表示 token $u$ 可以 attend to token $v$。如果：
+
+\[
+M_{u,v}=0
+\]
+
+表示这条 attention 边被屏蔽。
+
+可以把 masked attention 写成：
+
+\[
+\text{Attn}_M(u)
+=
+\sum_v
+\text{softmax}_v
+\left(
+\frac{q_u k_v^\top}{\sqrt{d}}
++
+b_{u,v}
+\right)
+v_v
+\]
+
+其中：
+
+\[
+b_{u,v}
+=
+\begin{cases}
+0, & M_{u,v}=1 \\
+-\infty, & M_{u,v}=0
+\end{cases}
+\]
+
+这样 mask 不是在输出图像上后处理，而是直接改变 Transformer 内部的信息流。
+
+\textbf{第四步：mask 遵守 5 条规则。}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{组内互通：} 同一个 group 内部的 token 可以互相 attend。这样每个文本组、每个图像区域、每个 latent 区域内部不会被切碎。
+  \item \textbf{Hint isolation：} 不同 text hint group 之间不互相 attend：
+  \[
+  G^\text{text}_a
+  \not\leftrightarrow
+  G^\text{text}_b,
+  \qquad
+  a\neq b
+  \]
+  这样 Region 1 的提示不会污染 Region 2 的提示。
+  \item \textbf{Image--latent full interaction：} image tokens 和 latent tokens 保持全局连接。论文强调不能把图像不同区域之间完全切断，否则区域边缘会出现明显割裂，整体一致性会变差。
+  \item \textbf{Region constraint：} 属于第 $k$ 个区域的 image patch 只看自己的 hint 和 global hint：
+  \[
+  u\in G^\text{img}_k
+  \Rightarrow
+  u
+  \text{ can attend to }
+  G^\text{text}_k
+  \cup
+  G^\text{text}_0
+  \]
+  这样局部编辑既受自己的区域指令控制，也不会丢掉全局风格 / 背景约束。
+  \item \textbf{Background constraint：} 背景 patch 只看 global hint：
+  \[
+  u\in G^\text{img}_\text{bg}
+  \Rightarrow
+  u
+  \text{ can attend to }
+  G^\text{text}_0
+  \]
+  这样背景不会被局部编辑提示污染。
+\end{enumerate}
+
+论文附录还补了两个细节：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{bbox 重叠：} 如果两个 bbox 重叠，重叠 patch 可以同时 attend 到对应的多个 hint。因为 image patch 之间仍保留 full self-attention，模型可以自己协调这些 sub-edits。
+  \item \textbf{bbox 扰动鲁棒性：} 只要 bbox 还大致对应正确目标，像素级误差影响不大；论文做了 bbox corner 随机 scale / shift 扰动实验，直到较大扰动前整体分数仍较稳定。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{RePlan attention injection 的本质：}\\
+它不是简单地“把区域提示拼进 prompt”，而是把文本 hint 和图像 patch 都分组，然后用 attention mask 规定信息流：
+\[
+\text{每个编辑区域}
+\longleftrightarrow
+\text{自己的 hint}
+\quad
+\text{背景}
+\longleftrightarrow
+\text{global hint}
+\]
+同时保留 image--latent 的全局交互，避免区域边界割裂。
+\end{summarybox}
+
 \textbf{ThinkRL-Edit} 更进一步，把 reasoning exploration 从 denoising 随机性里拿出来。普通图像 RL 的探索主要来自：
 
 \[
