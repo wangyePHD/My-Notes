@@ -1,0 +1,876 @@
+% ============================================================
+% Round 07: Flow-GRPO / LeapAlign
+% ============================================================
+
+\subsection{Round 07：Flow-GRPO 与 LeapAlign}
+
+\subsubsection{Highlight}
+
+\begin{conceptbox}
+\textbf{本章相关脉络：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Flow-GRPO}：arXiv 2025-05-08，NeurIPS 2025，Training Flow Matching Models via Online RL。核心是把 deterministic ODE 转成可采样、可算 logprob 的 SDE，再用 GRPO 做 online RL。论文：\url{https://arxiv.org/abs/2505.05470}，代码：\url{https://github.com/yifan123/flow_grpo}
+  \item \textbf{Flow-GRPO 官方实现}：2025-08-15 加入 Qwen-Image / Qwen-Image-Edit 支持；2025-08-04 加入 FLUX.1-Kontext-dev 图像编辑 pipeline。仓库：\url{https://github.com/yifan123/flow_grpo}
+  \item \textbf{LeapAlign}：arXiv 2026-04-16，CVPR 2026，Post-Training Flow Matching Models at Any Generation Step by Building Two-Step Trajectories。它不是 policy gradient，而是把长 ODE 轨迹压缩成 two-step leap trajectory，让 reward gradient 可以稳定传到早期生成步骤。论文：\url{https://arxiv.org/abs/2604.15311}，项目页：\url{https://rockeycoss.github.io/leapalign/}
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{本章要解决的问题}
+
+上一章 DDPO 解决的是 diffusion model 的 RL：
+
+\[
+p_\theta(z_{t-1}\mid z_t,x,t)
+\]
+
+每一步本来就是随机转移，所以可以算：
+
+\[
+\log p_\theta(z_{t-1}\mid z_t,x,t)
+\]
+
+然后做 PPO / DDPO ratio。
+
+Flow Matching 的问题更麻烦。它的采样默认是 ODE：
+
+\[
+\frac{dx_t}{dt}
+=
+v_\theta(x_t,t,x)
+\]
+
+离散采样时：
+
+\[
+x_{t-\Delta t}
+=
+x_t-\Delta t\,v_\theta(x_t,t,x)
+\]
+
+这是确定性的。
+
+因此它默认没有一个像 diffusion 那样好用的：
+
+\[
+p_\theta(x_{t-\Delta t}\mid x_t,x,t)
+\]
+
+\begin{warnbox}
+\textbf{Flow RL 的核心难点：} DDPO 可以直接把 diffusion reverse transition 当 policy；Flow Matching 的 ODE transition 默认只是一个点，不是一个普通概率分布，所以不能直接做 logprob ratio。
+\end{warnbox}
+
+\subsubsection{从 DDPO 到 Flow-GRPO 的概念迁移}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+\textbf{概念} & \textbf{DDPO / Diffusion RL} & \textbf{Flow-GRPO} \\
+\hline
+生成过程
+&
+随机 denoising chain
+&
+默认确定性 ODE flow
+\\
+每步转移
+&
+$p_\theta(z_{t-1}\mid z_t,x,t)$
+&
+先把 ODE 转成 SDE，得到 $p_\theta(x_{t-\Delta t}\mid x_t,x,t)$
+\\
+Action
+&
+下一步 latent $z_{t-1}$
+&
+下一步 latent $x_{t-\Delta t}$
+\\
+Logprob
+&
+天然来自 Gaussian reverse transition
+&
+来自 ODE-to-SDE 后的 Gaussian transition
+\\
+Advantage
+&
+reward baseline / PPO advantage
+&
+group-relative advantage
+\\
+Ratio
+&
+新旧 denoising transition probability ratio
+&
+新旧 flow transition probability ratio
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{一句话：} Flow-GRPO 的目标不是重新发明 PPO，而是先让 flow transition 变成可采样、可算 logprob 的随机策略，然后把 GRPO 的 group-relative ratio loss 接上去。
+\end{summarybox}
+
+\subsubsection{第一步：把 ODE 写成一步均值}
+
+按照本笔记前面的时间约定，$t=1$ 是噪声端，$t=0$ 是干净端。采样时从大 $t$ 往小 $t$ 走。
+
+ODE 的 Euler 更新是：
+
+\[
+x_{t-\Delta t}
+=
+x_t
+-
+\Delta t\,v_\theta(x_t,t,x)
+\]
+
+把右侧记为一步均值：
+
+\[
+\mu_\theta(x_t,t,x)
+=
+x_t
+-
+\Delta t\,v_\theta(x_t,t,x)
+\]
+
+于是：
+
+\[
+x_{t-\Delta t}
+=
+\mu_\theta(x_t,t,x)
+\]
+
+这个式子说明：给定 $x_t$、时间 $t$ 和条件 $x$，下一步只有一个确定点。
+
+如果硬写成概率分布：
+
+\[
+p_\theta(x_{t-\Delta t}\mid x_t,x,t)
+=
+\delta
+\left(
+x_{t-\Delta t}
+-
+\mu_\theta(x_t,t,x)
+\right)
+\]
+
+这是 Dirac delta，不是普通高斯密度。
+
+\begin{intubox}
+\textbf{直觉：} ODE 像导航系统直接告诉你“下一步就走到这个位置”；RL 需要的是“下一步可以在这个位置附近随机采样，并知道每个采样点概率是多少”。
+\end{intubox}
+
+\subsubsection{第二步：ODE-to-SDE，给一步更新加随机性}
+
+Flow-GRPO 的关键操作是把确定性 ODE transition 变成随机 SDE transition。
+
+离散形式可以写成：
+
+\[
+x_{t-\Delta t}
+=
+\mu_\theta(x_t,t,x)
++
+\sigma_t\sqrt{\Delta t}\,\epsilon
+\]
+
+其中：
+
+\[
+\epsilon\sim\mathcal{N}(0,I)
+\]
+
+也就是：
+
+\[
+x_{t-\Delta t}
+\sim
+\mathcal{N}
+\left(
+\mu_\theta(x_t,t,x),
+\sigma_t^2\Delta t I
+\right)
+\]
+
+于是每一步 flow transition 就有了普通高斯 logprob：
+
+\[
+\log p_\theta(x_{t-\Delta t}\mid x_t,x,t)
+=
+-
+\frac{
+\left\|
+x_{t-\Delta t}
+-
+\mu_\theta(x_t,t,x)
+\right\|^2
+}{
+2\sigma_t^2\Delta t
+}
+-
+\frac{d}{2}
+\log(2\pi\sigma_t^2\Delta t)
+\]
+
+这里 $d$ 是 latent 维度。
+
+\begin{summarybox}
+\textbf{关键变化：}\\
+ODE：
+\[
+x_{t-\Delta t}=\mu_\theta
+\]
+没有好用 logprob。\\
+SDE：
+\[
+x_{t-\Delta t}=\mu_\theta+\sigma_t\sqrt{\Delta t}\epsilon
+\]
+变成 Gaussian policy，因此可以计算 logprob。
+\end{summarybox}
+
+\subsubsection{第三步：整条 Flow Trajectory 的 Logprob}
+
+一条 flow trajectory 写成：
+
+\[
+\tau
+=
+\left(
+x_{t_K},x_{t_{K-1}},\ldots,x_{t_0}
+\right)
+\]
+
+其中：
+
+\[
+t_K=1,
+\qquad
+t_0=0
+\]
+
+在 SDE 化后，每一步都有：
+
+\[
+p_\theta(x_{t_{k-1}}\mid x_{t_k},x,t_k)
+\]
+
+所以整条轨迹的 logprob 是：
+
+\[
+\log p_\theta(\tau\mid x)
+=
+\sum_{k=1}^{K}
+\log
+p_\theta(x_{t_{k-1}}\mid x_{t_k},x,t_k)
+\]
+
+这和 DDPO 完全对应：
+
+\[
+\log p_\theta(\tau_\text{diff}\mid x)
+=
+\sum_t
+\log p_\theta(z_{t-1}\mid z_t,x,t)
+\]
+
+\begin{intubox}
+\textbf{记忆法：} DDPO 是 diffusion step logprob 求和；Flow-GRPO 是 SDE flow step logprob 求和。
+\end{intubox}
+
+\subsubsection{第四步：Group Sampling}
+
+GRPO 的核心不是训练 value model，而是对同一个条件生成一组候选，然后在组内做相对比较。
+
+图像编辑条件写成：
+
+\[
+x=(I_\text{src},c)
+\]
+
+对同一个 $x$，采样 $G$ 条 flow trajectories：
+
+\[
+\tau_1,\tau_2,\ldots,\tau_G
+\]
+
+每条轨迹得到一个最终编辑图：
+
+\[
+I_j
+=
+D_\text{VAE}(x_{t_0}^{(j)})
+\]
+
+然后用 reward model / scorer 打分：
+
+\[
+R_j
+=
+R(I_\text{src},c,I_j)
+\]
+
+组内 advantage 是：
+
+\[
+A_j
+=
+\frac{
+R_j-\text{mean}(R_1,\ldots,R_G)
+}{
+\text{std}(R_1,\ldots,R_G)+\epsilon
+}
+\]
+
+\begin{summarybox}
+\textbf{GRPO 的直觉：}\\
+不需要知道某张图的绝对 reward 是否可靠，只要在同一个原图和同一个编辑指令下，知道哪几张图相对更好、哪几张图相对更差。
+\end{summarybox}
+
+\subsubsection{第五步：Flow-GRPO 的 Ratio}
+
+采样时使用 old policy：
+
+\[
+\tau_j\sim p_{\theta_\text{old}}(\tau\mid x)
+\]
+
+对轨迹中的每一步，记录旧 logprob：
+
+\[
+\log p_{\theta_\text{old}}
+\left(
+x_{t_{k-1}}^{(j)}
+\mid
+x_{t_k}^{(j)},x,t_k
+\right)
+\]
+
+更新时，用当前模型重新计算新 logprob：
+
+\[
+\log p_\theta
+\left(
+x_{t_{k-1}}^{(j)}
+\mid
+x_{t_k}^{(j)},x,t_k
+\right)
+\]
+
+每一步 ratio 是：
+
+\[
+r_{j,k}(\theta)
+=
+\exp
+\left(
+\log p_\theta
+\left(
+x_{t_{k-1}}^{(j)}
+\mid
+x_{t_k}^{(j)},x,t_k
+\right)
+-
+\log p_{\theta_\text{old}}
+\left(
+x_{t_{k-1}}^{(j)}
+\mid
+x_{t_k}^{(j)},x,t_k
+\right)
+\right)
+\]
+
+它的含义是：
+
+\[
+\text{同一个 flow transition，在新模型下比旧模型下更可能还是更不可能}
+\]
+
+Flow-GRPO 的 clipped objective 可以抽象写成：
+
+\[
+\mathcal{L}_\text{Flow-GRPO}
+=
+-
+\mathbb{E}
+\left[
+\frac{1}{G}
+\sum_{j=1}^{G}
+\sum_{k=1}^{K}
+\min
+\left(
+r_{j,k}(\theta)A_j,
+\text{clip}(r_{j,k}(\theta),1-\epsilon,1+\epsilon)A_j
+\right)
+\right]
+\]
+
+如果 $A_j>0$，说明第 $j$ 个样本在组内比较好，训练会提高它的 trajectory probability。\\
+如果 $A_j<0$，说明第 $j$ 个样本在组内比较差，训练会降低它的 trajectory probability。
+
+\begin{intubox}
+\textbf{直觉：} Flow-GRPO 不是直接告诉模型“应该怎么画”，而是告诉模型：“同一批候选里，高分轨迹更值得重复，低分轨迹更不值得重复”。
+\end{intubox}
+
+\subsubsection{图像编辑版 Flow-GRPO}
+
+在 text-to-image 里，条件通常是：
+
+\[
+x=c_\text{text}
+\]
+
+在图像编辑里，条件变成：
+
+\[
+x=(I_\text{src},c)
+\]
+
+每一步 SDE transition 写成：
+
+\[
+p_\theta
+\left(
+x_{t_{k-1}}
+\mid
+x_{t_k},
+I_\text{src},
+c,
+t_k
+\right)
+\]
+
+最终 reward 必须同时评价：
+
+\[
+\text{编辑是否正确}
+\quad
+\text{原图是否保持}
+\quad
+\text{图像质量是否高}
+\quad
+\text{人类是否偏好}
+\]
+
+所以可以写成：
+
+\[
+R_j
+=
+w_\text{inst}R_\text{inst}^{(j)}
++
+w_\text{pres}R_\text{pres}^{(j)}
++
+w_\text{qual}R_\text{qual}^{(j)}
++
+w_\text{pref}R_\text{pref}^{(j)}
+\]
+
+其中 preservation reward 尤其重要：
+
+\[
+R_\text{pres}^{(j)}
+=
+\cos
+\left(
+\phi(I_j),
+\phi(I_\text{src})
+\right)
+\]
+
+或者在 mask 外区域计算：
+
+\[
+R_\text{pres}^{(j)}
+=
+-
+\text{LPIPS}
+\left(
+(1-m)\odot I_j,
+(1-m)\odot I_\text{src}
+\right)
+\]
+
+\begin{warnbox}
+\textbf{编辑侧风险：} 如果 Flow-GRPO 只优化 PickScore / HPS / aesthetic reward，很容易把任务变成“重新生成一张漂亮图”。图像编辑必须有 source-image preservation 约束。
+\end{warnbox}
+
+\subsubsection{Flow-GRPO 为什么要 Denoising Reduction}
+
+Flow-GRPO 的代价很高，因为每条 trajectory 有很多步：
+
+\[
+K\text{ steps}
+\]
+
+每个 condition 又要采样一组：
+
+\[
+G\text{ samples}
+\]
+
+如果每一步都算 logprob 和 ratio，训练成本大致随：
+
+\[
+G\times K
+\]
+
+增长。
+
+所以 Flow-GRPO 提出 Denoising Reduction：训练时减少参与 RL 更新的 denoising / flow steps，但推理时仍保留原来的完整采样步数。
+
+抽象地说，不再对所有时间步求和：
+
+\[
+\sum_{k=1}^{K}
+\log p_\theta(x_{t_{k-1}}\mid x_{t_k},x,t_k)
+\]
+
+而是只选一个子集 $\mathcal{S}$：
+
+\[
+\sum_{k\in\mathcal{S}}
+\log p_\theta(x_{t_{k-1}}\mid x_{t_k},x,t_k)
+\]
+
+这样能显著减少训练成本。
+
+官方实现后续还加入了 Flow-GRPO-Fast：可以在 deterministic ODE trajectory 的某一个或两个中间 step 注入噪声，生成 group，只训练这些随机分叉点附近的 step。
+
+\begin{intubox}
+\textbf{直觉：} 完整 Flow-GRPO 是“整条轨迹都做 RL”；Denoising Reduction / Flow-GRPO-Fast 是“只挑关键几个步做 RL”，从而降低训练成本。
+\end{intubox}
+
+\subsubsection{Flow-GRPO 和 DDPO 的本质区别}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+\textbf{问题} & \textbf{DDPO} & \textbf{Flow-GRPO} \\
+\hline
+底座模型
+&
+Diffusion model
+&
+Flow matching model
+\\
+原始采样
+&
+通常已经是随机反向过程
+&
+通常是 deterministic ODE
+\\
+logprob 来源
+&
+reverse Gaussian transition
+&
+ODE-to-SDE 后的 Gaussian transition
+\\
+advantage
+&
+reward baseline / PPO advantage
+&
+group-relative advantage
+\\
+是否需要 value model
+&
+可以有，也可以不用
+&
+通常不训练 value model
+\\
+主要工程难点
+&
+采样成本、reward 方差
+&
+SDE 化、step logprob、训练步数成本
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{最小区分：}\\
+DDPO 的难点是“怎么把最终 reward 分给 diffusion steps”；Flow-GRPO 的额外难点是“Flow ODE 先天没有 step probability，必须先变成 SDE 才能做 ratio”。
+\end{summarybox}
+
+\subsubsection{LeapAlign：另一条 Flow 后训练路线}
+
+Flow-GRPO 是 policy-gradient 路线：
+
+\[
+\text{sample}
+\Rightarrow
+\text{reward}
+\Rightarrow
+\text{logprob ratio update}
+\]
+
+LeapAlign 是 direct-gradient 路线：
+
+\[
+\text{reward}
+\Rightarrow
+\text{直接反传穿过 flow trajectory}
+\]
+
+问题是，完整 flow trajectory 很长。直接反传会带来：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 显存成本高；
+  \item 梯度容易爆炸；
+  \item 很难稳定更新早期生成步骤；
+  \item 早期步骤往往决定整体布局和全局结构。
+\end{itemize}
+
+LeapAlign 的想法是：不要穿过完整长轨迹，而是构造 two-step leap trajectory。
+
+假设从完整 ODE 轨迹中选两个时间点：
+
+\[
+k>j>0
+\]
+
+第一跳从 $x_k$ 直接预测到 $x_j$：
+
+\[
+\hat{x}_{j\mid k}
+=
+x_k
+-
+(k-j)
+v_\theta(x_k,k,x)
+\]
+
+然后用 latent connector 把预测点接回真实轨迹点：
+
+\[
+x_j
+=
+\hat{x}_{j\mid k}
++
+\text{stop\_gradient}
+\left(
+x_j-\hat{x}_{j\mid k}
+\right)
+\]
+
+第二跳从 $x_j$ 直接预测到 clean 端：
+
+\[
+\hat{x}_{0\mid j}
+=
+x_j
+-
+j
+v_\theta(x_j,j,x)
+\]
+
+再接回真实 $x_0$：
+
+\[
+x_0
+=
+\hat{x}_{0\mid j}
++
+\text{stop\_gradient}
+\left(
+x_0-\hat{x}_{0\mid j}
+\right)
+\]
+
+所以完整长路径被压缩成：
+
+\[
+x_k
+\Rightarrow
+\hat{x}_{j\mid k}
+\Rightarrow
+x_j
+\Rightarrow
+\hat{x}_{0\mid j}
+\Rightarrow
+x_0
+\]
+
+\begin{intubox}
+\textbf{直觉：} LeapAlign 让模型学会“跳步预测”：不是一步一步走完整 ODE，而是从中间时刻直接跳到更靠近最终图像的位置。这样 reward gradient 只需要穿过两次 leap，而不是几十步采样。
+\end{intubox}
+
+\subsubsection{LeapAlign 的 Reward Objective}
+
+LeapAlign 使用最终图像 reward：
+
+\[
+r(x_0)
+\]
+
+可以写一个 hinge-style loss：
+
+\[
+\mathcal{L}_\text{raw}
+=
+\max(0,\lambda-r(x_0))
+\]
+
+如果 reward 已经高于阈值 $\lambda$，loss 为 0；如果 reward 低于阈值，就推动模型提高 reward。
+
+但不是所有 leap trajectory 都可靠。如果 leap 预测偏离真实长路径太远，反传信号就不可信。于是可以用 trajectory similarity 做权重。
+
+例如：
+
+\[
+d_j
+=
+\text{mean}
+\left(
+|x_j-\hat{x}_{j\mid k}|
+\right)
+\]
+
+\[
+d_0
+=
+\text{mean}
+\left(
+|x_0-\hat{x}_{0\mid j}|
+\right)
+\]
+
+定义：
+
+\[
+w_\text{sim}
+=
+\frac{1}
+{\max(d_j,\tau)+\max(d_0,\tau)}
+\]
+
+最终 loss：
+
+\[
+\mathcal{L}
+=
+\text{stop\_gradient}(w_\text{sim})
+\mathcal{L}_\text{raw}
+\]
+
+\begin{summarybox}
+\textbf{LeapAlign 的核心：}\\
+用 two-step leap trajectory 缩短反传路径，让 reward gradient 能更稳定地更新任意生成步骤，尤其是早期控制布局的步骤。
+\end{summarybox}
+
+\subsubsection{Flow-GRPO 和 LeapAlign 的关系}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+\textbf{维度} & \textbf{Flow-GRPO} & \textbf{LeapAlign} \\
+\hline
+路线
+&
+Policy gradient / GRPO
+&
+Direct reward backpropagation
+\\
+是否需要 logprob
+&
+需要，所以要 ODE-to-SDE
+&
+不需要 logprob
+\\
+是否要求 reward 可微
+&
+不要求，只要能打分
+&
+更依赖可微 reward 或可反传 surrogate
+\\
+训练信号
+&
+group-relative advantage
+&
+reward gradient
+\\
+主要成本
+&
+采样多、ratio 计算多
+&
+反传轨迹显存和梯度稳定性
+\\
+核心技巧
+&
+SDE 化 + GRPO ratio + denoising reduction
+&
+two-step leap trajectory + similarity weighting + gradient discounting
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{不要混淆：} Flow-GRPO 和 LeapAlign 都是 flow matching 后训练，但不是同一个范式。Flow-GRPO 是“采样后用 reward 做 RL”；LeapAlign 是“让 reward 梯度直接穿过短轨迹反传”。
+\end{warnbox}
+
+\subsubsection{图像编辑里该怎么选}
+
+如果 reward 是黑盒或离散 judge，例如：
+
+\[
+\text{VLM judge score}
+\]
+
+\[
+\text{human preference scorer}
+\]
+
+\[
+\text{OCR / object counting / rule-based reward}
+\]
+
+那么 Flow-GRPO 更自然，因为 policy gradient 不要求 reward 可微。
+
+如果 reward 是可微的，例如某些 CLIP / HPS / differentiable aesthetic scorer，并且希望更高效地把梯度传给早期生成步骤，那么 LeapAlign 这类 direct-gradient 方法很有吸引力。
+
+图像编辑任务里，实践上通常还要看：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 是否有可靠的 preservation reward；
+  \item reward 是否可微；
+  \item 训练预算是否允许 group sampling；
+  \item 是否需要在线探索；
+  \item 是否容易 reward hacking；
+  \item 底座模型是 diffusion 还是 flow matching。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} Flow-GRPO 更像“用采样结果的好坏来调策略”；LeapAlign 更像“直接把评价器的梯度塞回生成过程”。前者适合黑盒 reward，后者适合可微 reward。
+\end{intubox}
+
+\subsubsection{本章最小结论}
+
+\begin{summarybox}
+\textbf{Flow-GRPO 的核心：}\\
+Flow Matching 默认是 deterministic ODE，没有好用的 logprob。Flow-GRPO 先通过 ODE-to-SDE 把每一步 transition 变成 Gaussian policy，再对同一个条件采样 group，用 group-relative reward 构造 advantage，最后用新旧 step logprob ratio 做 GRPO 更新。\\
+\textbf{LeapAlign 的核心：}\\
+它不是 RL ratio 路线，而是 direct-gradient 路线。通过 two-step leap trajectory 缩短反传路径，让 reward gradient 能稳定更新任意 flow generation step，尤其是早期布局步骤。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Flow Matching 的 ODE 为什么默认不能直接做 PPO / GRPO？
+  \item ODE-to-SDE 后，每一步 transition 的 logprob 是怎么来的？
+  \item Flow-GRPO 的 group-relative advantage 是什么？
+  \item Flow-GRPO 的 ratio 和 DDPO 的 ratio 有什么对应关系？
+  \item 图像编辑版 Flow-GRPO 为什么必须有 preservation reward？
+  \item Denoising Reduction / Flow-GRPO-Fast 解决的是什么成本问题？
+  \item LeapAlign 为什么不用 logprob？
+  \item Flow-GRPO 和 LeapAlign 分别适合什么类型的 reward？
+\end{enumerate}
