@@ -1,0 +1,504 @@
+% ============================================================
+% Round 03: Image Editing SFT
+% ============================================================
+
+\subsection{Round 03：图像编辑模型 SFT}
+
+\subsubsection{Highlight}
+
+\begin{conceptbox}
+\textbf{本章相关脉络：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{InstructPix2Pix}：arXiv 2022-11-17，代表了“用指令编辑三元组训练 conditional diffusion editor”的经典路线。论文：\url{https://arxiv.org/abs/2211.09800}，代码：\url{https://github.com/timothybrooks/instruct-pix2pix}
+  \item \textbf{MagicBrush}：arXiv 2023-06-16，NeurIPS 2023，手工标注的 instruction-guided real image editing 数据集，核心数据是 source image、instruction、target image 三元组。论文：\url{https://arxiv.org/abs/2306.10012}，代码/数据：\url{https://github.com/OSU-NLP-Group/MagicBrush}
+  \item \textbf{Qwen-Image-Edit}：2025-08 发布的现代图像编辑模型路线，强调把输入图像同时送入 VLM 侧做语义控制、送入 VAE encoder 侧做外观控制。模型卡：\url{https://huggingface.co/Qwen/Qwen-Image-Edit}
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{本章要解决的问题}
+
+上一章我们只解决了生成轨迹的问题：
+
+\[
+\text{diffusion / flow 如何从噪声走到图像}
+\]
+
+这一章开始进入后训练的第一步：SFT。
+
+文本侧 SFT 是：
+
+\[
+(x,y^*)
+\quad\Rightarrow\quad
+\text{让模型更容易输出标准答案 } y^*
+\]
+
+图像编辑侧 SFT 是：
+
+\[
+(I_\text{src}, c, I_\text{tgt})
+\quad\Rightarrow\quad
+\text{让模型学会按指令 } c \text{ 把原图 } I_\text{src} \text{ 编辑成 } I_\text{tgt}
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $I_\text{src}$ 是输入原图；
+  \item $c$ 是编辑指令；
+  \item $I_\text{tgt}$ 是监督信号，也就是理想编辑结果；
+  \item 有些数据还会提供 mask $m$，告诉模型哪些区域可以改。
+\end{itemize}
+
+所以图像编辑 SFT 的数据可以写成：
+
+\[
+\mathcal{D}_\text{SFT}
+=
+\left\{
+\left(
+I_\text{src}^{(i)},
+c^{(i)},
+I_\text{tgt}^{(i)},
+m^{(i)}
+\right)
+\right\}_{i=1}^{N}
+\]
+
+\begin{intubox}
+\textbf{直觉：} 文本 SFT 的标准答案是一段文本；图像编辑 SFT 的标准答案是一张编辑后的目标图像。
+\end{intubox}
+
+\subsubsection{先把图像编辑模型写成 Policy}
+
+从后训练角度看，图像编辑模型也是一个 policy：
+
+\[
+\pi_\theta(I_\text{edit}\mid I_\text{src},c)
+\]
+
+如果有 paired data，最自然的 SFT 目标是最大化目标图像概率：
+
+\[
+\max_\theta
+\log
+\pi_\theta(I_\text{tgt}\mid I_\text{src},c)
+\]
+
+等价地，最小化负对数似然：
+
+\[
+\mathcal{L}_\text{SFT}
+=
+-
+\mathbb{E}_{(I_\text{src},c,I_\text{tgt})}
+\left[
+\log
+\pi_\theta(I_\text{tgt}\mid I_\text{src},c)
+\right]
+\]
+
+但 diffusion / flow 模型通常不会直接像 LLM 那样给整张图一个显式 token-level likelihood。实际训练时会把这个目标改写成 denoising loss 或 flow matching loss。
+
+\begin{warnbox}
+\textbf{关键差别：} 文本 SFT 直接算 answer tokens 的 logprob；图像 diffusion / flow SFT 通常不直接算最终图片的 logprob，而是训练“中间噪声状态如何回到目标图像”。
+\end{warnbox}
+
+\subsubsection{Diffusion 编辑 SFT：监督的是 Target Image 的去噪}
+
+先把目标图像编码到 latent 空间：
+
+\[
+z_0^\text{tgt}
+=
+E_\text{VAE}(I_\text{tgt})
+\]
+
+再采样一个时间步 $t$ 和噪声 $\epsilon$：
+
+\[
+t\sim \text{Uniform}(\{1,\ldots,T\}),
+\qquad
+\epsilon\sim\mathcal{N}(0,I)
+\]
+
+根据 forward noising 公式构造带噪 target latent：
+
+\[
+z_t^\text{tgt}
+=
+\sqrt{\bar{\alpha}_t}\,z_0^\text{tgt}
++
+\sqrt{1-\bar{\alpha}_t}\,\epsilon
+\]
+
+编辑条件写成：
+
+\[
+c_\text{edit}
+=
+\left(
+I_\text{src},
+c,
+m
+\right)
+\]
+
+更具体地，在模型里它可能变成：
+
+\[
+c_\text{edit}
+=
+\left(
+E_\text{VAE}(I_\text{src}),
+E_\text{text}(c),
+m
+\right)
+\]
+
+然后模型输入是：
+
+\[
+\epsilon_\theta
+\left(
+z_t^\text{tgt},
+t,
+c_\text{edit}
+\right)
+\]
+
+如果模型采用 noise prediction，训练目标就是：
+
+\[
+\mathcal{L}_\text{diff-SFT}
+=
+\mathbb{E}
+\left[
+\left\|
+\epsilon
+-
+\epsilon_\theta
+\left(
+z_t^\text{tgt},
+t,
+c_\text{edit}
+\right)
+\right\|^2
+\right]
+\]
+
+这句话非常重要：
+
+\begin{summarybox}
+\textbf{Diffusion 编辑 SFT 的本质：}\\
+训练时不是从模型自己生成的图像开始，而是从真实目标图像 $I_\text{tgt}$ 加噪得到 $z_t^\text{tgt}$。模型要学的是：在看到原图和编辑指令时，如何把这个 noisy target latent 去噪回目标图像。
+\end{summarybox}
+
+\subsubsection{这里的 Teacher Forcing 是什么}
+
+文本侧 teacher forcing 是：
+
+\[
+\text{输入真实前缀 } y_{<i}^*
+\quad\Rightarrow\quad
+\text{训练模型预测真实下一个 token } y_i^*
+\]
+
+对应的 SFT loss 是：
+
+\[
+\mathcal{L}_\text{text-SFT}
+=
+-
+\sum_i
+\log
+\pi_\theta
+\left(
+y_i^*
+\mid
+x,
+y_{<i}^*
+\right)
+\]
+
+图像 diffusion SFT 里没有“真实前缀 token”，但有一个很相似的东西：
+
+\[
+z_t^\text{tgt}
+\sim
+q(z_t\mid z_0^\text{tgt})
+\]
+
+也就是说，训练时模型看到的中间状态不是它自己采样出来的 $z_t$，而是由真实目标图像 $I_\text{tgt}$ 加噪得到的 $z_t^\text{tgt}$。
+
+所以可以把它类比成：
+
+\[
+\text{文本 teacher forcing：给真实前缀}
+\]
+
+\[
+\text{图像 diffusion SFT：给真实目标图像对应的 noisy latent}
+\]
+
+\begin{intubox}
+\textbf{直觉：} 文本里是“不要让模型自己乱续写前缀，直接喂标准答案前缀”；图像 diffusion 里是“不要让模型自己滚出一个中间 latent，直接喂由标准目标图像加噪得到的中间 latent”。
+\end{intubox}
+
+训练时：
+
+\[
+\left(
+I_\text{src},
+c,
+z_t^\text{tgt}
+\right)
+\longrightarrow
+\text{预测噪声 / 预测 } z_0^\text{tgt}
+\]
+
+推理时：
+
+\[
+\left(
+I_\text{src},
+c,
+z_T
+\right)
+\longrightarrow
+z_{T-1}
+\longrightarrow
+\cdots
+\longrightarrow
+z_0
+\longrightarrow
+I_\text{edit}
+\]
+
+推理阶段没有 $I_\text{tgt}$，只能从噪声开始一步步采样。
+
+\begin{warnbox}
+\textbf{不要误解：} 图像编辑 SFT 不是把模型输出 decode 成图片后，再和目标图片逐像素比较。常见训练是在 latent / noise / velocity 空间里做监督，比较的是模型预测的噪声、clean latent 或 velocity。
+\end{warnbox}
+
+\subsubsection{Flow 编辑 SFT：监督的是 Target Image 的速度场}
+
+如果底座是 Flow Matching，写法更接近上一章。
+
+先编码目标图像：
+
+\[
+x_0
+=
+E_\text{VAE}(I_\text{tgt})
+\]
+
+采样噪声端：
+
+\[
+x_1\sim\mathcal{N}(0,I)
+\]
+
+构造线性路径：
+
+\[
+x_t
+=
+(1-t)x_0 + t x_1
+\]
+
+真实速度是：
+
+\[
+v^*
+=
+x_1-x_0
+\]
+
+模型输入是当前 noisy / mixed latent、时间和编辑条件：
+
+\[
+v_\theta(x_t,t,c_\text{edit})
+\]
+
+Flow SFT / Flow Matching loss 是：
+
+\[
+\mathcal{L}_\text{flow-SFT}
+=
+\mathbb{E}
+\left[
+\left\|
+v_\theta(x_t,t,c_\text{edit})
+-
+(x_1-x_0)
+\right\|^2
+\right]
+\]
+
+\begin{summarybox}
+\textbf{Diffusion SFT 和 Flow SFT 的共同点：}\\
+它们都不是直接监督最终图片的一句话描述，而是在训练中构造一个中间状态，让模型学习“从这个中间状态往目标图像方向走”的局部规则。
+\end{summarybox}
+
+\subsubsection{原图到底如何进入模型}
+
+图像编辑和 text-to-image 的关键差别在于：模型不能只看文本。
+
+编辑条件应该写成：
+
+\[
+c_\text{edit}
+=
+\left(
+I_\text{src},
+\text{instruction},
+\text{optional mask / control}
+\right)
+\]
+
+实际模型常见的输入方式包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把原图编码成 latent，与 noisy target latent 在 channel 维度拼接；
+  \item 把原图送入 image encoder / VLM，得到语义条件；
+  \item 把原图送入 VAE encoder，得到外观条件；
+  \item 把 mask 作为额外通道，告诉模型哪里允许改；
+  \item 用 cross-attention 注入文本编辑指令。
+\end{itemize}
+
+一个抽象写法是：
+
+\[
+\hat{\epsilon}
+=
+\epsilon_\theta
+\left(
+z_t^\text{tgt},
+t,
+E_\text{src}(I_\text{src}),
+E_\text{text}(c),
+m
+\right)
+\]
+
+\begin{intubox}
+\textbf{直觉：} $z_t^\text{tgt}$ 告诉模型“目标答案加噪后现在长什么样”；$I_\text{src}$ 和 instruction 告诉模型“这个目标答案应该从哪张原图、按照什么要求编辑出来”。
+\end{intubox}
+
+\subsubsection{编辑保持：只学 Target 够不够}
+
+如果数据里的 $I_\text{tgt}$ 很好，理论上 SFT 只学 target denoising 就能学到：
+
+\[
+\text{该改的地方改}
+\quad
+\text{不该改的地方保持}
+\]
+
+因为这些约束已经体现在 $I_\text{tgt}$ 里。
+
+但实际数据经常不完美，所以有些训练还会加入额外保持项。例如有 mask $m$，其中 $m=1$ 表示编辑区域，$1-m$ 表示应该保持的区域，可以写：
+
+\[
+\mathcal{L}_\text{preserve}
+=
+\left\|
+(1-m)\odot
+\left(
+\hat{I}_\text{edit}
+-
+I_\text{src}
+\right)
+\right\|_1
+\]
+
+整体目标可以抽象成：
+
+\[
+\mathcal{L}_\text{edit-SFT}
+=
+\mathcal{L}_\text{gen}
++
+\lambda_\text{preserve}\mathcal{L}_\text{preserve}
++
+\lambda_\text{perc}\mathcal{L}_\text{perceptual}
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $\mathcal{L}_\text{gen}$ 是 diffusion noise loss 或 flow velocity loss；
+  \item $\mathcal{L}_\text{preserve}$ 约束未编辑区域；
+  \item $\mathcal{L}_\text{perceptual}$ 可以是 LPIPS / DINO / identity 等感知保持项。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{注意：} 这些辅助 loss 不是所有编辑模型都必须显式使用。有些模型主要靠 paired data 的质量和模型条件设计来学保持，有些模型会在训练或后训练阶段显式加入 preservation reward / loss。
+\end{warnbox}
+
+\subsubsection{SFT 的训练流程}
+
+一个最小 diffusion editing SFT 流程是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 从数据集中取三元组 $(I_\text{src},c,I_\text{tgt})$；
+  \item 把 $I_\text{tgt}$ 编码成 latent $z_0^\text{tgt}$；
+  \item 采样时间步 $t$ 和噪声 $\epsilon$；
+  \item 构造 noisy target latent $z_t^\text{tgt}$；
+  \item 把 $(z_t^\text{tgt},t,I_\text{src},c)$ 输入模型；
+  \item 让模型预测噪声 / clean latent / velocity；
+  \item 用 MSE 或相关目标更新模型。
+\end{enumerate}
+
+压缩成一行就是：
+
+\[
+\left(
+I_\text{src},
+c,
+I_\text{tgt}
+\right)
+\Rightarrow
+z_t^\text{tgt}
+\Rightarrow
+\text{predict local denoising / velocity target}
+\]
+
+\subsubsection{为什么 SFT 还不够}
+
+SFT 是图像编辑后训练的基础，但它不是终点。
+
+主要问题有四个：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{一个指令可能有多个合理答案。} 例如“让照片更有电影感”，并没有唯一 target image。
+  \item \textbf{paired target 不一定代表人类最喜欢的结果。} 它可能只是数据集里某一个可接受答案。
+  \item \textbf{局部 denoising loss 不等于最终图像偏好。} 模型在每个噪声步上 MSE 很低，不代表最终图片最符合人类偏好。
+  \item \textbf{编辑目标之间会冲突。} 强编辑可能破坏身份保持；强保持可能导致指令执行不充分。
+\end{enumerate}
+
+所以 SFT 后面通常还要接：
+
+\[
+\text{reward model}
+\quad
+\text{preference optimization}
+\quad
+\text{RL fine-tuning}
+\]
+
+\begin{summarybox}
+\textbf{本章最小结论：}\\
+图像编辑 SFT 的核心不是“模型最终输出图片后再比对图片”，而是：用目标编辑图像构造 noisy / flow 中间状态，让模型在原图和指令条件下学习局部去噪或速度场。它对应文本 teacher forcing 的位置，是整个图像编辑后训练的监督学习底座。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 图像编辑 SFT 的一条样本通常包含哪三个核心对象？
+  \item 为什么 diffusion editing SFT 训练时要对 $I_\text{tgt}$ 加噪，而不是对 $I_\text{src}$ 加噪？
+  \item 图像 diffusion SFT 里的 teacher forcing 类比文本侧的哪个部分？
+  \item Diffusion SFT 和 Flow SFT 的监督目标分别是什么？
+  \item 为什么 SFT 之后还需要 reward model 或 preference optimization？
+\end{enumerate}

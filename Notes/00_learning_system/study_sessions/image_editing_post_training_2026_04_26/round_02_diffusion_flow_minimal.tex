@@ -308,43 +308,261 @@ v_\theta(x_t,t,c)\Delta t
 \textbf{直觉：} Diffusion 更像“逐步去噪”；Flow Matching 更像“学习一个速度场，让噪声沿着流动路径变成图像”。
 \end{intubox}
 
-\subsubsection{Flow 的 RL 难点：ODE 没有 Logprob}
+\subsubsection{追问：如何从 $x_t$ 和速度场估计干净图像}
 
-Flow Matching 默认推理是 ODE：
+这里要先确认时间约定。本笔记采用 Rectified Flow / Flow Matching 里常见的一种约定：
+
+\[
+x_t = (1-t)x_0 + t x_1
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $x_0$ 是干净图像 / clean latent；
+  \item $x_1$ 是噪声；
+  \item $t=0$ 是干净端；
+  \item $t=1$ 是噪声端。
+\end{itemize}
+
+把路径改写成：
+
+\[
+x_t = x_0 + t(x_1-x_0)
+\]
+
+所以真实速度是：
+
+\[
+v = \frac{dx_t}{dt} = x_1 - x_0
+\]
+
+模型学习的是：
+
+\[
+v_\theta(x_t,t,c) \approx x_1-x_0
+\]
+
+如果当前时刻的速度预测足够准，就可以从 $x_t$ 反推一个 clean image / clean latent 估计：
+
+\[
+\hat{x}_0
+=
+x_t - t\,v_\theta(x_t,t,c)
+\]
+
+也可以反推出噪声端估计：
+
+\[
+\hat{x}_1
+=
+x_t + (1-t)\,v_\theta(x_t,t,c)
+\]
+
+\begin{intubox}
+\textbf{直觉：} $v_\theta$ 告诉你“从干净图像走向噪声的方向”。当前 $x_t$ 已经沿这个方向走了 $t$ 的距离，所以回到干净端就往反方向走 $t\,v_\theta$。
+\end{intubox}
+
+推导很简单：
+
+\[
+x_t = x_0 + t v
+\]
+
+移项得到：
+
+\[
+x_0 = x_t - tv
+\]
+
+把 $v$ 换成模型预测的 $v_\theta$，就是：
+
+\[
+\hat{x}_0 = x_t - t\,v_\theta(x_t,t,c)
+\]
+
+\subsubsection{追问：离散形式到底是什么意思}
+
+Flow Matching 的连续采样是解 ODE：
+
+\[
+\frac{dx_t}{dt}=v_\theta(x_t,t,c)
+\]
+
+但计算机不能真的连续积分，只能把时间切成很多小步。设当前时间是 $t_k$，下一步要走到更干净的时刻：
+
+\[
+t_{k-1}=t_k-\Delta t
+\]
+
+其中 $\Delta t>0$。
+
+Euler 离散化就是：
+
+\[
+x_{t_{k-1}}
+\approx
+x_{t_k}
+-
+\Delta t\,
+v_\theta(x_{t_k},t_k,c)
+\]
+
+这就是之前写的：
 
 \[
 x_{t-\Delta t}
 =
-f_\theta(x_t,t,c)
+x_t
+-
+v_\theta(x_t,t,c)\Delta t
 \]
 
-给定当前状态 $x_t$、时间 $t$ 和条件 $c$，下一步是确定的。
+\begin{warnbox}
+\textbf{不要混淆：}
+\[
+\hat{x}_0 = x_t - t\,v_\theta(x_t,t,c)
+\]
+是“从当前 $t$ 一步估计干净端”。\\
+\[
+x_{t-\Delta t}=x_t-\Delta t\,v_\theta(x_t,t,c)
+\]
+是“只往前走一个小步”。\\
+如果 $\Delta t=t$，它们形式上就一样；但实际采样通常用很多小步积分，而不是一步直接跳到 $t=0$。
+\end{warnbox}
 
-这对生成很方便，但对 RL 很麻烦：
+多步采样可以写成：
+
+\[
+x_{t_{K}} = x_1
+\]
+
+\[
+x_{t_{k-1}}
+=
+x_{t_k}
+-
+(t_k-t_{k-1})
+v_\theta(x_{t_k},t_k,c),
+\qquad
+k=K,K-1,\ldots,1
+\]
+
+最后得到：
+
+\[
+x_{t_0}\approx x_0
+\]
+
+其中 $t_K=1$，$t_0=0$。
+
+\begin{summarybox}
+\textbf{一句话：} $\hat{x}_0=x_t-t v_\theta$ 是当前时刻的 clean 估计；ODE 离散采样是每次只走一小步 $x_{t-\Delta t}=x_t-\Delta t v_\theta$，多步累积后得到最终图像。
+\end{summarybox}
+
+\begin{warnbox}
+\textbf{时间约定提醒：} 如果论文使用反过来的约定：
+\[
+x_t=(1-t)x_\text{noise}+t x_\text{clean}
+\]
+也就是 $t=0$ 是噪声、$t=1$ 是干净图像，那么公式会变成：
+\[
+\hat{x}_0 = x_t + (1-t)v_\theta(x_t,t,c)
+\]
+所以读 Flow / Diffusion 论文时，第一件事永远是确认 $t=0$ 到底是哪一端。
+\end{warnbox}
+
+\subsubsection{Flow 的 RL 难点：ODE 没有 Logprob}
+
+先看 Flow Matching 的确定性 ODE 采样。按照本节的时间约定，我们从噪声端 $t=1$ 往干净端 $t=0$ 走，所以一步 Euler 更新是：
+
+\[
+x_{t-\Delta t}
+=
+x_t
+-
+\Delta t\,v_\theta(x_t,t,c)
+\]
+
+把右边这一项记成模型给出的下一步均值：
+
+\[
+\mu_\theta(x_t,t,c)
+=
+x_t
+-
+\Delta t\,v_\theta(x_t,t,c)
+\]
+
+于是 ODE 的一步更新可以写成：
+
+\[
+x_{t-\Delta t}
+=
+\mu_\theta(x_t,t,c)
+\]
+
+这句话的含义是：给定当前状态 $x_t$、时间 $t$ 和条件 $c$，下一步只有一个确定的答案。
+
+如果硬要把它写成概率分布，它不是一个普通的高斯分布，而是一个集中在单点上的 Dirac delta：
+
+\[
+p_\theta(x_{t-\Delta t}\mid x_t,c,t)
+=
+\delta
+\left(
+x_{t-\Delta t}
+-
+\mu_\theta(x_t,t,c)
+\right)
+\]
+
+这对普通生成是可以的，因为你只需要沿着轨迹走下去；但对 RL 很麻烦：
 
 \begin{itemize}[leftmargin=1.5em]
-  \item 没有随机性，探索弱；
-  \item 没有正常的概率密度，难以计算 $\log p_\theta(x_{t-\Delta t}\mid x_t,c,t)$；
-  \item 没有 logprob，就很难计算 PPO / GRPO 的 ratio。
+  \item 它没有可用的随机采样空间，探索很弱；
+  \item Dirac delta 不是普通密度，$\log p_\theta(x_{t-\Delta t}\mid x_t,c,t)$ 不像文本 token logprob 那样好算；
+  \item 没有稳定的 logprob，就很难做 PPO / GRPO 的 importance ratio。
 \end{itemize}
 
 \begin{warnbox}
-\textbf{核心矛盾：} 文本 PPO / diffusion RL 需要 logprob；deterministic flow ODE 默认不给你 logprob。
+\textbf{核心矛盾：} 文本 PPO / diffusion RL 需要“当前策略给这个 action 多大概率”；deterministic ODE 每一步只给一个点，不给一个好用的概率分布。
 \end{warnbox}
 
-所以 Flow-GRPO 这类方法会把 ODE 改造成带随机性的 SDE：
+解决思路是：不要让下一步只能落在一个点上，而是让它围绕 $\mu_\theta$ 附近随机采样。也就是把 ODE 的确定性更新改成带噪声的更新：
 
 \[
 x_{t-\Delta t}
 =
 \mu_\theta(x_t,t,c)
 +
-\sigma_t\sqrt{\Delta t}\epsilon,
+\sigma_t\sqrt{\Delta t}\,\epsilon,
 \qquad
 \epsilon\sim\mathcal{N}(0,I)
 \]
 
-这样每一步转移就变成高斯：
+这里：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $\mu_\theta(x_t,t,c)$ 是 ODE 原本想走到的位置；
+  \item $\epsilon$ 是标准高斯噪声；
+  \item $\sigma_t$ 控制随机性大小；
+  \item $\sqrt{\Delta t}$ 来自 SDE / Brownian motion 的尺度：时间步越小，随机扰动也应该越小。
+\end{itemize}
+
+这个形式可以理解成 Euler-Maruyama 离散化后的 SDE。连续写法大致是：
+
+\[
+dx
+=
+v_\theta(x,t,c)\,dt
++
+\sigma_t\,dW_t
+\]
+
+其中 $dW_t$ 是 Brownian noise。因为采样时我们实际从 $t$ 走到 $t-\Delta t$，所以离散更新里的确定性部分写成 $-\Delta t\,v_\theta$。
+
+一旦加上高斯噪声，每一步转移就从“一个点”变成“一个高斯分布”：
 
 \[
 p_\theta(x_{t-\Delta t}\mid x_t,c,t)
@@ -357,16 +575,65 @@ x_{t-\Delta t};
 \right)
 \]
 
-于是可以计算：
+这时 logprob 就可以明确写出来。设 latent 总维度是 $d$：
 
 \[
 \log p_\theta(x_{t-\Delta t}\mid x_t,c,t)
+=
+-
+\frac{
+\left\|
+x_{t-\Delta t}
+-
+\mu_\theta(x_t,t,c)
+\right\|^2
+}{
+2\sigma_t^2\Delta t
+}
+-
+\frac{d}{2}\log(2\pi\sigma_t^2\Delta t)
 \]
 
-也就可以做 GRPO ratio。
+也可以把它理解成：先看真实采样出来的下一步 $x_{t-\Delta t}$ 离模型均值 $\mu_\theta$ 有多远，再用高斯密度给这个偏差打分。
+
+\[
+\epsilon_\theta
+=
+\frac{
+x_{t-\Delta t}
+-
+\mu_\theta(x_t,t,c)
+}{
+\sigma_t\sqrt{\Delta t}
+}
+\]
+
+偏差越小，logprob 越高；偏差越大，logprob 越低。
+
+这样 GRPO / PPO 需要的 ratio 就有了。对同一个采样出来的 transition，比较新旧策略的 logprob：
+
+\[
+r_k(\theta)
+=
+\exp
+\left(
+\log p_\theta(x_{t_{k-1}}\mid x_{t_k},c,t_k)
+-
+\log p_{\theta_{\text{old}}}(x_{t_{k-1}}\mid x_{t_k},c,t_k)
+\right)
+\]
+
+整条 flow trajectory 的 logprob 是每一步 transition logprob 的和：
+
+\[
+\log p_\theta(\tau\mid c)
+=
+\sum_{k=1}^{K}
+\log p_\theta(x_{t_{k-1}}\mid x_{t_k},c,t_k)
+\]
 
 \begin{summarybox}
-\textbf{Flow-GRPO 的最小动机：} 把 deterministic ODE 变成 stochastic SDE，让 flow trajectory 既能探索，也能计算 logprob。
+\textbf{Flow-GRPO 的最小动机：} ODE 是确定性轨迹，默认没有好用的 logprob；SDE 在 ODE 的下一步均值附近加高斯噪声，让每一步 transition 变成高斯分布，于是可以计算 logprob，也就可以做 PPO / GRPO ratio。
 \end{summarybox}
 
 \subsubsection{Diffusion 和 Flow 的后训练差别}

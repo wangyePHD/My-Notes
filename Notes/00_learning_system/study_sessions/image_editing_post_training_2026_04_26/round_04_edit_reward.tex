@@ -1,0 +1,665 @@
+% ============================================================
+% Round 04: Image Editing Reward
+% ============================================================
+
+\subsection{Round 04：图像编辑 Reward}
+
+\subsubsection{Highlight}
+
+\begin{conceptbox}
+\textbf{本章相关脉络：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{CLIP}：arXiv 2021-02-26，用图文对比学习得到 image-text 相似度模型。论文：\url{https://arxiv.org/abs/2103.00020}，代码：\url{https://github.com/openai/CLIP}
+  \item \textbf{LPIPS}：arXiv 2018-01-11，学习感知相似度，常用于图像重建 / 保真度评估。论文：\url{https://arxiv.org/abs/1801.03924}，代码：\url{https://github.com/richzhang/PerceptualSimilarity}
+  \item \textbf{DINO}：arXiv 2021-04-29，自监督 ViT 表征，常用于语义保持 / identity-like feature 相似度。论文：\url{https://arxiv.org/abs/2104.14294}，代码：\url{https://github.com/facebookresearch/dino}
+  \item \textbf{ImageReward}：arXiv 2023-04-12，通用 text-to-image human preference reward model。论文：\url{https://arxiv.org/abs/2304.05977}，代码：\url{https://github.com/zai-org/ImageReward}
+  \item \textbf{Pick-a-Pic / PickScore}：arXiv 2023-05-02，基于真实用户偏好的 text-to-image preference 数据与 CLIP-based scorer。论文：\url{https://arxiv.org/abs/2305.01569}，代码：\url{https://github.com/yuvalkirstain/PickScore}
+  \item \textbf{HPS v2}：arXiv 2023-06-15，用 HPD v2 训练 Human Preference Score v2。论文：\url{https://arxiv.org/abs/2306.09341}，代码：\url{https://github.com/tgxs002/HPSv2}
+  \item \textbf{EditReward}：arXiv 2025-09-30，面向 instruction-guided image editing 的 human-aligned reward model，ICLR 2026。论文：\url{https://arxiv.org/abs/2509.26346}，代码：\url{https://github.com/TIGER-AI-Lab/EditReward}
+  \item \textbf{HP-Edit / HP-Scorer}：arXiv 2026-04-21，CVPR 2026，面向图像编辑的人类偏好后训练框架。论文：\url{https://arxiv.org/abs/2604.19406}
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{本章要解决的问题}
+
+上一章 SFT 解决的是：
+
+\[
+\text{有标准目标图 } I_\text{tgt}
+\quad\Rightarrow\quad
+\text{让模型模仿它}
+\]
+
+但后训练真正关心的是：
+
+\[
+\text{模型生成了一个编辑结果}
+\quad\Rightarrow\quad
+\text{这个结果到底好不好}
+\]
+
+也就是要定义 reward：
+
+\[
+R(I_\text{src}, c, I_\text{edit})
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $I_\text{src}$ 是原图；
+  \item $c$ 是编辑指令；
+  \item $I_\text{edit}$ 是模型输出的编辑图；
+  \item $R$ 是一个标量分数，越高表示越符合我们想要的编辑结果。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} 文本侧 reward model 给回答打分；图像编辑侧 reward model 给“原图 + 指令 + 编辑后图像”这个三元关系打分。
+\end{intubox}
+
+\subsubsection{图像编辑 Reward 的四个维度}
+
+图像编辑不是只看好不好看。一个好的编辑结果通常要同时满足四件事：
+
+\[
+\text{指令遵循}
+\quad
++
+\quad
+\text{未编辑区域保持}
+\quad
++
+\quad
+\text{图像质量}
+\quad
++
+\quad
+\text{人类偏好}
+\]
+
+所以 reward 可以抽象成：
+
+\[
+R
+=
+w_\text{inst}\widetilde{R}_\text{inst}
++
+w_\text{pres}\widetilde{R}_\text{pres}
++
+w_\text{qual}\widetilde{R}_\text{qual}
++
+w_\text{pref}\widetilde{R}_\text{pref}
+\]
+
+这里加了波浪线 $\widetilde{R}$，是为了提醒：不同 reward 的量纲不一样，真实训练前通常要做 normalization / clipping / calibration。
+
+\begin{warnbox}
+\textbf{关键点：} 图像编辑 reward 不是单一指标。只优化 CLIP 可能破坏原图；只优化保持可能什么都不改；只优化美学可能把编辑任务变成重新生成。
+\end{warnbox}
+
+\subsubsection{第一类：指令遵循 Reward}
+
+指令遵循问的是：
+
+\[
+\text{输出图像有没有完成编辑指令 } c
+\]
+
+最简单的做法是用图文相似度模型，例如 CLIP。
+
+把输出图像编码成图像特征：
+
+\[
+h_I
+=
+f_I(I_\text{edit})
+\]
+
+把文本条件编码成文本特征：
+
+\[
+h_T
+=
+f_T(c_\text{target})
+\]
+
+然后计算 cosine similarity：
+
+\[
+R_\text{CLIP}
+=
+\cos(h_I,h_T)
+=
+\frac{
+h_I^\top h_T
+}{
+\|h_I\|\|h_T\|
+}
+\]
+
+这里我写的是 $c_\text{target}$，而不是直接写 $c$，因为编辑指令经常不是最终图像描述。
+
+例如：
+
+\[
+c=\text{``把红车改成蓝车''}
+\]
+
+如果直接用 CLIP 比较输出图和“把红车改成蓝车”这句话，CLIP 未必能准确理解“从红到蓝”的编辑关系。更合理的目标文本可能是：
+
+\[
+c_\text{target}=\text{``a blue car''}
+\]
+
+\begin{warnbox}
+\textbf{CLIP 的局限：} CLIP 更擅长判断“图像和文本是否匹配”，不擅长判断“相对于原图，是否做了正确编辑”。所以 CLIP 可以做辅助 reward，但很难单独承担图像编辑 reward。
+\end{warnbox}
+
+\subsubsection{第二类：保持 Reward}
+
+图像编辑最容易出问题的地方是 over-edit：
+
+\[
+\text{该改的地方改了}
+\quad
+\text{但不该改的地方也乱变了}
+\]
+
+保持 reward 问的是：
+
+\[
+\text{未编辑区域是否还像原图}
+\]
+
+如果有 mask $m$，其中 $m=1$ 表示允许编辑区域，$1-m$ 表示应该保持区域，可以写像素级保持：
+
+\[
+R_\text{pixel-pres}
+=
+-
+\left\|
+(1-m)\odot
+\left(
+I_\text{edit}-I_\text{src}
+\right)
+\right\|_1
+\]
+
+负号表示：差异越小，reward 越高。
+
+但像素级距离太严格。一个轻微光照变化、压缩变化、纹理变化，都会让像素差异变大。所以更常用感知距离：
+
+\[
+R_\text{LPIPS-pres}
+=
+-
+\text{LPIPS}
+\left(
+(1-m)\odot I_\text{edit},
+(1-m)\odot I_\text{src}
+\right)
+\]
+
+如果更关心语义 / identity，而不是逐像素一致，可以用 DINO / image encoder 特征：
+
+\[
+R_\text{DINO-pres}
+=
+\cos
+\left(
+\phi(I_\text{edit}),
+\phi(I_\text{src})
+\right)
+\]
+
+也可以只在非编辑区域上抽特征：
+
+\[
+R_\text{region-pres}
+=
+\cos
+\left(
+\phi((1-m)\odot I_\text{edit}),
+\phi((1-m)\odot I_\text{src})
+\right)
+\]
+
+\begin{intubox}
+\textbf{直觉：} LPIPS 更像“看起来像不像”；DINO feature 更像“语义和结构是不是还像”。它们都比直接逐像素相减更接近人的视觉感受。
+\end{intubox}
+
+\subsubsection{第三类：图像质量 Reward}
+
+图像质量问的是：
+
+\[
+\text{输出图像是否真实、清晰、无明显伪影}
+\]
+
+可以用 aesthetic scorer、image quality scorer，或者 VLM 直接评分。
+
+抽象写成：
+
+\[
+R_\text{qual}
+=
+Q(I_\text{edit})
+\]
+
+其中 $Q$ 可以判断：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 是否清晰；
+  \item 是否有畸形结构；
+  \item 是否有不自然边界；
+  \item 光照 / 阴影 / 材质是否合理；
+  \item 人脸、手、文字是否崩坏。
+\end{itemize}
+
+但质量 reward 不能单独优化。
+
+例如指令是：
+
+\[
+\text{``把桌上的杯子移除''}
+\]
+
+模型输出一张完全不同但很漂亮的房间照片，质量很高，但编辑任务失败。
+
+\begin{warnbox}
+\textbf{质量不等于编辑正确：} $R_\text{qual}$ 只能说明图像自然，不说明它是否忠实执行了编辑指令。
+\end{warnbox}
+
+\subsubsection{第四类：Human Preference Reward}
+
+Human preference reward 直接学习人的偏好：
+
+\[
+R_\text{pref}
+=
+r_\psi(I_\text{src},c,I_\text{edit})
+\]
+
+如果是 text-to-image reward model，常见输入是：
+
+\[
+r_\psi(c,I)
+\]
+
+例如 ImageReward、PickScore、HPS v2 主要面向：
+
+\[
+\text{text prompt}
+\quad+\quad
+\text{generated image}
+\]
+
+也就是：
+
+\[
+r_\psi(c,I_\text{gen})
+\]
+
+但图像编辑更复杂，因为必须看原图：
+
+\[
+r_\psi(I_\text{src},c,I_\text{edit})
+\]
+
+否则 reward model 不知道：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 原图里哪些内容应该保留；
+  \item 指令要求改变的是哪个对象；
+  \item 输出是不是只是重新生成了一张漂亮图；
+  \item identity / layout / background 是否被破坏。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{关键差别：}\\
+Text-to-image reward 看的是：
+\[
+(\text{prompt}, \text{generated image})
+\]
+Image editing reward 必须看的是：
+\[
+(\text{source image}, \text{instruction}, \text{edited image})
+\]
+\end{summarybox}
+
+\subsubsection{Pairwise Preference：从人工偏好训练 Reward Model}
+
+和文本 RM 一样，图像 reward model 也常从 pairwise preference 学出来。
+
+对同一个输入：
+
+\[
+x=(I_\text{src},c)
+\]
+
+让模型生成两个候选：
+
+\[
+I_a,\quad I_b
+\]
+
+人类标注哪个更好：
+
+\[
+I_w \succ I_l
+\]
+
+其中 $I_w$ 是 winner / chosen，$I_l$ 是 loser / rejected。
+
+Reward model 输出：
+
+\[
+r_\psi(x,I_w),
+\qquad
+r_\psi(x,I_l)
+\]
+
+Bradley-Terry 偏好概率是：
+
+\[
+P_\psi(I_w\succ I_l\mid x)
+=
+\sigma
+\left(
+r_\psi(x,I_w)-r_\psi(x,I_l)
+\right)
+\]
+
+训练 loss 是：
+
+\[
+\mathcal{L}_\text{RM}
+=
+-
+\log
+\sigma
+\left(
+r_\psi(x,I_w)-r_\psi(x,I_l)
+\right)
+\]
+
+这和文本侧 reward model 训练非常像，只是 $x$ 从文本 prompt 变成了：
+
+\[
+x=(I_\text{src},c)
+\]
+
+\begin{intubox}
+\textbf{直觉：} Reward model 不一定要知道“绝对满分图像”是什么；它只需要学会：在同一个原图和指令下，哪个编辑结果更符合人类偏好。
+\end{intubox}
+
+\subsubsection{VLM Scorer：让视觉语言模型按 Rubric 打分}
+
+现代图像编辑 reward 里很常见的一种做法是 VLM-as-a-judge。
+
+输入给 VLM：
+
+\[
+\left(
+I_\text{src},
+I_\text{edit},
+c,
+\text{rubric}
+\right)
+\]
+
+让它输出一个分数：
+
+\[
+s\in\{0,1,2,3,4,5\}
+\]
+
+也可以输出多维分数：
+
+\[
+\left(
+s_\text{instruction},
+s_\text{preservation},
+s_\text{quality},
+s_\text{overall}
+\right)
+\]
+
+例如一个 rubric 可以写成：
+
+\[
+\begin{array}{ll}
+0 &: \text{完全没有完成编辑，或图像严重损坏} \\
+1 &: \text{只完成很少部分，且有明显伪影} \\
+2 &: \text{部分完成，但偏离指令或破坏原图} \\
+3 &: \text{大体完成，但质量或保持一般} \\
+4 &: \text{较好完成，质量和保持都不错} \\
+5 &: \text{完全遵循指令，保持自然，图像质量高}
+\end{array}
+\]
+
+HP-Edit 里的 HP-Scorer 就是这个方向：用少量人工偏好评分数据和预训练 VLM，构造一个自动的 human preference-aligned evaluator，再把它用于偏好数据构造和 RL reward。
+
+\begin{warnbox}
+\textbf{VLM scorer 的风险：} 它比 CLIP 更懂编辑关系，但也可能有 judge bias、打分不稳定、偏好模板敏感、以及被模型学会钻空子的 reward hacking 问题。
+\end{warnbox}
+
+\subsubsection{常见 Reward / Metric 的角色}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.5cm}p{3.5cm}p{4.2cm}p{3.2cm}}
+\hline
+\textbf{方法} & \textbf{主要看什么} & \textbf{适合用法} & \textbf{主要风险} \\
+\hline
+CLIP
+&
+图文匹配
+&
+粗略判断输出是否符合目标文本
+&
+不理解原图到编辑图的变化关系
+\\
+LPIPS
+&
+感知相似度
+&
+约束未编辑区域保持
+&
+可能惩罚合理的局部变化
+\\
+DINO
+&
+语义 / 结构特征
+&
+保持 identity、布局、主体语义
+&
+对细粒度编辑不一定敏感
+\\
+Aesthetic / Quality
+&
+美学与自然度
+&
+减少低质图、伪影图
+&
+可能鼓励重新生成漂亮图
+\\
+ImageReward / PickScore / HPS
+&
+人类偏好
+&
+text-to-image 偏好评价、辅助排序
+&
+通常不显式看原图
+\\
+EditReward / HP-Scorer
+&
+编辑结果的人类偏好
+&
+图像编辑偏好打分、RL reward
+&
+依赖标注质量、VLM judge 可靠性
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{为什么 Reward 要做 Normalization}
+
+不同 reward 的数值范围可能完全不同：
+
+\[
+R_\text{CLIP}\in[-1,1]
+\]
+
+\[
+R_\text{LPIPS}\in[0,\infty)
+\]
+
+\[
+R_\text{VLM}\in\{0,1,2,3,4,5\}
+\]
+
+如果直接相加：
+
+\[
+R
+=
+R_\text{CLIP}
+-
+\text{LPIPS}
++
+R_\text{VLM}
+\]
+
+某一项可能因为数值尺度大，直接支配总 reward。
+
+所以通常要做标准化：
+
+\[
+\widetilde{R}_i
+=
+\frac{
+R_i-\mu_i
+}{
+\sigma_i+\epsilon
+}
+\]
+
+或者做 clipping：
+
+\[
+\widetilde{R}_i
+=
+\text{clip}(R_i,a_i,b_i)
+\]
+
+也可以在 GRPO 里用 group-relative advantage，让同一个 prompt / 原图下的多张候选彼此比较：
+
+\[
+A_j
+=
+\frac{
+R_j-\text{mean}(R_1,\ldots,R_G)
+}{
+\text{std}(R_1,\ldots,R_G)+\epsilon
+}
+\]
+
+\begin{intubox}
+\textbf{直觉：} reward 的绝对值不一定可靠，但“同一个编辑任务下，哪个候选更好”通常更稳定。这也是 group-relative 方法适合图像编辑的原因之一。
+\end{intubox}
+
+\subsubsection{Reward Hacking：每个 Reward 都会被钻空子}
+
+图像编辑 reward 的难点不是“找一个分数”，而是防止模型只优化分数、不优化真实目标。
+
+几个典型例子：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 只优化 CLIP：模型可能把目标物体画得很明显，但破坏原图背景；
+  \item 只优化 LPIPS：模型可能几乎不改图，因为不改最容易保持；
+  \item 只优化 aesthetic：模型可能生成漂亮但不相关的图；
+  \item 只优化 VLM scorer：模型可能学到 scorer 偏好的表面模式；
+  \item 只优化 identity：模型可能拒绝执行风格、姿态、背景等合理编辑。
+\end{itemize}
+
+因此实际 reward 设计通常要做 trade-off：
+
+\[
+\text{edit strength}
+\quad\leftrightarrow\quad
+\text{preservation}
+\]
+
+\[
+\text{instruction following}
+\quad\leftrightarrow\quad
+\text{image quality}
+\]
+
+\[
+\text{human preference}
+\quad\leftrightarrow\quad
+\text{metric stability}
+\]
+
+\begin{warnbox}
+\textbf{后训练的核心风险：} reward model 不是人类偏好的真相，它只是人类偏好的近似。RL 会放大 reward model 的偏差，所以 reward 设计、约束和评测必须一起看。
+\end{warnbox}
+
+\subsubsection{从 Reward 接到后面的 DPO / RL}
+
+有了 reward 以后，后面会出现两条路线。
+
+第一条是 preference optimization：
+
+\[
+(I_\text{src},c,I_w,I_l)
+\quad\Rightarrow\quad
+\text{让模型更偏向 chosen，远离 rejected}
+\]
+
+这会进入下一章：
+
+\[
+\text{Diffusion-DPO / Image Editing DPO}
+\]
+
+第二条是 RL：
+
+\[
+I_\text{edit}\sim\pi_\theta(\cdot\mid I_\text{src},c)
+\]
+
+\[
+R=R(I_\text{src},c,I_\text{edit})
+\]
+
+\[
+\text{用 } R \text{ 更新 diffusion / flow trajectory}
+\]
+
+这会进入后面的：
+
+\[
+\text{DDPO / Flow-GRPO / HP-Edit}
+\]
+
+\begin{summarybox}
+\textbf{本章最小结论：}\\
+图像编辑 reward 必须同时看原图、指令和编辑图。它通常由指令遵循、区域保持、图像质量和人类偏好组成。CLIP、LPIPS、DINO、ImageReward、PickScore、HPS、VLM scorer 都能提供部分信号，但没有任何一个单独等价于“好编辑”。后面的 DPO 和 RL，本质上都是在利用这些 reward / preference 信号继续优化编辑模型。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 为什么图像编辑 reward 不能只看 $I_\text{edit}$？
+  \item CLIP reward 在图像编辑里最大的局限是什么？
+  \item LPIPS / DINO preservation reward 分别更偏向衡量什么？
+  \item Text-to-image reward model 和 image editing reward model 的输入有什么区别？
+  \item Pairwise preference 如何训练 reward model？
+  \item 为什么多个 reward 相加前通常要 normalization？
+  \item 什么是 reward hacking？图像编辑里有哪些典型例子？
+\end{enumerate}

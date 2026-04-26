@@ -1,0 +1,746 @@
+% ============================================================
+% Round 05: Diffusion-DPO / Image Editing Preference Optimization
+% ============================================================
+
+\subsection{Round 05：Diffusion-DPO 与图像编辑偏好优化}
+
+\subsubsection{Highlight}
+
+\begin{conceptbox}
+\textbf{本章相关脉络：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{DPO}：arXiv 2023-05-29，Direct Preference Optimization，把 RLHF 的 reward + PPO 过程改写成 pairwise classification loss。论文：\url{https://arxiv.org/abs/2305.18290}
+  \item \textbf{Pick-a-Pic}：arXiv 2023-05-02，真实用户 text-to-image 偏好数据，包含 prompt 和成对图像偏好。论文：\url{https://arxiv.org/abs/2305.01569}，代码/数据：\url{https://github.com/yuvalkirstain/PickScore}
+  \item \textbf{Diffusion-DPO}：arXiv 2023-11-21，把 DPO 改写到 diffusion model，用 diffusion ELBO / denoising error 近似图像 likelihood。论文：\url{https://arxiv.org/abs/2311.12908}，代码：\url{https://github.com/SalesforceAIResearch/DiffusionDPO}
+  \item \textbf{Diffusion-SDPO}：arXiv 2025-11-05，后续改进，指出标准 Diffusion-DPO 可能在扩大偏好间隔时破坏 winner 分支，并提出 safeguarded loser update。论文：\url{https://arxiv.org/abs/2511.03317}，代码：\url{https://github.com/AIDC-AI/Diffusion-SDPO}
+\end{itemize}
+\end{conceptbox}
+
+\subsubsection{本章要解决的问题}
+
+上一章我们讲了 reward：
+
+\[
+R(I_\text{src},c,I_\text{edit})
+\]
+
+但 reward model + RL 不是唯一后训练路线。
+
+如果我们有偏好数据：
+
+\[
+(I_\text{src},c,I_w,I_l)
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $I_w$ 是 chosen / winner，也就是更好的编辑结果；
+  \item $I_l$ 是 rejected / loser，也就是较差的编辑结果；
+  \item 二者对应同一个原图 $I_\text{src}$ 和同一个编辑指令 $c$。
+\end{itemize}
+
+那么可以直接训练模型：
+
+\[
+\text{提高 } I_w \text{ 的相对概率}
+\quad
+\text{降低 } I_l \text{ 的相对概率}
+\]
+
+这就是 DPO / Diffusion-DPO 的核心。
+
+\begin{intubox}
+\textbf{直觉：} SFT 只告诉模型“这个答案可以学”；DPO 额外告诉模型“在这两个答案里，这个更好，那个更差”。
+\end{intubox}
+
+\subsubsection{先复习文本 DPO}
+
+文本 DPO 的数据是：
+
+\[
+(x,y_w,y_l)
+\]
+
+其中 $y_w$ 是 chosen answer，$y_l$ 是 rejected answer。
+
+文本模型的 DPO loss 是：
+
+\[
+\mathcal{L}_\text{DPO}
+=
+-
+\log
+\sigma
+\left(
+\beta
+\left[
+\log\frac{\pi_\theta(y_w\mid x)}{\pi_\text{ref}(y_w\mid x)}
+-
+\log\frac{\pi_\theta(y_l\mid x)}{\pi_\text{ref}(y_l\mid x)}
+\right]
+\right)
+\]
+
+把它展开：
+
+\[
+\mathcal{L}_\text{DPO}
+=
+-
+\log
+\sigma
+\left(
+\beta
+\left[
+\log \pi_\theta(y_w\mid x)
+-
+\log \pi_\text{ref}(y_w\mid x)
+-
+\log \pi_\theta(y_l\mid x)
++
+\log \pi_\text{ref}(y_l\mid x)
+\right]
+\right)
+\]
+
+这个式子的含义是：
+
+\[
+\text{新模型相对 reference，要更偏向 chosen，而不是 rejected}
+\]
+
+其中 $\beta$ 控制偏好优化强度。$\beta$ 越大，模型越激进地拉开 chosen 和 rejected；$\beta$ 越小，模型越保守。
+
+\begin{warnbox}
+\textbf{reference 的作用：} DPO 不是无约束地提高 chosen 概率。它比较的是 $\pi_\theta$ 相对 $\pi_\text{ref}$ 的变化，这等价于在偏好优化里保留一个 KL regularization 的锚点，防止模型漂太远。
+\end{warnbox}
+
+\subsubsection{迁移到图像：直接难点是什么}
+
+图像编辑偏好数据可以写成：
+
+\[
+x=(I_\text{src},c)
+\]
+
+\[
+(x,I_w,I_l)
+\]
+
+如果完全照搬文本 DPO，应该写成：
+
+\[
+\mathcal{L}_\text{edit-DPO}
+=
+-
+\log
+\sigma
+\left(
+\beta
+\left[
+\log\frac{\pi_\theta(I_w\mid I_\text{src},c)}
+{\pi_\text{ref}(I_w\mid I_\text{src},c)}
+-
+\log\frac{\pi_\theta(I_l\mid I_\text{src},c)}
+{\pi_\text{ref}(I_l\mid I_\text{src},c)}
+\right]
+\right)
+\]
+
+问题是：diffusion model 通常不像 LLM 那样直接给：
+
+\[
+\log \pi_\theta(I\mid I_\text{src},c)
+\]
+
+LLM 可以把整段文本 logprob 写成 token logprob 之和：
+
+\[
+\log \pi_\theta(y\mid x)
+=
+\sum_i
+\log \pi_\theta(y_i\mid x,y_{<i})
+\]
+
+但 diffusion 的最终图像概率需要把整条去噪轨迹积分 / 边缘化掉：
+
+\[
+p_\theta(z_0\mid c)
+=
+\int
+p(z_T)
+\prod_{t=1}^{T}
+p_\theta(z_{t-1}\mid z_t,c)
+\,
+dz_{1:T}
+\]
+
+这个积分不好直接算。
+
+\begin{warnbox}
+\textbf{Diffusion-DPO 的核心难点：} 文本 DPO 需要 $\log \pi_\theta(y\mid x)$；diffusion 模型没有一个像 token logprob 那样直接好算的最终图像 logprob。
+\end{warnbox}
+
+\subsubsection{关键替换：用去噪误差近似 Logprob}
+
+Diffusion-DPO 的做法是：不要直接算最终图像的精确 likelihood，而是用 diffusion ELBO / denoising objective 给出一个可训练的 surrogate。
+
+先看普通 diffusion SFT 的噪声预测 loss。给定目标图像 latent：
+
+\[
+z_0
+=
+E_\text{VAE}(I)
+\]
+
+加噪得到：
+
+\[
+z_t
+=
+\sqrt{\bar{\alpha}_t}z_0
++
+\sqrt{1-\bar{\alpha}_t}\epsilon,
+\qquad
+\epsilon\sim\mathcal{N}(0,I)
+\]
+
+模型预测噪声：
+
+\[
+\epsilon_\theta(z_t,t,x)
+\]
+
+去噪误差是：
+
+\[
+\ell_\theta(I,t,x)
+=
+\left\|
+\epsilon
+-
+\epsilon_\theta(z_t,t,x)
+\right\|^2
+\]
+
+直觉上：
+
+\[
+\ell_\theta \text{ 越小}
+\quad\Rightarrow\quad
+\text{模型越会生成这张图}
+\]
+
+所以可以粗略理解为：
+
+\[
+\log \pi_\theta(I\mid x)
+\approx
+\text{constant}
+-
+\sum_t
+\omega_t
+\ell_\theta(I,t,x)
+\]
+
+其中 $\omega_t$ 是不同时间步的权重。
+
+\begin{intubox}
+\textbf{直觉：} 对 diffusion 来说，“这张图概率高”可以近似理解成：“把这张图加噪到任意时间步后，模型都很擅长把它去噪回来”。
+\end{intubox}
+
+\subsubsection{Diffusion-DPO 的核心公式}
+
+现在有一组图像偏好样本：
+
+\[
+x=(I_\text{src},c)
+\]
+
+\[
+I_w \succ I_l
+\]
+
+分别编码成 latent：
+
+\[
+z_0^w=E_\text{VAE}(I_w),
+\qquad
+z_0^l=E_\text{VAE}(I_l)
+\]
+
+采样同一个时间步 $t$，并分别加噪：
+
+\[
+z_t^w
+=
+\sqrt{\bar{\alpha}_t}z_0^w
++
+\sqrt{1-\bar{\alpha}_t}\epsilon^w
+\]
+
+\[
+z_t^l
+=
+\sqrt{\bar{\alpha}_t}z_0^l
++
+\sqrt{1-\bar{\alpha}_t}\epsilon^l
+\]
+
+对当前模型计算去噪误差：
+
+\[
+\ell_\theta^w
+=
+\left\|
+\epsilon^w
+-
+\epsilon_\theta(z_t^w,t,x)
+\right\|^2
+\]
+
+\[
+\ell_\theta^l
+=
+\left\|
+\epsilon^l
+-
+\epsilon_\theta(z_t^l,t,x)
+\right\|^2
+\]
+
+对 reference model 也计算同样的误差：
+
+\[
+\ell_\text{ref}^w
+=
+\left\|
+\epsilon^w
+-
+\epsilon_\text{ref}(z_t^w,t,x)
+\right\|^2
+\]
+
+\[
+\ell_\text{ref}^l
+=
+\left\|
+\epsilon^l
+-
+\epsilon_\text{ref}(z_t^l,t,x)
+\right\|^2
+\]
+
+因为 logprob 近似等于负的去噪误差，所以图像 DPO 的 margin 可以写成：
+
+\[
+m_\theta
+=
+\beta\omega_t
+\left[
+\left(
+\ell_\theta^l-\ell_\text{ref}^l
+\right)
+-
+\left(
+\ell_\theta^w-\ell_\text{ref}^w
+\right)
+\right]
+\]
+
+于是 Diffusion-DPO loss 是：
+
+\[
+\mathcal{L}_\text{Diff-DPO}
+=
+-
+\log
+\sigma(m_\theta)
+\]
+
+把它读成中文就是：
+
+\[
+\text{chosen 的去噪误差，相对 ref 要变小}
+\]
+
+\[
+\text{rejected 的去噪误差，相对 ref 可以变大}
+\]
+
+所以：
+
+\[
+\left(
+\ell_\theta^w-\ell_\text{ref}^w
+\right)
+\downarrow
+\]
+
+\[
+\left(
+\ell_\theta^l-\ell_\text{ref}^l
+\right)
+\uparrow
+\]
+
+margin 就会变大，loss 就会变小。
+
+\begin{summarybox}
+\textbf{Diffusion-DPO 一句话：}\\
+文本 DPO 比较的是 chosen / rejected 的 logprob ratio；Diffusion-DPO 比较的是 chosen / rejected 的 denoising error 相对 reference 的变化。因为 diffusion 的 logprob 可以用 ELBO / 去噪误差近似，所以 DPO loss 可以落到噪声预测 MSE 上。
+\end{summarybox}
+
+\subsubsection{为什么公式里是 Rejected 减 Chosen}
+
+这个符号很容易看晕。我们从 logprob 角度推一次。
+
+文本 DPO 的核心 margin 是：
+
+\[
+\beta
+\left[
+\log\frac{\pi_\theta(I_w\mid x)}{\pi_\text{ref}(I_w\mid x)}
+-
+\log\frac{\pi_\theta(I_l\mid x)}{\pi_\text{ref}(I_l\mid x)}
+\right]
+\]
+
+现在用：
+
+\[
+\log\pi_\theta(I\mid x)
+\approx
+-
+\omega_t\ell_\theta(I,t,x)
+\]
+
+代入 chosen：
+
+\[
+\log\frac{\pi_\theta(I_w\mid x)}{\pi_\text{ref}(I_w\mid x)}
+\approx
+-
+\omega_t
+\left(
+\ell_\theta^w-\ell_\text{ref}^w
+\right)
+\]
+
+代入 rejected：
+
+\[
+\log\frac{\pi_\theta(I_l\mid x)}{\pi_\text{ref}(I_l\mid x)}
+\approx
+-
+\omega_t
+\left(
+\ell_\theta^l-\ell_\text{ref}^l
+\right)
+\]
+
+两者相减：
+
+\[
+-
+\omega_t
+\left(
+\ell_\theta^w-\ell_\text{ref}^w
+\right)
+-
+\left[
+-
+\omega_t
+\left(
+\ell_\theta^l-\ell_\text{ref}^l
+\right)
+\right]
+\]
+
+整理后就是：
+
+\[
+\omega_t
+\left[
+\left(
+\ell_\theta^l-\ell_\text{ref}^l
+\right)
+-
+\left(
+\ell_\theta^w-\ell_\text{ref}^w
+\right)
+\right]
+\]
+
+所以你看到的是：
+
+\[
+\text{rejected error improvement}
+-
+\text{chosen error improvement}
+\]
+
+更准确说，是：
+
+\[
+\text{rejected 相对 ref 的误差变化}
+-
+\text{chosen 相对 ref 的误差变化}
+\]
+
+由于 logprob 是负误差，所以符号会反过来。
+
+\begin{intubox}
+\textbf{记忆法：} 文本里要让 chosen logprob 更高；diffusion 里等价于让 chosen denoising error 更低。logprob 越高越好，error 越低越好，所以从 logprob 换成 error 时符号会翻转。
+\end{intubox}
+
+\subsubsection{图像编辑版 DPO 与 Text-to-Image DPO 的差别}
+
+Text-to-image Diffusion-DPO 的条件通常是 prompt：
+
+\[
+x=c_\text{text}
+\]
+
+图像编辑 DPO 的条件是：
+
+\[
+x=(I_\text{src},c)
+\]
+
+因此每次计算 chosen / rejected 的去噪误差时，模型都必须看到同一个原图和同一个编辑指令：
+
+\[
+\epsilon_\theta(z_t^w,t,I_\text{src},c)
+\]
+
+\[
+\epsilon_\theta(z_t^l,t,I_\text{src},c)
+\]
+
+这很关键。因为 chosen 好，不只是因为它漂亮，而是因为它相对于同一张原图做了更正确的编辑。
+
+\begin{warnbox}
+\textbf{图像编辑 DPO 的关键：} chosen / rejected 必须在同一个 source image 和同一个 instruction 下比较。否则模型学到的可能只是“哪张图更好看”，而不是“哪个编辑更正确”。
+\end{warnbox}
+
+\subsubsection{Preference Pair 可以从哪里来}
+
+图像编辑偏好对可以来自几种方式。
+
+\textbf{第一种：人工标注。}
+
+给同一个编辑任务生成多个结果，让人类选择更好的：
+
+\[
+I_w \succ I_l
+\]
+
+人工偏好质量高，但成本高。
+
+\textbf{第二种：reward / scorer 自动排序。}
+
+用上一章的 reward：
+
+\[
+R(I_\text{src},c,I)
+\]
+
+对多个候选排序：
+
+\[
+R(I_a)>R(I_b)
+\quad\Rightarrow\quad
+I_a\succ I_b
+\]
+
+成本低，但会继承 reward model 的偏差。
+
+\textbf{第三种：VLM judge。}
+
+让 VLM 比较：
+
+\[
+(I_\text{src},c,I_a,I_b)
+\]
+
+输出哪个编辑更好。
+
+这种方式更像自动化人类偏好标注，但也会有 judge bias。
+
+\begin{summarybox}
+\textbf{偏好数据的本质：}\\
+Diffusion-DPO 不要求你有绝对 reward 分数，只要求你知道：在同一个编辑任务下，两个候选结果哪个更好。
+\end{summarybox}
+
+\subsubsection{DPO、SFT、Reward RL 的区别}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.7cm}p{3.6cm}p{4.2cm}p{3.4cm}}
+\hline
+\textbf{方法} & \textbf{数据} & \textbf{训练信号} & \textbf{核心风险} \\
+\hline
+SFT
+&
+$(I_\text{src},c,I_\text{tgt})$
+&
+模仿 target image 的去噪 / 速度场
+&
+target 不一定代表人类最优偏好
+\\
+DPO
+&
+$(I_\text{src},c,I_w,I_l)$
+&
+提高 chosen 相对 rejected 的概率
+&
+受离线偏好数据覆盖范围限制
+\\
+Reward RL
+&
+采样结果 + reward
+&
+直接最大化 reward
+&
+训练不稳定、reward hacking
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{Diffusion-DPO 为什么不是普通 SFT}
+
+如果只用 chosen 图像做 SFT：
+
+\[
+\mathcal{L}_\text{SFT}
+=
+\ell_\theta^w
+\]
+
+模型只知道：
+
+\[
+I_w \text{ 是可以学习的}
+\]
+
+但它不知道：
+
+\[
+I_w \text{ 比 } I_l \text{ 好在哪里}
+\]
+
+DPO 的训练信号是相对的：
+
+\[
+\mathcal{L}_\text{DPO}
+=
+-
+\log
+\sigma
+\left(
+\text{chosen score}
+-
+\text{rejected score}
+\right)
+\]
+
+它要求模型拉开两者：
+
+\[
+\text{score}_\theta(I_w,x)
+>
+\text{score}_\theta(I_l,x)
+\]
+
+在 diffusion 里，score 来自负去噪误差：
+
+\[
+\text{score}_\theta(I,x)
+\approx
+-
+\sum_t
+\omega_t
+\left(
+\ell_\theta(I,t,x)-\ell_\text{ref}(I,t,x)
+\right)
+\]
+
+\begin{intubox}
+\textbf{直觉：} SFT 是“向好答案靠近”；DPO 是“相对于坏答案，更偏向好答案”。这就是为什么 DPO 需要 winner 和 loser 成对出现。
+\end{intubox}
+
+\subsubsection{Diffusion-DPO 的训练流程}
+
+一个最小训练流程是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 从偏好数据中取 $(I_\text{src},c,I_w,I_l)$；
+  \item 把 $I_w$ 和 $I_l$ 编码成 latents：$z_0^w,z_0^l$；
+  \item 采样时间步 $t$；
+  \item 分别对 winner / loser 加噪得到 $z_t^w,z_t^l$；
+  \item 用当前模型计算 $\ell_\theta^w,\ell_\theta^l$；
+  \item 用冻结 reference model 计算 $\ell_\text{ref}^w,\ell_\text{ref}^l$；
+  \item 构造 DPO margin $m_\theta$；
+  \item 最小化 $-\log\sigma(m_\theta)$。
+\end{enumerate}
+
+压缩成一行：
+
+\[
+(I_w,I_l)
+\Rightarrow
+(\ell_\theta^w,\ell_\theta^l)
+\Rightarrow
+\text{preference margin}
+\Rightarrow
+\text{DPO loss}
+\]
+
+\subsubsection{DPO 的优点和局限}
+
+优点：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 不需要显式训练 reward model；
+  \item 不需要在线 PPO / DDPO 那样每步采样再 policy gradient；
+  \item 训练形式接近 supervised fine-tuning，工程上更稳定；
+  \item 可以直接利用人工或自动构造的 preference pairs。
+\end{itemize}
+
+局限：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它依赖离线偏好数据，数据覆盖不到的区域很难改；
+  \item preference pair 的质量会直接决定训练方向；
+  \item 如果 winner / loser 只反映美学差异，模型可能学不到编辑正确性；
+  \item 过强的 DPO 可能破坏原模型的生成能力或 winner 分支质量；
+  \item 它没有 RL 的在线探索能力。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{为什么有后续 SDPO / RL 改进：}\\
+标准 Diffusion-DPO 的目标是拉大 chosen 和 rejected 的相对间隔，但“拉大间隔”不必然等于“chosen 变得更好”。如果更新主要通过让 loser 更差来实现，或者 winner 分支也被误伤，就可能出现训练退化。因此后续方法会加入更细的更新约束、dense reward 或在线 RL。
+\end{warnbox}
+
+\subsubsection{本章最小结论}
+
+\begin{summarybox}
+\textbf{Diffusion-DPO 的核心：}\\
+文本 DPO 用 chosen / rejected 的 sequence logprob 做偏好分类；Diffusion-DPO 没有直接好算的 image logprob，于是用 diffusion ELBO / denoising error 作为 surrogate。图像编辑版 DPO 进一步把条件从 text prompt 扩展为 $(I_\text{src},c)$，让模型在同一个原图和指令下，更偏向 chosen 编辑结果，而不是 rejected 编辑结果。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 文本 DPO 的 chosen / rejected logprob ratio 是什么？
+  \item 为什么 diffusion model 不能像 LLM 一样直接计算最终图像的 token logprob？
+  \item Diffusion-DPO 为什么可以用 denoising error 近似 logprob？
+  \item 公式里为什么会出现 $\ell_\theta^l-\ell_\theta^w$ 这种 rejected 减 chosen 的结构？
+  \item 图像编辑 DPO 和 text-to-image DPO 的条件输入有什么区别？
+  \item DPO 相比 SFT 多用了什么信息？
+  \item DPO 相比 reward RL 少了什么能力？
+\end{enumerate}
