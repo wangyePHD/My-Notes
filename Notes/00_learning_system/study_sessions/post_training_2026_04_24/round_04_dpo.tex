@@ -1,0 +1,864 @@
+% ============================================================
+% Round 04: DPO
+% ============================================================
+
+\subsection{Round 04：DPO}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解 DPO 为什么能绕过显式 Reward Model 和 PPO，直接用 chosen / rejected 偏好数据更新 policy。\\
+\textbf{主线位置：}
+\[
+\text{SFT} \to \text{Reward Model} \to \text{PPO / RLHF} \to \text{DPO} \to \text{GRPO / RLVR}
+\]
+\end{conceptbox}
+
+\subsubsection{DPO 想解决什么}
+
+昨天的 RLHF / PPO 链条是：
+
+\[
+\text{Preference Data}
+\to
+\text{Reward Model}
+\to
+\text{PPO}
+\to
+\text{Policy}
+\]
+
+这条链很自然，但工程上很重：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 需要训练 Reward Model；
+  \item 需要在线采样 rollout；
+  \item 需要 old policy、ratio、clip、advantage；
+  \item 通常还需要 value model / critic；
+  \item 训练稳定性依赖很多超参数。
+\end{itemize}
+
+DPO 的想法是：既然偏好数据本来就是 chosen / rejected，能不能不显式训练 Reward Model，也不跑 PPO，而是直接让 policy 学会：
+
+\[
+\text{提高 chosen 的相对概率，降低 rejected 的相对概率}
+\]
+
+因此 DPO 把链条压缩成：
+
+\[
+\text{Preference Data}
+\to
+\text{Policy}
+\]
+
+\begin{summarybox}
+\textbf{一句话：} DPO = Direct Preference Optimization，用偏好对直接训练 policy，不显式训练 Reward Model，也不做在线 PPO。
+\end{summarybox}
+
+\subsubsection{DPO 的训练数据}
+
+DPO 使用的数据和 Reward Model 很像：
+
+\[
+(x, y_w, y_l)
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $x$：prompt；
+  \item $y_w$：winner / chosen，人类更喜欢的回答；
+  \item $y_l$：loser / rejected，人类不喜欢的回答。
+\end{itemize}
+
+但 DPO 不再训练一个单独的 $r_\phi(x,y)$，而是直接更新 policy：
+
+\[
+\pi_\theta(y \mid x)
+\]
+
+同时它还保留一个冻结的 reference policy：
+
+\[
+\pi_\text{ref}(y \mid x)
+\]
+
+这个 reference policy 通常就是 SFT 模型。
+
+\subsubsection{从 RLHF 目标到 DPO 的关键关系}
+
+RLHF 里常见的 KL-regularized 目标是：
+
+\[
+\max_\pi
+\mathbb{E}_{y \sim \pi(\cdot \mid x)}
+\left[
+r(x,y)
+-
+\beta
+\log
+\frac{\pi(y \mid x)}{\pi_\text{ref}(y \mid x)}
+\right]
+\]
+
+这个目标的最优 policy 满足一个重要关系：
+
+\[
+\pi^\ast(y \mid x)
+\propto
+\pi_\text{ref}(y \mid x)
+\exp\left(\frac{1}{\beta}r(x,y)\right)
+\]
+
+把它改写一下，可以得到：
+
+\[
+r(x,y)
+=
+\beta
+\log
+\frac{\pi^\ast(y \mid x)}{\pi_\text{ref}(y \mid x)}
++ C(x)
+\]
+
+其中 $C(x)$ 是只和 prompt 有关的常数。
+
+\begin{intubox}
+\textbf{直觉：} 如果某个回答相对 reference model 被 policy 提高了很多概率，那么它对应的隐式 reward 就更高。
+\end{intubox}
+
+比较两个回答时，$C(x)$ 会抵消：
+
+\[
+r(x,y_w) - r(x,y_l)
+=
+\beta
+\left[
+\log
+\frac{\pi_\theta(y_w \mid x)}{\pi_\text{ref}(y_w \mid x)}
+-
+\log
+\frac{\pi_\theta(y_l \mid x)}{\pi_\text{ref}(y_l \mid x)}
+\right]
+\]
+
+这就是 DPO 的核心：\key{用 policy 相对 reference 的 log probability 差，来替代 Reward Model 的 reward 差}。
+
+\subsubsection{DPO Loss}
+
+Reward Model 的 Bradley--Terry loss 是：
+
+\[
+\mathcal{L}_\text{RM}
+=
+-
+\log
+\sigma
+\left(
+r(x,y_w) - r(x,y_l)
+\right)
+\]
+
+DPO 把 reward 差替换成 policy 和 reference 的 logprob 差：
+
+\[
+\mathcal{L}_\text{DPO}
+=
+-
+\log
+\sigma
+\left(
+\beta
+\left[
+\log
+\frac{\pi_\theta(y_w \mid x)}{\pi_\text{ref}(y_w \mid x)}
+-
+\log
+\frac{\pi_\theta(y_l \mid x)}{\pi_\text{ref}(y_l \mid x)}
+\right]
+\right)
+\]
+
+也可以展开成：
+
+\[
+\mathcal{L}_\text{DPO}
+=
+-
+\log
+\sigma
+\left(
+\beta
+\left[
+\log \pi_\theta(y_w \mid x)
+-
+\log \pi_\theta(y_l \mid x)
+-
+\log \pi_\text{ref}(y_w \mid x)
++
+\log \pi_\text{ref}(y_l \mid x)
+\right]
+\right)
+\]
+
+\begin{summarybox}
+\textbf{DPO 在比较什么：}
+\[
+\left(
+\log \pi_\theta(y_w \mid x)
+-
+\log \pi_\theta(y_l \mid x)
+\right)
+-
+\left(
+\log \pi_\text{ref}(y_w \mid x)
+-
+\log \pi_\text{ref}(y_l \mid x)
+\right)
+\]
+它不是单纯让 chosen 概率变大，而是让当前 policy 相比 reference，更偏向 chosen 而不是 rejected。
+\end{summarybox}
+
+\subsubsection{Sequence Logprob：整段回答的概率}
+
+这里的 $\log \pi_\theta(y \mid x)$ 不是单个 token 的 logprob，而是一整段回答的 logprob：
+
+\[
+y = (y_1, y_2, \ldots, y_T)
+\]
+
+因为语言模型是自回归模型，所以整段回答的条件概率按链式法则分解为：
+
+\[
+\pi_\theta(y \mid x)
+=
+\prod_{t=1}^{T}
+\pi_\theta(y_t \mid x, y_{<t})
+\]
+
+取 log 之后，乘法变成加法：
+
+\[
+\log \pi_\theta(y \mid x)
+=
+\sum_{t=1}^{T}
+\log \pi_\theta(y_t \mid x, y_{<t})
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $x$ 是 prompt；
+  \item $y_t$ 是回答里的第 $t$ 个 token；
+  \item $y_{<t}$ 是回答里已经出现的前面 tokens；
+  \item $\pi_\theta(y_t \mid x, y_{<t})$ 是模型在当前位置给真实下一个 token 的概率。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{关键点：} 这不是假设 token 独立。每一项都是条件概率，都会看到 prompt $x$ 和前面已经出现的回答 tokens $y_{<t}$。
+\end{warnbox}
+
+举一个抽象例子。假设回答被 tokenizer 切成三个 token：
+
+\[
+y = (A, B, C)
+\]
+
+那么整段回答的概率是：
+
+\[
+\pi_\theta(y \mid x)
+=
+\pi_\theta(A \mid x)
+\cdot
+\pi_\theta(B \mid x,A)
+\cdot
+\pi_\theta(C \mid x,A,B)
+\]
+
+对应的 logprob 是：
+
+\[
+\log \pi_\theta(y \mid x)
+=
+\log \pi_\theta(A \mid x)
++
+\log \pi_\theta(B \mid x,A)
++
+\log \pi_\theta(C \mid x,A,B)
+\]
+
+实际代码里计算一个固定回答的 logprob 时，一般不是让模型重新生成，而是用 teacher forcing：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 把 prompt 和回答拼起来输入模型；
+  \item 对回答区域的每个 token，取模型对这个真实 token 的 log probability；
+  \item 忽略 prompt tokens 和 padding tokens；
+  \item 把回答 tokens 的 logprob 加起来，得到 $\log \pi_\theta(y \mid x)$。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{直觉：} sequence logprob 衡量的是：在给定 prompt 的前提下，模型沿着这条固定回答路径一步一步走出来的总概率有多大。
+\end{intubox}
+
+\subsubsection{追问：什么是 Teacher Forcing}
+
+Teacher forcing 是训练自回归模型时最常见的计算方式。它的核心是：\key{训练时不让模型自由生成下一步，而是把标准答案的前缀喂给模型，让模型预测标准答案里的下一个 token}。
+
+假设 prompt 是 $x$，标准回答是：
+
+\[
+y = (y_1, y_2, y_3)
+\]
+
+teacher forcing 训练时会计算：
+
+\[
+\pi_\theta(y_1 \mid x)
+\]
+
+\[
+\pi_\theta(y_2 \mid x, y_1)
+\]
+
+\[
+\pi_\theta(y_3 \mid x, y_1, y_2)
+\]
+
+注意这里的上下文使用的是\key{真实答案前缀}，不是模型自己刚刚生成出来的 token。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.4cm}p{9.4cm}}
+\hline
+\textbf{方式} & \textbf{含义} \\
+\hline
+自由生成
+&
+模型先采样 $y_1$，再基于自己生成的 $y_1$ 采样 $y_2$，一路生成完整回答。
+\\
+Teacher forcing
+&
+模型不采样，而是直接看真实前缀 $y_{<t}$，只负责给真实下一个 token $y_t$ 打概率。
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+因此 SFT 的 loss：
+
+\[
+\mathcal{L}_\text{SFT}
+=
+-
+\sum_{t=1}^{T}
+\log \pi_\theta(y_t^\ast \mid x, y_{<t}^\ast)
+\]
+
+就是典型的 teacher forcing。DPO 里计算 chosen / rejected 的 sequence logprob 也用同样方式：
+
+\[
+\log \pi_\theta(y_w \mid x)
+=
+\sum_t
+\log \pi_\theta(y_{w,t} \mid x, y_{w,<t})
+\]
+
+\[
+\log \pi_\theta(y_l \mid x)
+=
+\sum_t
+\log \pi_\theta(y_{l,t} \mid x, y_{l,<t})
+\]
+
+\begin{intubox}
+\textbf{直觉：} teacher forcing 问的不是“模型会不会真的生成这整段回答”，而是“如果沿着这条已知回答路径走，模型每一步给正确 token 的概率有多高”。
+\end{intubox}
+
+\begin{warnbox}
+\textbf{关键区别：} 训练 / 打分时常用 teacher forcing；推理时没有标准答案前缀，只能用模型自己生成的 token 继续往下走。\\
+这也是为什么训练时 loss 很低，不代表自由生成时一定完全稳定。模型推理时一旦前面生成错了，后续上下文就会偏离训练时看到的真实前缀。
+\end{warnbox}
+
+\subsubsection{再解释：Teacher Forcing 到底 Force 了什么}
+
+Teacher forcing 这个名字容易误解。它不是强迫模型\key{输出}正确 token，而是强迫模型的\key{输入上下文}沿着真实答案走。
+
+假设训练样本是：
+
+\[
+x = \text{``解释 PPO''}
+\]
+
+真实回答 token 是：
+
+\[
+y^\ast = (y_1^\ast, y_2^\ast, y_3^\ast)
+\]
+
+如果自由生成，模型会这样走：
+
+\[
+\hat{y}_1 \sim \pi_\theta(\cdot \mid x)
+\]
+
+\[
+\hat{y}_2 \sim \pi_\theta(\cdot \mid x, \hat{y}_1)
+\]
+
+\[
+\hat{y}_3 \sim \pi_\theta(\cdot \mid x, \hat{y}_1, \hat{y}_2)
+\]
+
+这里第二步看到的是模型自己生成的 $\hat{y}_1$。如果第一步生成错了，后面的上下文也跟着偏。
+
+而 teacher forcing 不让模型这样自由滚下去。它每一步都使用真实答案前缀：
+
+\[
+\pi_\theta(y_1^\ast \mid x)
+\]
+
+\[
+\pi_\theta(y_2^\ast \mid x, y_1^\ast)
+\]
+
+\[
+\pi_\theta(y_3^\ast \mid x, y_1^\ast, y_2^\ast)
+\]
+
+也就是说，就算模型在第一步其实最想生成的是 $\hat{y}_1$，训练时第二步仍然把真实的 $y_1^\ast$ 塞进上下文，让模型继续预测真实的 $y_2^\ast$。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{9.6cm}}
+\hline
+\textbf{问题} & \textbf{答案} \\
+\hline
+模型有没有真的采样？
+&
+没有。teacher forcing 是对固定答案路径打分，不是自由生成。
+\\
+force 的是什么？
+&
+force 的是下一步输入上下文使用真实答案前缀，而不是模型自己生成的前缀。
+\\
+模型在做什么？
+&
+每个位置都在回答：在这个真实前缀下，我会给真实下一个 token 多大概率？
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{一句话：} teacher forcing = 让模型沿着老师给出的标准路径走，每一步检查它有没有把下一个标准 token 预测得更有信心。
+\end{intubox}
+
+所以在 DPO 里，计算 chosen 的 logprob 时，不是问：
+
+\[
+\text{模型自由生成时会不会刚好生成 chosen？}
+\]
+
+而是问：
+
+\[
+\text{如果把 chosen 的前缀一步步喂给模型，模型给 chosen 每个下一个 token 的概率有多高？}
+\]
+
+rejected 也一样。DPO 比较的是模型沿着 chosen 路径和 rejected 路径时，各自给出的总 logprob。
+
+\subsubsection{再追问：Teacher Forcing 能控制模型输出吗}
+
+不能。这个问题非常关键。
+
+Teacher forcing 不能强迫模型\key{输出}某个 token。它只控制模型每一步看到的\key{输入上下文}。训练时模型也不是必须真的采样出一句话，而是输出一个词表上的概率分布。
+
+假设用户问：
+
+\[
+x = \text{``今天吃饭了吗？''}
+\]
+
+标准回答简化成三个 token：
+
+\[
+y^\ast = (\text{``你好''},\ \text{``刚吃完''},\ \text{``你吃了吗''})
+\]
+
+在 teacher forcing 下，第二步会把真实前缀喂进去：
+
+\[
+\text{输入上下文} = x + \text{``你好''}
+\]
+
+然后模型输出的不是一个确定文本，而是一个概率分布：
+
+\[
+\pi_\theta(\cdot \mid x, \text{``你好''})
+\]
+
+这个分布里可能是：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{4cm}}
+\hline
+\textbf{候选下一个 token} & \textbf{模型给的概率} \\
+\hline
+``刚吃完'' & $0.20$ \\
+``没吃'' & $0.35$ \\
+``不知道'' & $0.10$ \\
+其他 token & $0.35$ \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+如果标准答案的下一个 token 是 ``刚吃完''，训练时不会说“模型必须输出它”。训练做的是取出这个 token 的概率：
+
+\[
+\pi_\theta(\text{``刚吃完''} \mid x, \text{``你好''}) = 0.20
+\]
+
+然后计算 loss：
+
+\[
+-\log 0.20
+\]
+
+如果概率低，loss 就大；反向传播会推动模型以后在这个上下文下提高 ``刚吃完'' 的概率。
+
+\begin{warnbox}
+\textbf{关键点：} teacher forcing 不是控制输出，而是\key{指定要评分的答案路径}。模型可以给真实 token 很低概率，这时 loss 会惩罚它；如果给真实 token 高概率，loss 就小。
+\end{warnbox}
+
+再看第三步。即使模型第二步最想生成的是 ``没吃''，teacher forcing 也不会把 ``没吃'' 接到上下文里。它仍然使用真实前缀：
+
+\[
+x + \text{``你好''} + \text{``刚吃完''}
+\]
+
+然后检查模型给第三个真实 token ``你吃了吗'' 多大概率：
+
+\[
+\pi_\theta(\text{``你吃了吗''} \mid x, \text{``你好''}, \text{``刚吃完''})
+\]
+
+所以 teacher forcing 的本质是：
+
+\[
+\text{不让模型自己的错误前缀污染后续训练位置}
+\]
+
+\begin{summarybox}
+\textbf{最小结论：} teacher forcing 不保证模型输出正确 token。\\
+它只是把真实答案前缀作为输入上下文，然后问模型：
+\[
+\text{在这个上下文下，你给真实下一个 token 多大概率？}
+\]
+训练通过 cross entropy / negative log likelihood，让这个概率逐渐变高。
+\end{summarybox}
+
+\subsubsection{追问：怎么知道真实 token 是哪个}
+
+训练时不需要先 decode 成文本再对照。真实答案本来就在数据里，训练前会先经过 tokenizer，变成 token id 序列。
+
+例如标准回答是：
+
+\[
+\text{``你好，刚吃完''}
+\]
+
+tokenizer 会把它变成类似：
+
+\[
+y^\ast = [101, 527, 834, 912]
+\]
+
+这些 id 就是训练时的 label。模型 forward 后，在每个位置输出一个 logits 向量：
+
+\[
+\text{logits}_t \in \mathbb{R}^{|\mathcal{V}|}
+\]
+
+其中 $|\mathcal{V}|$ 是词表大小。对 logits 做 log-softmax 得到每个 token 的 log probability：
+
+\[
+\log p_t = \log \operatorname{softmax}(\text{logits}_t)
+\]
+
+然后直接用真实 token id 去取对应位置的 logprob：
+
+\[
+\log p_t[y_t^\ast]
+\]
+
+这一步在代码里通常叫 \code{gather}。
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.2cm}p{3.2cm}p{3.2cm}p{3.2cm}}
+\hline
+\textbf{位置} & \textbf{输入上下文} & \textbf{真实下一个 token id} & \textbf{取出的值} \\
+\hline
+$t=1$ & $x$ & $y_1^\ast$ & $\log p_1[y_1^\ast]$ \\
+$t=2$ & $x,y_1^\ast$ & $y_2^\ast$ & $\log p_2[y_2^\ast]$ \\
+$t=3$ & $x,y_1^\ast,y_2^\ast$ & $y_3^\ast$ & $\log p_3[y_3^\ast]$ \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+所以判断“真实 token 是哪个”不靠模型输出，也不靠 decode 对照，而是靠训练样本里的 label id。
+
+\begin{warnbox}
+\textbf{关键点：} 模型输出的是整个词表的概率分布；真实 token id 来自数据集标签。训练只需要在模型分布里取出 label token 对应的概率，然后算 loss。
+\end{warnbox}
+
+代码直觉大概是：
+
+\[
+\text{labels} = [y_1^\ast, y_2^\ast, \ldots, y_T^\ast]
+\]
+
+\[
+\text{logprobs} = \log \operatorname{softmax}(\text{logits})
+\]
+
+\[
+\text{selected\_logprobs}
+=
+\operatorname{gather}(\text{logprobs}, \text{labels})
+\]
+
+最后：
+
+\[
+\log \pi_\theta(y^\ast \mid x)
+=
+\sum_t \text{selected\_logprobs}_t
+\]
+
+\begin{summarybox}
+\textbf{最小结论：} 不需要 decode。训练数据已经给了真实 token id，模型给出每个位置的全词表概率分布，直接用 label id 取概率即可。
+\end{summarybox}
+
+\subsubsection{确认理解：Teacher Forcing 的完整过程}
+
+可以把你的理解整理成更标准的一句话：
+
+\begin{summarybox}
+\textbf{Teacher forcing = 把 prompt 和真实答案前缀作为输入，让模型在每个位置输出全词表 logits，然后用真实下一个 token 的 id 去取对应概率。}
+\end{summarybox}
+
+这里注意两个术语：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 是 \code{logits}，不是 logic。logits 是 softmax 前的未归一化分数；
+  \item 是 teacher \code{forcing}，意思是强行使用真实答案前缀作为上下文。
+\end{itemize}
+
+更具体地说：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 数据里有 prompt $x$ 和真实答案 $y^\ast$；
+  \item tokenizer 把 $y^\ast$ 变成 token id，例如 $[y_1^\ast,y_2^\ast,\ldots,y_T^\ast]$；
+  \item 模型看到的是 $x$ 加真实答案前缀；
+  \item 每个位置输出一个全词表 logits 向量；
+  \item 对 logits 做 log-softmax，得到每个候选 token 的 logprob；
+  \item 用真实下一个 token 的 id 取出对应 logprob；
+  \item 把这些 logprob 加起来，就是这段真实答案在模型下的 sequence logprob。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{直觉：} teacher forcing 问的是：我已经把正确前缀给你了，在这个条件下，你给我希望的下一个 token 多大概率？
+\end{intubox}
+
+所以 DPO 训练时会分别计算：
+
+\[
+\log \pi_\theta(y_w \mid x),
+\quad
+\log \pi_\theta(y_l \mid x),
+\quad
+\log \pi_\text{ref}(y_w \mid x),
+\quad
+\log \pi_\text{ref}(y_l \mid x)
+\]
+
+然后把它们放进 DPO loss。
+
+\begin{warnbox}
+\textbf{注意：} DPO 里的 reference model 不是 old policy。\\
+它通常是冻结的 SFT 模型，用来定义“不要偏离原始 assistant 太远”的基准。
+\end{warnbox}
+
+\subsubsection{DPO 的直觉}
+
+假设对同一个 prompt，有两个回答：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.4cm}p{10.4cm}}
+\hline
+\textbf{chosen} & 正确、结构清楚、符合用户需求 \\
+\textbf{rejected} & 有错误、啰嗦、或者不符合指令 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+DPO 希望训练后满足：
+
+\[
+\log
+\frac{\pi_\theta(y_w \mid x)}{\pi_\text{ref}(y_w \mid x)}
+>
+\log
+\frac{\pi_\theta(y_l \mid x)}{\pi_\text{ref}(y_l \mid x)}
+\]
+
+也就是说，当前 policy 相比 reference model，要更明显地偏向 chosen。
+
+\begin{intubox}
+\textbf{直觉：} reference model 本来可能也偏向 chosen，只是不够强。DPO 做的是把这种偏好差距拉大：chosen 相对 reference 更上升，rejected 相对 reference 更下降。
+\end{intubox}
+
+\subsubsection{$\beta$ 的作用}
+
+DPO loss 里的 $\beta$ 控制偏好优化的强度：
+
+\[
+\beta
+\left[
+\log
+\frac{\pi_\theta(y_w \mid x)}{\pi_\text{ref}(y_w \mid x)}
+-
+\log
+\frac{\pi_\theta(y_l \mid x)}{\pi_\text{ref}(y_l \mid x)}
+\right]
+\]
+
+可以粗略理解为：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 在 KL-regularized RLHF 推导里，$\beta$ 可以看成 KL 约束的强度尺度；
+  \item 在 DPO loss 里，$\beta$ 会缩放 preference logit，影响梯度大小和 sigmoid 饱和速度；
+  \item 实际训练中，$\beta$ 是控制偏好拟合和 reference 约束之间平衡的超参数。
+\end{itemize}
+
+不同资料对 $\beta$ 的直觉表述有时会受公式写法影响。更稳妥的记法是：\key{$\beta$ 控制 DPO 偏好优化的温度 / 强度尺度，需要结合实现和实验调参理解}。
+
+\subsubsection{DPO 和 SFT / RM / PPO 的关系}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.4cm}p{3.5cm}p{3.5cm}p{3.4cm}}
+\hline
+\textbf{方法} & \textbf{数据} & \textbf{训练对象} & \textbf{核心思想} \\
+\hline
+SFT
+&
+$(x, y^\ast)$
+&
+Policy
+&
+模仿标准答案
+\\
+Reward Model
+&
+$(x, y_w, y_l)$
+&
+Reward function
+&
+学习回答好坏排序
+\\
+PPO / RLHF
+&
+Prompt + online rollout + reward
+&
+Policy + value model
+&
+用 reward 优化 policy，同时加 KL 约束
+\\
+DPO
+&
+$(x, y_w, y_l)$
+&
+Policy
+&
+直接让 policy 相比 reference 更偏向 chosen
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{DPO 的优点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 不需要显式训练 Reward Model；
+  \item 不需要 PPO 的 online rollout；
+  \item 不需要 value model / critic；
+  \item 训练流程更像普通 supervised fine-tuning，工程更简单；
+  \item 直接利用 chosen / rejected 偏好数据。
+\end{itemize}
+
+因此 DPO 很适合做离线偏好对齐：
+
+\[
+\text{已有偏好数据}
+\to
+\text{直接优化模型偏好}
+\]
+
+\subsubsection{DPO 的局限}
+
+DPO 也不是免费午餐。它的局限包括：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{依赖离线偏好数据。} 数据覆盖不到的区域，DPO 不会主动探索。
+  \item \textbf{没有在线试错。} PPO / GRPO 可以让模型生成新答案再打分，DPO 主要从已有 chosen / rejected 中学习。
+  \item \textbf{容易受偏好数据质量影响。} 如果 chosen / rejected 标注噪声大，DPO 会直接学到错误偏好。
+  \item \textbf{不天然适合可验证奖励搜索。} 对数学、代码这类任务，模型可能需要通过大量采样探索更高 reward 的解法，这会引出后面的 GRPO / RLVR。
+\end{enumerate}
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{DPO = 用偏好对直接训练 policy。}\\
+核心 loss：
+\[
+\mathcal{L}_\text{DPO}
+=
+-
+\log
+\sigma
+\left(
+\beta
+\left[
+\log
+\frac{\pi_\theta(y_w \mid x)}{\pi_\text{ref}(y_w \mid x)}
+-
+\log
+\frac{\pi_\theta(y_l \mid x)}{\pi_\text{ref}(y_l \mid x)}
+\right]
+\right)
+\]
+核心直觉：让当前 policy 相比 reference，更偏向 chosen 而不是 rejected。\\
+核心代价：DPO 更简单，但少了在线探索能力，因此后面会引出 GRPO / RLVR。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item DPO 相比 PPO/RLHF 省掉了哪些东西？
+  \item DPO 为什么还需要 reference model？
+  \item DPO loss 里 $\pi_\theta$ 和 $\pi_\text{ref}$ 分别是什么？
+  \item DPO 是单纯提高 chosen 概率吗？为什么不是？
+  \item DPO 的局限如何引出 GRPO / RLVR？
+\end{enumerate}

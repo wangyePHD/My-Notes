@@ -1,0 +1,475 @@
+% ============================================================
+% Round 02: Diffusion / Flow Minimal Foundations for Post-Training
+% ============================================================
+
+\subsection{Round 02：Diffusion / Flow 后训练最小基础}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 只补后训练需要的 Diffusion / Flow 基础：trajectory 是什么、action 是什么、logprob 从哪里来、最终图像 reward 如何作用到中间生成步骤。\\
+\textbf{主线位置：}
+\[
+\text{图像编辑任务本体}
+\to
+\text{Diffusion / Flow 后训练基础}
+\to
+\text{Reward / Preference}
+\to
+\text{Diffusion-DPO / DDPO / Flow-GRPO}
+\]
+\end{conceptbox}
+
+\subsubsection{为什么要先补 Diffusion / Flow}
+
+文本侧后训练里，policy 很清楚：
+
+\[
+\pi_\theta(y_t \mid x,y_{<t})
+\]
+
+每一步 action 是下一个 token，logprob 也很自然：
+
+\[
+\log \pi_\theta(y_t \mid x,y_{<t})
+\]
+
+但图像生成 / 编辑模型不是逐 token 生成，而是从噪声 latent 逐步变成图像：
+
+\[
+z_T
+\to
+z_{T-1}
+\to
+\cdots
+\to
+z_0
+\to
+I
+\]
+
+所以图像后训练首先要回答：
+
+\[
+\text{这条生成轨迹里，哪一步算 action？}
+\]
+
+\[
+\text{每一步有没有概率？能不能算 logprob？}
+\]
+
+\[
+\text{最终图像的 reward 怎么分配给中间步骤？}
+\]
+
+\begin{summarybox}
+\textbf{一句话：} 文本后训练优化 token distribution；图像后训练优化 denoising / flow trajectory。
+\end{summarybox}
+
+\subsubsection{Diffusion 的最小图景}
+
+Diffusion model 有两个过程：
+
+\[
+\text{forward noising}
+\qquad
+\text{reverse denoising}
+\]
+
+\paragraph{Forward noising}
+
+训练时，把真实图像 latent $z_0$ 逐步加噪：
+
+\[
+z_0
+\to
+z_1
+\to
+\cdots
+\to
+z_T
+\]
+
+其中 $z_T$ 接近纯高斯噪声。
+
+常见写法是：
+
+\[
+q(z_t \mid z_0)
+=
+\mathcal{N}
+\left(
+\sqrt{\bar{\alpha}_t}z_0,\;
+(1-\bar{\alpha}_t)I
+\right)
+\]
+
+直觉是：$t$ 越大，图像信息越少，噪声越多。
+
+\paragraph{Reverse denoising}
+
+推理时，从噪声 $z_T$ 出发，一步步去噪：
+
+\[
+z_T
+\to
+z_{T-1}
+\to
+\cdots
+\to
+z_0
+\]
+
+模型学习的是反向转移：
+
+\[
+p_\theta(z_{t-1}\mid z_t,c)
+\]
+
+其中 $c$ 是条件。对图像编辑来说，条件通常包括：
+
+\[
+c = (I_\text{src}, \text{edit instruction})
+\]
+
+\begin{intubox}
+\textbf{直觉：} Diffusion 的每一步都在问：当前这个 noisy latent 应该怎么变得更干净一点，同时符合原图和编辑指令？
+\end{intubox}
+
+\subsubsection{Diffusion 里的 Policy、Action、Trajectory}
+
+从 RL 角度看，reverse denoising 可以看成一个多步决策过程。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{9.8cm}}
+\hline
+\textbf{RL 概念} & \textbf{Diffusion / Image Editing 中的含义} \\
+\hline
+State $s_t$
+&
+当前 latent $z_t$，时间步 $t$，原图 $I_\text{src}$，编辑指令 $c$
+\\
+Action $a_t$
+&
+采样下一个 latent $z_{t-1}$，或模型预测的噪声 / velocity / score
+\\
+Policy $\pi_\theta$
+&
+反向去噪模型 $p_\theta(z_{t-1}\mid z_t,I_\text{src},c,t)$
+\\
+Trajectory
+&
+$z_T,z_{T-1},\ldots,z_0$ 这整条去噪路径
+\\
+Reward
+&
+最终图像 $I_\text{edit}$ 的编辑质量、保真度、美学、人类偏好分数
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+如果反向转移是随机高斯：
+
+\[
+z_{t-1}
+\sim
+\mathcal{N}
+\left(
+\mu_\theta(z_t,t,c),\;
+\sigma_t^2 I
+\right)
+\]
+
+那么每一步都有 logprob：
+
+\[
+\log p_\theta(z_{t-1}\mid z_t,c,t)
+\]
+
+这就能接上 PPO / DDPO / GRPO：
+
+\[
+\rho_t(\theta)
+=
+\frac{
+p_\theta(z_{t-1}\mid z_t,c,t)
+}{
+p_{\theta_\text{old}}(z_{t-1}\mid z_t,c,t)
+}
+\]
+
+\begin{summarybox}
+\textbf{Diffusion RL 的关键：} 只要每一步反向采样有概率密度，就能像文本 PPO 那样计算 old logprob、new logprob 和 ratio。
+\end{summarybox}
+
+\subsubsection{最终 Reward 怎么给中间步骤}
+
+图像 reward 通常只在最后才知道：
+
+\[
+I_\text{edit}
+=
+\operatorname{Decode}(z_0)
+\]
+
+\[
+R
+=
+R(I_\text{src},c,I_\text{edit})
+\]
+
+这个 reward 是整张最终图像的分数，而不是每一步 $z_t$ 都有分数。
+
+所以最简单的做法是：整条 trajectory 共享同一个 reward 或 advantage：
+
+\[
+A_t \approx A
+\]
+
+于是所有去噪步骤都朝同一个方向更新：
+
+\[
+\sum_t
+\log p_\theta(z_{t-1}\mid z_t,c,t)
+\cdot A
+\]
+
+\begin{warnbox}
+\textbf{信用分配难点：} 如果最终图像不好，到底是哪一步去噪造成的？早期构图错了？中期语义错了？后期细节坏了？只用最终 reward 很难精确回答。
+\end{warnbox}
+
+这就是图像后训练里很多方法要研究 timestep weighting、early-step optimization、trajectory reconstruction、process reward 的原因。
+
+\subsubsection{Flow Matching 的最小图景}
+
+Flow Matching / Rectified Flow 的思路和 diffusion 不一样。
+
+它通常构造一条从真实图像 $x_0$ 到噪声 $x_1$ 的连续路径：
+
+\[
+x_t = (1-t)x_0 + t x_1,
+\qquad
+t\in[0,1]
+\]
+
+其中：
+
+\[
+t=0 \Rightarrow x_t=x_0
+\]
+
+\[
+t=1 \Rightarrow x_t=x_1
+\]
+
+模型学习速度场：
+
+\[
+v_\theta(x_t,t,c)
+\]
+
+训练目标是让预测速度接近真实路径速度：
+
+\[
+\mathcal{L}_\text{FM}
+=
+\mathbb{E}
+\left[
+\left\|
+v_\theta(x_t,t,c)
+-
+(x_1-x_0)
+\right\|^2
+\right]
+\]
+
+推理时，从噪声出发，沿 ODE 积分回图像：
+
+\[
+\frac{dx_t}{dt}
+=
+v_\theta(x_t,t,c)
+\]
+
+离散写成：
+
+\[
+x_{t-\Delta t}
+=
+x_t
+-
+v_\theta(x_t,t,c)\Delta t
+\]
+
+\begin{intubox}
+\textbf{直觉：} Diffusion 更像“逐步去噪”；Flow Matching 更像“学习一个速度场，让噪声沿着流动路径变成图像”。
+\end{intubox}
+
+\subsubsection{Flow 的 RL 难点：ODE 没有 Logprob}
+
+Flow Matching 默认推理是 ODE：
+
+\[
+x_{t-\Delta t}
+=
+f_\theta(x_t,t,c)
+\]
+
+给定当前状态 $x_t$、时间 $t$ 和条件 $c$，下一步是确定的。
+
+这对生成很方便，但对 RL 很麻烦：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 没有随机性，探索弱；
+  \item 没有正常的概率密度，难以计算 $\log p_\theta(x_{t-\Delta t}\mid x_t,c,t)$；
+  \item 没有 logprob，就很难计算 PPO / GRPO 的 ratio。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{核心矛盾：} 文本 PPO / diffusion RL 需要 logprob；deterministic flow ODE 默认不给你 logprob。
+\end{warnbox}
+
+所以 Flow-GRPO 这类方法会把 ODE 改造成带随机性的 SDE：
+
+\[
+x_{t-\Delta t}
+=
+\mu_\theta(x_t,t,c)
++
+\sigma_t\sqrt{\Delta t}\epsilon,
+\qquad
+\epsilon\sim\mathcal{N}(0,I)
+\]
+
+这样每一步转移就变成高斯：
+
+\[
+p_\theta(x_{t-\Delta t}\mid x_t,c,t)
+=
+\mathcal{N}
+\left(
+x_{t-\Delta t};
+\mu_\theta(x_t,t,c),
+\sigma_t^2\Delta t I
+\right)
+\]
+
+于是可以计算：
+
+\[
+\log p_\theta(x_{t-\Delta t}\mid x_t,c,t)
+\]
+
+也就可以做 GRPO ratio。
+
+\begin{summarybox}
+\textbf{Flow-GRPO 的最小动机：} 把 deterministic ODE 变成 stochastic SDE，让 flow trajectory 既能探索，也能计算 logprob。
+\end{summarybox}
+
+\subsubsection{Diffusion 和 Flow 的后训练差别}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+ & \textbf{Diffusion} & \textbf{Flow Matching} \\
+\hline
+生成过程
+&
+随机去噪 Markov chain
+&
+通常是确定性 ODE flow
+\\
+每步概率
+&
+通常天然有 $p_\theta(z_{t-1}\mid z_t)$
+&
+ODE 默认没有，需要 SDE 化或其他技巧
+\\
+RL 接入
+&
+较自然，可算 denoising step logprob
+&
+要先引入随机性和可计算 logprob
+\\
+trajectory
+&
+denoising trajectory
+&
+flow / ODE / SDE trajectory
+\\
+典型方法
+&
+DDPO, Diffusion-DPO
+&
+Flow-GRPO, LeapAlign
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{图像编辑条件如何进入模型}
+
+图像编辑不是只给文本条件 $c$。更准确是：
+
+\[
+c_\text{edit}
+=
+(I_\text{src}, \text{instruction})
+\]
+
+不同模型会用不同方式注入原图：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把原图编码成 latent，与 noisy latent 拼接；
+  \item 用 VAE encoder 提供外观控制；
+  \item 用 VLM / image encoder 提供语义控制；
+  \item 用 mask 指定可编辑区域；
+  \item 用 cross-attention 注入文本编辑指令。
+\end{itemize}
+
+因此图像编辑的反向转移更像：
+
+\[
+p_\theta(z_{t-1}
+\mid
+z_t,\;
+I_\text{src},\;
+c,\;
+t)
+\]
+
+\begin{intubox}
+\textbf{直觉：} text-to-image 只问“按文本生成什么”；image editing 还要问“基于这张原图，哪些内容该继承，哪些内容该改变”。
+\end{intubox}
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{Diffusion / Flow 后训练最小基础：}\\
+Diffusion 生成是一条随机去噪轨迹：
+\[
+z_T\to z_{T-1}\to\cdots\to z_0
+\]
+每一步通常有 logprob，因此能自然接 PPO / DDPO / GRPO。\\
+Flow Matching 生成通常是确定性 ODE：
+\[
+\frac{dx_t}{dt}=v_\theta(x_t,t,c)
+\]
+默认没有 logprob，所以做 RL 时常需要 SDE 化，引入随机性和可计算转移概率。\\
+图像编辑后训练的核心难点是：最终图像 reward 如何稳定地作用到 denoising / flow trajectory 的中间步骤。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Diffusion 的 forward noising 和 reverse denoising 分别是什么？
+  \item 在 diffusion RL 里，state、action、trajectory、reward 分别对应什么？
+  \item 为什么 diffusion 的每步随机转移更容易接 PPO / GRPO？
+  \item Flow Matching 的 ODE 为什么不能直接算 logprob？
+  \item Flow-GRPO 为什么要把 ODE 改成 SDE？
+\end{enumerate}

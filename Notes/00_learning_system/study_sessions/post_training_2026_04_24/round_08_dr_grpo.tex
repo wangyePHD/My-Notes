@@ -1,0 +1,411 @@
+% ============================================================
+% Round 08: Dr.GRPO
+% ============================================================
+
+\subsection{Round 08：Dr.GRPO}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解 Dr.GRPO 为什么认为原始 GRPO / DAPO 仍然有优化偏置，以及它如何通过去掉 response length normalization 和 reward std scaling 来提高 token efficiency。\\
+\textbf{主线位置：}
+\[
+\text{GRPO}
+\to
+\text{DAPO}
+\to
+\text{Dr.GRPO}
+\to
+\text{GSPO}
+\]
+\end{conceptbox}
+
+\begin{conceptbox}
+\textbf{Highlight：Dr.GRPO}\\
+\textbf{论文：} \emph{Understanding R1-Zero-Like Training: A Critical Perspective}\\
+\textbf{arXiv：} \href{https://arxiv.org/abs/2503.20783}{2503.20783}，submitted 2025-03-26\\
+\textbf{OpenReview：} \href{https://openreview.net/forum?id=5PAF7PAY2Y}{COLM 2025 submission / revision page}\\
+\textbf{Code：} \href{https://github.com/sail-sg/understand-r1-zero}{sail-sg/understand-r1-zero}\\
+\textbf{关键词：} R1-Zero-like training，GRPO bias，length bias，difficulty bias，critic-free RL，token efficiency\\
+\textbf{核心定位：} 批判性分析 R1-Zero 类训练中的优化偏置，提出 Dr.GRPO 来减少错误回答变长和 token 浪费。
+\end{conceptbox}
+
+\subsubsection{Dr.GRPO 想修什么}
+
+DAPO 已经在 GRPO 上做了很多工程改进：
+
+\[
+\text{Dynamic Sampling}
+\quad
+\text{Clip-Higher}
+\quad
+\text{Token-Level Loss}
+\quad
+\text{Overlong Shaping}
+\]
+
+但 Dr.GRPO 关注的问题更“数学化”：它认为原始 GRPO objective 里有两个容易被忽略的优化偏置：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{response length bias：} 由每条回答自己的长度归一化 $1/|o_i|$ 引入；
+  \item \textbf{difficulty / std scaling bias：} 由组内 reward 标准差归一化 $1/\operatorname{std}(\{r_j\})$ 引入。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{一句话：} Dr.GRPO = Group Relative Policy Optimization Done Right。它的核心不是加新技巧，而是删掉会扭曲梯度权重的归一化项。
+\end{summarybox}
+
+\subsubsection{先看原始 GRPO 的两个归一化}
+
+原始 GRPO 常见 loss 写法是：
+
+\[
+\mathcal{L}_\text{GRPO}
+=
+-
+\frac{1}{G}
+\sum_{i=1}^{G}
+\frac{1}{|o_i|}
+\sum_{t=1}^{|o_i|}
+l_{i,t}
+\]
+
+其中：
+
+\[
+l_{i,t}
+\approx
+\rho_{i,t}(\theta)\hat{A}_i
+\]
+
+而 group advantage 通常是：
+
+\[
+\hat{A}_i
+=
+\frac{
+r_i-\operatorname{mean}(\{r_j\}_{j=1}^{G})
+}{
+\operatorname{std}(\{r_j\}_{j=1}^{G})+\epsilon
+}
+\]
+
+所以这里有两个归一化：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{8.8cm}}
+\hline
+\textbf{归一化项} & \textbf{作用} \\
+\hline
+$1/|o_i|$
+&
+每条回答内部按自己的长度平均 token loss。
+\\
+$1/\operatorname{std}(\{r_j\})$
+&
+把同一个 prompt 的 group reward 标准化到近似单位方差。
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+Dr.GRPO 的核心观点是：这两个项看起来像正常化技巧，但会改变不同样本的真实优化权重。
+
+\subsubsection{问题一：Response Length Bias}
+
+先看长度项：
+
+\[
+\frac{1}{|o_i|}
+\sum_{t=1}^{|o_i|}
+l_{i,t}
+\]
+
+这表示每条回答不管多长，都会先变成一个平均值。
+
+如果两个回答的 advantage 相同：
+
+\[
+\hat{A}_1 = \hat{A}_2
+\]
+
+但长度不同：
+
+\[
+|o_1| = 100,
+\qquad
+|o_2| = 1000
+\]
+
+那么原始 GRPO 会让两条回答的总 loss 权重差不多，而不是让长回答里的 1000 个 token 都按同样强度参与更新。
+
+\begin{warnbox}
+\textbf{关键问题：} 这种按 response 自身长度平均的写法，会让回答长度参与决定梯度权重。Dr.GRPO 认为这会造成 response-level length bias。
+\end{warnbox}
+
+在 reasoning RL 中，这个偏置特别麻烦，因为模型的回答长度本身也在训练中变化。也就是说，模型不只是学习“怎么答对”，还可能被 objective 暗中鼓励某些长度行为。
+
+论文特别指出，原始 GRPO 可能使回答长度持续增长，尤其是错误回答变长。这会造成：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item token efficiency 下降；
+  \item 错误回答里出现更多无效思考；
+  \item 表面上像 long-CoT emergent behavior，但其中一部分其实来自优化偏置。
+\end{itemize}
+
+\subsubsection{Dr.GRPO 怎么修长度偏置}
+
+Dr.GRPO 不再用每条回答自己的长度 $|o_i|$ 做归一化，而是用一个固定常数 $L$。通常 $L$ 可以取最大生成长度：
+
+\[
+L = T_\text{max}
+\]
+
+Dr.GRPO loss 写成：
+
+\[
+\mathcal{L}_\text{Dr.GRPO}
+=
+-
+\frac{1}{LG}
+\sum_{i=1}^{G}
+\sum_{t=1}^{|o_i|}
+l_{i,t}
+\]
+
+对比一下：
+
+\[
+\mathcal{L}_\text{GRPO}
+=
+-
+\frac{1}{G}
+\sum_i
+\frac{1}{|o_i|}
+\sum_t l_{i,t}
+\]
+
+\[
+\mathcal{L}_\text{DAPO}
+=
+-
+\frac{1}{\sum_i |o_i|}
+\sum_i
+\sum_t l_{i,t}
+\]
+
+\[
+\mathcal{L}_\text{Dr.GRPO}
+=
+-
+\frac{1}{LG}
+\sum_i
+\sum_t l_{i,t}
+\]
+
+\begin{intubox}
+\textbf{直觉：} 原始 GRPO 是“每条回答用自己的长度归一化”；DAPO 是“用当前 batch 的总 token 数归一化”；Dr.GRPO 是“用固定最大长度归一化”。固定常数不随模型生成长度变化，因此更不容易引入长度偏置。
+\end{intubox}
+
+\subsubsection{问题二：Reward Std Scaling Bias}
+
+标准 GRPO 的 advantage 常写成：
+
+\[
+\hat{A}_i
+=
+\frac{
+r_i-\mu_\text{group}
+}{
+\sigma_\text{group}+\epsilon
+}
+\]
+
+这里：
+
+\[
+\mu_\text{group}
+=
+\operatorname{mean}(\{r_j\})
+\]
+
+\[
+\sigma_\text{group}
+=
+\operatorname{std}(\{r_j\})
+\]
+
+均值中心化是合理的，它让同组回答相对比较：
+
+\[
+r_i-\mu_\text{group}
+\]
+
+但再除以组内标准差，会改变不同 prompt 的权重。
+
+举例说，同样是二值 reward，如果一个 group 的正确率接近一半：
+
+\[
+[0,1,0,1]
+\]
+
+它的标准差较大。
+
+如果一个 group 只有一个样本和其他不一样：
+
+\[
+[0,0,0,1]
+\]
+
+它的标准差较小。除以更小的 $\sigma$ 会放大这类 group 的梯度。
+
+\begin{warnbox}
+\textbf{关键问题：} reward std scaling 不只是“数值稳定”，它会让不同难度、不同 reward 分布的 prompt 获得不同训练权重。Dr.GRPO 把这称为一种 difficulty / question-level bias。
+\end{warnbox}
+
+\subsubsection{Dr.GRPO 怎么修 Std Scaling Bias}
+
+Dr.GRPO 建议去掉组内 std scaling，只保留均值 baseline：
+
+\[
+\hat{A}_i
+=
+r_i-\operatorname{mean}(\{r_j\}_{j=1}^{G})
+\]
+
+也就是说，从：
+
+\[
+\frac{r_i-\mu_\text{group}}{\sigma_\text{group}+\epsilon}
+\]
+
+改成：
+
+\[
+r_i-\mu_\text{group}
+\]
+
+\begin{intubox}
+\textbf{直觉：} 均值 baseline 负责告诉模型“比同组平均好还是差”；std scaling 会额外改变这个 prompt 的整体权重。Dr.GRPO 认为后者会带来不想要的难度偏置。
+\end{intubox}
+
+\subsubsection{Dr.GRPO 的完整改法}
+
+因此 Dr.GRPO 的两个主要修改是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 不用每条回答的 $|o_i|$ 做归一化，改用固定常数 $L$；
+  \item 不用组内 reward std scaling，advantage 用 $r_i-\mu_\text{group}$。
+\end{enumerate}
+
+可以把它简化写成：
+
+\[
+\mathcal{L}_\text{Dr.GRPO}
+=
+-
+\frac{1}{LG}
+\sum_{i=1}^{G}
+\sum_{t=1}^{|o_i|}
+\rho_{i,t}(\theta)
+\left(
+r_i-\mu_\text{group}
+\right)
+\]
+
+实际实现中仍然可以保留 PPO-style clip、old policy ratio 等机制；Dr.GRPO 的核心是在 loss normalization 和 advantage scaling 上去偏。
+
+\subsubsection{GRPO / DAPO / Dr.GRPO 对比}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{3.2cm}p{3.2cm}p{3.2cm}}
+\hline
+ & \textbf{GRPO} & \textbf{DAPO} & \textbf{Dr.GRPO} \\
+\hline
+长度归一化
+&
+$1/|o_i|$
+&
+$1/\sum_i |o_i|$
+&
+$1/(LG)$
+\\
+是否依赖生成长度
+&
+依赖单条长度
+&
+依赖 batch 总长度
+&
+不依赖，使用固定常数
+\\
+reward std scaling
+&
+通常使用
+&
+通常沿用
+&
+建议去掉
+\\
+主要目标
+&
+critic-free online RL
+&
+工程稳定性
+&
+去除优化偏置，提高 token efficiency
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{Dr.GRPO 的直觉}
+
+Dr.GRPO 的思想可以很朴素地理解：
+
+\[
+\text{不要让回答长度决定训练权重}
+\]
+
+\[
+\text{不要让 group reward 标准差决定 prompt 权重}
+\]
+
+也就是说，模型应该因为答案质量被强化或惩罚，而不是因为这个回答刚好长、这个 group 的 reward 方差刚好小而被额外放大或缩小。
+
+\begin{summarybox}
+\textbf{一句话：} GRPO / DAPO 更像工程可用的 recipe；Dr.GRPO 更像对这些 recipe 的目标函数体检，指出哪些归一化会悄悄改变优化目标。
+\end{summarybox}
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{Dr.GRPO 的核心：}\\
+去掉 response length normalization：
+\[
+\frac{1}{|o_i|}
+\quad \to \quad
+\frac{1}{L}
+\]
+去掉 reward std scaling：
+\[
+\frac{r_i-\mu}{\sigma}
+\quad \to \quad
+r_i-\mu
+\]
+它要解决的是 GRPO 中的 length bias 和 difficulty / std scaling bias。\\
+核心效果：减少错误回答变长，提高 token efficiency，同时尽量保持 reasoning performance。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 原始 GRPO 里的 $1/|o_i|$ 为什么可能引入长度偏置？
+  \item DAPO 的 token-level loss 和 Dr.GRPO 的常数归一化有什么区别？
+  \item reward std scaling 为什么可能带来 question-level difficulty bias？
+  \item Dr.GRPO 为什么说自己更接近无偏 policy gradient？
+  \item Dr.GRPO 和 DAPO 分别更像“理论修正”还是“工程 recipe”？
+\end{enumerate}

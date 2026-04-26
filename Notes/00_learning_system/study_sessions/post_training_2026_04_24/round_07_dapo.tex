@@ -1,0 +1,464 @@
+% ============================================================
+% Round 07: DAPO
+% ============================================================
+
+\subsection{Round 07：DAPO}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解 DAPO 是如何在 GRPO 基础上改进大规模 reasoning RL 训练稳定性的。重点掌握四个组件：Clip-Higher、Dynamic Sampling、Token-Level Policy Gradient Loss、Overlong Reward Shaping。\\
+\textbf{主线位置：}
+\[
+\text{GRPO}
+\to
+\text{DAPO}
+\to
+\text{Dr.GRPO / GSPO / REINFORCE++}
+\]
+\end{conceptbox}
+
+\begin{conceptbox}
+\textbf{Highlight：DAPO}\\
+\textbf{论文：} \emph{DAPO: An Open-Source LLM Reinforcement Learning System at Scale}\\
+\textbf{arXiv：} \href{https://arxiv.org/abs/2503.14476}{2503.14476}，submitted 2025-03-18，last revised 2025-05-20\\
+\textbf{Project：} \href{https://dapo-sia.github.io/}{dapo-sia.github.io}\\
+\textbf{Code：} \href{https://github.com/BytedTsinghua-SIA/DAPO}{BytedTsinghua-SIA/DAPO}\\
+\textbf{Data / Model：} \href{https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k}{DAPO-Math-17k}，
+\href{https://huggingface.co/BytedTsinghua-SIA/DAPO-Qwen-32B}{DAPO-Qwen-32B}\\
+\textbf{关键词：} GRPO improvement，long-CoT RLVR，Clip-Higher，Dynamic Sampling，Token-Level Loss，Overlong Reward Shaping\\
+\textbf{核心定位：} 在 GRPO 基础上补齐大规模 reasoning RL 的工程 recipe，让训练更稳定、更可复现。
+\end{conceptbox}
+
+\subsubsection{DAPO 是什么}
+
+DAPO = Decoupled Clip and Dynamic sAmpling Policy Optimization。
+
+它不是从零发明一个新 RL 框架，而是在 GRPO 的基础上，针对 long-CoT reasoning RL 的几个工程痛点做系统修补。
+
+标准 GRPO 的核心是：
+
+\[
+\text{同题采样一组回答}
+\to
+\text{组内 reward normalization}
+\to
+\text{PPO-style ratio + clip 更新 policy}
+\]
+
+DAPO 仍然保留这条主线，但加入四个关键技巧：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Clip-Higher；
+  \item Dynamic Sampling；
+  \item Token-Level Policy Gradient Loss；
+  \item Overlong Reward Shaping。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{一句话：} DAPO = 更工程化、更稳定的 GRPO recipe，目标是让 long-CoT RLVR 真正跑起来、跑得稳、跑得有效。
+\end{summarybox}
+
+\subsubsection{DAPO 为什么出现}
+
+论文里的出发点很直接：naive GRPO 在复现大规模 reasoning RL 时会遇到：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item entropy collapse：模型分布越来越尖，探索变少；
+  \item reward noise：尤其是超长被截断样本带来的噪声；
+  \item training instability：训练曲线不稳，性能上不去；
+  \item sample inefficiency：很多 group 全对或全错，几乎没有梯度。
+\end{itemize}
+
+所以 DAPO 的四个组件分别对应这些问题：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.6cm}p{4.2cm}p{5cm}}
+\hline
+\textbf{组件} & \textbf{修的问题} & \textbf{核心动作} \\
+\hline
+Clip-Higher
+&
+entropy collapse，探索不足
+&
+提高 ratio 的上 clip，让好样本概率有更多上升空间
+\\
+Dynamic Sampling
+&
+全对 / 全错 group 没梯度
+&
+只保留同题内既有正确又有错误的 group
+\\
+Token-Level Loss
+&
+sample-level loss 对长回答权重不合理
+&
+按所有有效 token 汇总 loss，而不是每条回答先平均
+\\
+Overlong Reward Shaping
+&
+截断样本 reward 噪声
+&
+过滤或软惩罚超长回答，避免粗暴惩罚污染训练
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{DAPO 的目标函数}
+
+可以把 DAPO 看成 GRPO objective 的一个改进版：
+
+\[
+\mathcal{J}_\text{DAPO}(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{
+\sum_{i=1}^{G}|o_i|
+}
+\sum_{i=1}^{G}
+\sum_{t=1}^{|o_i|}
+\min
+\left(
+\rho_{i,t}(\theta)\hat{A}_{i,t},\;
+\operatorname{clip}
+\left(
+\rho_{i,t}(\theta),
+1-\epsilon_\text{low},
+1+\epsilon_\text{high}
+\right)
+\hat{A}_{i,t}
+\right)
+\right]
+\]
+
+其中：
+
+\[
+\rho_{i,t}(\theta)
+=
+\frac{
+\pi_\theta(o_{i,t}\mid q,o_{i,<t})
+}{
+\pi_{\theta_\text{old}}(o_{i,t}\mid q,o_{i,<t})
+}
+\]
+
+\[
+\hat{A}_{i,t}
+\approx
+\hat{A}_i
+=
+\frac{
+r_i-\operatorname{mean}(\{r_j\}_{j=1}^{G})
+}{
+\operatorname{std}(\{r_j\}_{j=1}^{G})+\epsilon
+}
+\]
+
+注意这里写成 $\hat{A}_{i,t}$，但在常见 outcome reward 设置里，同一个回答 $o_i$ 的所有 token 通常共享同一个回答级 advantage $\hat{A}_i$。
+
+\begin{warnbox}
+\textbf{和标准 GRPO 的两个明显差别：}
+\begin{itemize}[leftmargin=1.5em]
+  \item clip 从对称的 $[1-\epsilon,1+\epsilon]$ 变成非对称的 $[1-\epsilon_\text{low},1+\epsilon_\text{high}]$；
+  \item loss normalization 从每条回答内部先除以 $|o_i|$，变成对整个 group 的有效 token 总数归一化。
+\end{itemize}
+\end{warnbox}
+
+\subsubsection{追问：DAPO 为什么公式里没有 KL}
+
+前面 PPO / GRPO 里我们经常写 KL penalty：
+
+\[
+-
+\beta
+\mathbb{D}_\text{KL}
+(\pi_\theta \| \pi_\text{ref})
+\]
+
+它的作用是防止 policy 偏离 reference model 太远。
+
+但 DAPO 论文在 long-CoT reasoning RL 里做了一个重要取舍：\key{去掉显式 KL penalty}。直觉是，reasoning RL 的目标不是让模型一直贴近初始 instruct model，而是允许模型发展出更长、更复杂的推理分布。
+
+\[
+\text{long-CoT RL}
+\quad
+\Rightarrow
+\quad
+\pi_\theta \text{ 可能需要明显偏离 } \pi_\text{ref}
+\]
+
+如果 KL 约束太强，可能会压制这种推理能力的展开。
+
+\begin{warnbox}
+\textbf{注意：} 这不是说所有 GRPO / RLVR 训练都必须去 KL。是否使用 KL、KL 系数设多大，是一个工程超参数。DAPO 的经验是在它的 long-CoT 数学 RL 设置里，去掉显式 KL 有利于训练。
+\end{warnbox}
+
+\subsubsection{组件一：Clip-Higher}
+
+标准 PPO / GRPO 的 clip 是对称的：
+
+\[
+\operatorname{clip}(\rho,1-\epsilon,1+\epsilon)
+\]
+
+DAPO 改成：
+
+\[
+\operatorname{clip}
+(\rho,1-\epsilon_\text{low},1+\epsilon_\text{high})
+\]
+
+并且通常设置：
+
+\[
+\epsilon_\text{high} > \epsilon_\text{low}
+\]
+
+例如论文中使用过：
+
+\[
+\epsilon_\text{low}=0.20,
+\qquad
+\epsilon_\text{high}=0.28
+\]
+
+为什么要这样做？
+
+如果一个 token 原本概率很低，但是它出现在高 reward 的探索性回答里，标准对称 clip 可能很快限制它的概率上升。这样模型会更容易强化已有高概率 token，而不是探索低概率但有价值的新路径。
+
+\begin{intubox}
+\textbf{直觉：} Clip-Higher 给“提高好样本概率”更多空间，尤其是低概率探索 token，从而缓解 entropy collapse。
+\end{intubox}
+
+它不是放开所有更新。下界仍然保持较小：
+
+\[
+1-\epsilon_\text{low}
+\]
+
+这样可以避免过度降低某些 token 概率，导致采样空间快速坍缩。
+
+\subsubsection{组件二：Dynamic Sampling}
+
+GRPO 的学习信号来自组内差异。假设同一个 prompt 采样 $G=4$ 个回答。
+
+如果 reward 是：
+
+\[
+[1,1,1,1]
+\]
+
+或者：
+
+\[
+[0,0,0,0]
+\]
+
+那么组内 advantage 基本都是 $0$，这组样本几乎不会提供有效梯度。
+
+DAPO 的 Dynamic Sampling 直接过滤这种 group。它保留满足下面条件的 group：
+
+\[
+0
+<
+\left|
+\{o_i \mid \operatorname{is\_correct}(o_i)\}
+\right|
+<
+G
+\]
+
+也就是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 至少有一个正确回答；
+  \item 至少有一个错误回答。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{Dynamic Sampling = 只训练有区分度的 group。}\\
+全对没有可比差异，全错也没有正样本方向；混合 group 才能告诉模型“同一道题里，哪些路径比哪些路径更值得强化”。
+\end{summarybox}
+
+这会多花一些采样成本，但减少无效训练 batch，整体可能更快收敛。
+
+\subsubsection{组件三：Token-Level Policy Gradient Loss}
+
+原始 GRPO 常见写法是 sample-level loss：
+
+\[
+\mathcal{L}_\text{GRPO}
+=
+-
+\frac{1}{G}
+\sum_{i=1}^{G}
+\frac{1}{|o_i|}
+\sum_{t=1}^{|o_i|}
+l_{i,t}
+\]
+
+这个写法先对每条回答内部取平均，再对回答取平均。结果是：
+
+\[
+\text{每条回答的总权重差不多一样}
+\]
+
+不管回答有多长。
+
+在 long-CoT 场景里，这会带来问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 高质量长推理里的每个 token 权重被稀释，学得不够；
+  \item 低质量超长回答里的重复、乱码、绕圈 token 也被稀释，惩罚不够；
+  \item 模型可能学到不健康的长度增长。
+\end{itemize}
+
+DAPO 改成 token-level loss：
+
+\[
+\mathcal{L}_\text{DAPO}
+=
+-
+\frac{1}{
+\sum_{i=1}^{G}|o_i|
+}
+\sum_{i=1}^{G}
+\sum_{t=1}^{|o_i|}
+l_{i,t}
+\]
+
+也就是所有有效 token 放在一起平均。
+
+\begin{intubox}
+\textbf{直觉：} sample-level loss 是“每篇作文权重一样”；token-level loss 是“每个有效 token 权重一样”。在长 CoT 里，后者更能处理长回答中的具体模式。
+\end{intubox}
+
+\subsubsection{组件四：Overlong Reward Shaping}
+
+RL 训练时通常会设置最大生成长度：
+
+\[
+T_\text{max}
+\]
+
+如果回答超过最大长度，就会被截断。
+
+问题是：被截断不一定代表推理是坏的。有时模型可能正在进行合理推理，但因为太长被截断。如果直接给所有截断样本一个强负 reward，会引入 reward noise。
+
+DAPO 讨论了两类做法：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Overlong Filtering：} 对被截断样本 mask loss，不让它们污染训练；
+  \item \textbf{Soft Overlong Punishment：} 不一刀切，而是在超过安全长度后逐渐增加惩罚。
+\end{itemize}
+
+可以抽象写成：
+
+\[
+R_\text{final}
+=
+R_\text{accuracy}
++
+R_\text{length}
+\]
+
+其中 $R_\text{length}$ 在回答过长时变成负数，并随长度逐渐变大。
+
+\begin{warnbox}
+\textbf{关键点：} DAPO 不是简单惩罚所有长回答。它要避免“长但合理的推理”被粗暴打成坏样本，同时也要防止模型无限延长、重复和乱码。
+\end{warnbox}
+
+\subsubsection{DAPO 和 GRPO 的关系}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.7cm}p{4.9cm}}
+\hline
+ & \textbf{GRPO} & \textbf{DAPO} \\
+\hline
+Advantage
+&
+组内 reward normalization
+&
+基本沿用组内 advantage
+\\
+Clip
+&
+对称 clip：$1-\epsilon,1+\epsilon$
+&
+非对称 clip：$1-\epsilon_\text{low},1+\epsilon_\text{high}$
+\\
+采样
+&
+普通 group sampling
+&
+dynamic sampling，过滤全对 / 全错 group
+\\
+Loss 聚合
+&
+常见 sample-level mean
+&
+token-level mean
+\\
+超长样本
+&
+容易带来截断 reward 噪声
+&
+filtering 或 soft overlong punishment
+\\
+目标
+&
+去 critic 的 PPO-style RL
+&
+让 long-CoT RLVR 训练更稳、更有效
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{一个完整 DAPO iteration}
+
+可以把 DAPO 的一轮训练想成：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 从题库采样一批 prompts；
+  \item 令 $\pi_{\theta_\text{old}} \leftarrow \pi_\theta$；
+  \item 对每个 prompt 用 old policy 采样 $G$ 个回答；
+  \item 用 rule-based verifier 给每个回答打 reward；
+  \item 过滤全对 / 全错 group，保留有区分度的 group；
+  \item 对保留的 group 计算组内 advantage；
+  \item 处理超长样本：过滤或加 soft penalty；
+  \item 用当前 policy 重新计算这些回答 tokens 的 logprob；
+  \item 计算 ratio，并使用 asymmetric clip；
+  \item 用 token-level loss 更新 policy。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{最小结论：} DAPO 不是一个完全替代 GRPO 的新范式，而是一个更强的 GRPO 工程配方。\\
+它的四个关键词是：
+\[
+\text{Clip-Higher}
+\quad
+\text{Dynamic Sampling}
+\quad
+\text{Token-Level Loss}
+\quad
+\text{Overlong Shaping}
+\]
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item DAPO 为什么要使用 Clip-Higher，而不是标准对称 clip？
+  \item Dynamic Sampling 为什么要过滤全对和全错的 group？
+  \item sample-level loss 和 token-level loss 的区别是什么？
+  \item 为什么被截断的超长样本会带来 reward noise？
+  \item DAPO 和 GRPO 的关系是“替代”还是“增强”？为什么？
+\end{enumerate}

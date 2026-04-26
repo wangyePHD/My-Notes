@@ -1,0 +1,418 @@
+% ============================================================
+% Round 09: GSPO
+% ============================================================
+
+\subsection{Round 09：GSPO}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解 GSPO 为什么要把 GRPO 的 token-level importance ratio 改成 sequence-level importance ratio，以及这如何提升 long-CoT / MoE RL 训练稳定性。\\
+\textbf{主线位置：}
+\[
+\text{GRPO}
+\to
+\text{DAPO / Dr.GRPO}
+\to
+\text{GSPO}
+\to
+\text{Hybrid / Subsequence-level methods}
+\]
+\end{conceptbox}
+
+\begin{conceptbox}
+\textbf{Highlight：GSPO}\\
+\textbf{论文：} \emph{Group Sequence Policy Optimization}\\
+\textbf{arXiv：} \href{https://arxiv.org/abs/2507.18071}{2507.18071}，submitted 2025-07-24，last revised 2025-07-28\\
+\textbf{Blog：} \href{https://qwenlm.github.io/blog/gspo/}{Qwen: GSPO: Towards Scalable Reinforcement Learning for Language Models}\\
+\textbf{Code：} 论文未提供单独官方 repo；工程实现可参考 \href{https://github.com/modelscope/ms-swift}{modelscope/ms-swift} 和 \href{https://github.com/volcengine/verl}{volcengine/verl}\\
+\textbf{关键词：} sequence-level importance ratio，sequence-level clipping，MoE RL stability，Routing Replay，Qwen3\\
+\textbf{核心定位：} 把 GRPO 的 token-level policy optimization 改成 sequence-level policy optimization，让 reward 粒度和优化粒度对齐。
+\end{conceptbox}
+
+\subsubsection{GSPO 想修什么}
+
+GRPO 的基础公式里，对每个 token 都有 importance ratio：
+
+\[
+\rho_{i,t}(\theta)
+=
+\frac{
+\pi_\theta(y_{i,t}\mid x,y_{i,<t})
+}{
+\pi_{\theta_\text{old}}(y_{i,t}\mid x,y_{i,<t})
+}
+\]
+
+然后用这个 token-level ratio 去更新每个 token：
+
+\[
+\min
+\left(
+\rho_{i,t}\hat{A}_i,\;
+\operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)\hat{A}_i
+\right)
+\]
+
+但在 RLVR / reasoning RL 中，reward 通常不是 token-level 的，而是 sequence-level 的：
+
+\[
+r_i = R(x,y_i)
+\]
+
+例如数学题最后答案对了，整段回答拿 $1$；错了，整段回答拿 $0$。这时每个 token 都共享同一个回答级 advantage：
+
+\[
+\hat{A}_i
+\]
+
+这就产生了粒度不匹配：
+
+\[
+\text{reward 是整段级别}
+\qquad
+\text{ratio 却是逐 token 级别}
+\]
+
+\begin{summarybox}
+\textbf{一句话：} GSPO 认为 GRPO 的 token-level ratio 会给 sequence-level reward 引入高方差噪声，因此应该把 ratio、clip、optimization 都提升到 sequence level。
+\end{summarybox}
+
+\subsubsection{为什么 Token-Level Ratio 会不稳}
+
+在 long-CoT 中，一个回答可能有几千甚至上万 token。只要某些 token 的 ratio 特别大或特别小，就可能影响局部梯度和 clipping 行为。
+
+例如同一个回答里，几个 token ratio 是：
+
+\[
+[1.02,\;0.98,\;5.00,\;1.01,\;0.20,\;1.03]
+\]
+
+这些极端 token ratio 不一定代表整段回答真的应该被剧烈更新，可能只是局部概率波动、数值误差、MoE routing 差异或训练/推理 engine 差异造成的。
+
+但 GRPO 会在 token level 逐个处理：
+
+\[
+\rho_{i,t}
+\to
+\operatorname{clip}(\rho_{i,t})
+\]
+
+结果是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 某些 token 被过度 clipping；
+  \item 梯度噪声随序列长度累积；
+  \item long-CoT 训练更容易不稳定；
+  \item MoE 模型里 expert routing 波动会进一步放大问题。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} GRPO 像是对一篇作文里的每个字单独判断“新模型相对旧模型变了多少”；GSPO 认为 reward 明明是给整篇作文的，就应该从整篇作文的概率变化来判断。
+\end{intubox}
+
+\subsubsection{GSPO 的 Sequence-Level Ratio}
+
+GSPO 对每个回答 $y_i$ 定义一个 sequence-level importance ratio：
+
+\[
+s_i(\theta)
+=
+\left[
+\frac{
+\pi_\theta(y_i\mid x)
+}{
+\pi_{\theta_\text{old}}(y_i\mid x)
+}
+\right]^{1/|y_i|}
+\]
+
+因为：
+
+\[
+\pi_\theta(y_i\mid x)
+=
+\prod_{t=1}^{|y_i|}
+\pi_\theta(y_{i,t}\mid x,y_{i,<t})
+\]
+
+所以可以写成 log 形式：
+
+\[
+s_i(\theta)
+=
+\exp
+\left(
+\frac{1}{|y_i|}
+\sum_{t=1}^{|y_i|}
+\log
+\frac{
+\pi_\theta(y_{i,t}\mid x,y_{i,<t})
+}{
+\pi_{\theta_\text{old}}(y_{i,t}\mid x,y_{i,<t})
+}
+\right)
+\]
+
+注意这里有一个 $1/|y_i|$。它做的是长度归一化，避免整段概率连乘后随着长度指数级变小或 ratio 尺度随长度剧烈变化。
+
+\begin{summarybox}
+\textbf{GSPO ratio 的本质：}
+\[
+s_i(\theta)
+=
+\exp(\text{平均 token log-ratio})
+\]
+它不是看某一个 token 的概率变化，而是看整段回答平均意义上的概率变化。
+\end{summarybox}
+
+\subsubsection{GSPO 的目标函数}
+
+GSPO 的 objective 是 sequence-level 的：
+
+\[
+\mathcal{J}_\text{GSPO}(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{G}
+\sum_{i=1}^{G}
+\min
+\left(
+s_i(\theta)\hat{A}_i,\;
+\operatorname{clip}(s_i(\theta),1-\epsilon,1+\epsilon)\hat{A}_i
+\right)
+\right]
+\]
+
+对比 GRPO：
+
+\[
+\mathcal{J}_\text{GRPO}(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{G}
+\sum_i
+\frac{1}{|y_i|}
+\sum_t
+\min
+\left(
+\rho_{i,t}\hat{A}_i,\;
+\operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)\hat{A}_i
+\right)
+\right]
+\]
+
+核心差别：
+
+\[
+\text{GRPO：每个 token 一个 ratio，一个 clip}
+\]
+
+\[
+\text{GSPO：每个 sequence 一个 ratio，一个 clip}
+\]
+
+\begin{warnbox}
+\textbf{关键点：} GSPO 不是改掉 group advantage。它仍然可以使用同题 group relative advantage。它主要改的是 importance ratio 和 clipping 的粒度。
+\end{warnbox}
+
+\subsubsection{一个小例子}
+
+假设某个回答有 $4$ 个 token，token-level ratio 是：
+
+\[
+[1.1,\;1.2,\;0.9,\;1.0]
+\]
+
+GRPO 会分别处理四个 ratio：
+
+\[
+\rho_{1},\rho_{2},\rho_{3},\rho_{4}
+\]
+
+GSPO 则先取平均 log-ratio：
+
+\[
+\frac{1}{4}
+\left(
+\log 1.1
++
+\log 1.2
++
+\log 0.9
++
+\log 1.0
+\right)
+\]
+
+再 exponentiate：
+
+\[
+s
+=
+\exp
+\left[
+\frac{1}{4}
+(\log 1.1+\log 1.2+\log 0.9+\log 1.0)
+\right]
+\]
+
+这等价于这些 ratio 的几何平均：
+
+\[
+s
+=
+(1.1 \times 1.2 \times 0.9 \times 1.0)^{1/4}
+\]
+
+\begin{intubox}
+\textbf{直觉：} GSPO 用一整段回答的平均概率变化来决定更新强度，局部 token 的极端波动会被整体平均掉。
+\end{intubox}
+
+\subsubsection{为什么 GSPO 对 MoE 更重要}
+
+MoE 模型每个 token 会选择不同 expert。GRPO 在 token level 比较：
+
+\[
+\pi_\theta(y_{i,t}\mid x,y_{i,<t})
+\quad
+\text{vs}
+\quad
+\pi_{\theta_\text{old}}(y_{i,t}\mid x,y_{i,<t})
+\]
+
+如果新旧模型的 expert routing 不一致，某些 token 的概率可能出现较大波动，导致 ratio 噪声变大。
+
+为了解决这个问题，一些系统会用 Routing Replay：缓存 old policy 的 expert activation，在当前 policy 计算 ratio 时重放这些 routing patterns。
+
+但 Routing Replay 会带来：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 额外显存开销；
+  \item 额外通信和工程复杂度；
+  \item 限制 MoE 模型使用完整容量。
+\end{itemize}
+
+GSPO 因为只关心 sequence-level likelihood，对单个 token 的 routing 波动不那么敏感，因此可以减少对 Routing Replay 这类工程 workaround 的依赖。
+
+\begin{summarybox}
+\textbf{MoE 场景下的直觉：} GRPO 的 token-level ratio 容易被 expert routing 局部波动干扰；GSPO 把比较提升到 sequence level，因此训练更稳定，基础设施也更简单。
+\end{summarybox}
+
+\subsubsection{GSPO 和 GRPO / DAPO / Dr.GRPO 的关系}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.7cm}p{3.2cm}p{3.3cm}p{3.3cm}}
+\hline
+ & \textbf{GRPO} & \textbf{Dr.GRPO} & \textbf{GSPO} \\
+\hline
+核心问题
+&
+去 critic
+&
+去归一化偏置
+&
+去 token-level ratio 噪声
+\\
+Advantage
+&
+group relative
+&
+group mean baseline，去 std scaling
+&
+可继续用 group relative
+\\
+Ratio 粒度
+&
+token-level
+&
+通常仍是 token-level
+&
+sequence-level
+\\
+Clip 粒度
+&
+token-level clip
+&
+通常仍是 token-level clip
+&
+sequence-level clip
+\\
+主要收益
+&
+不用 critic
+&
+减少 length / difficulty bias
+&
+更稳定，尤其适合 long-CoT 和 MoE
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+DAPO 和 GSPO 也可以对比：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item DAPO 更像一套工程 recipe：dynamic sampling、Clip-Higher、token-level loss、overlong shaping；
+  \item GSPO 更像一次优化粒度调整：把 token-level objective 改成 sequence-level objective。
+\end{itemize}
+
+\subsubsection{GSPO 的代价}
+
+GSPO 不是没有 tradeoff。
+
+它的优势是 sequence-level 信号更稳，但代价是 token-level credit assignment 变粗：
+
+\[
+\text{所有 token 共享同一个 sequence ratio}
+\]
+
+这可能导致：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 局部 token 的细粒度修正能力变弱；
+  \item 对需要精细 token-level control 的任务不一定最优；
+  \item 后续会出现 hybrid 方法，把 token-level 和 sequence-level ratio 结合起来。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{核心 tradeoff：} GRPO 更细，但噪声大；GSPO 更稳，但更粗。后续 hybrid / subsequence-level 方法就是在寻找中间粒度。
+\end{warnbox}
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{GSPO 的核心：}\\
+把 GRPO 的 token-level ratio：
+\[
+\rho_{i,t}
+=
+\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
+{\pi_{\theta_\text{old}}(y_{i,t}\mid x,y_{i,<t})}
+\]
+改成 sequence-level ratio：
+\[
+s_i
+=
+\left[
+\frac{\pi_\theta(y_i\mid x)}
+{\pi_{\theta_\text{old}}(y_i\mid x)}
+\right]^{1/|y_i|}
+\]
+然后做 sequence-level clipping 和 optimization。\\
+核心直觉：reward 是给整段回答的，policy correction 也应该按整段回答来做。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item GRPO 的 token-level ratio 为什么和 sequence-level reward 粒度不匹配？
+  \item GSPO 的 $s_i(\theta)$ 为什么要取 $1/|y_i|$ 次方？
+  \item GSPO 的 objective 和 GRPO 的 objective 最大区别是什么？
+  \item 为什么 GSPO 对 MoE RL 训练稳定性特别有帮助？
+  \item GSPO 相比 GRPO 的 tradeoff 是什么？
+\end{enumerate}

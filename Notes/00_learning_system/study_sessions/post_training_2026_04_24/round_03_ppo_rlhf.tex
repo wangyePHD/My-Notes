@@ -159,6 +159,308 @@ $\rho_t \approx 1$ & 新旧模型变化不大 \\
 }
 \end{center}
 
+\subsubsection{追问：new logprob 和 old logprob 分别是什么}
+
+实际代码里通常不会直接除概率，而是先算 log probability：
+
+\[
+\rho_t(\theta)
+=
+\exp\left(
+\log \pi_\theta(y_t \mid x, y_{<t})
+-
+\log \pi_{\theta_\text{old}}(y_t \mid x, y_{<t})
+\right)
+\]
+
+也就是：
+
+\[
+\text{ratio}
+=
+\exp(\text{new\_logprob} - \text{old\_logprob})
+\]
+
+这里的分子和分母要看清楚：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{9.6cm}}
+\hline
+\textbf{对象} & \textbf{含义} \\
+\hline
+\code{new\_logprob}
+&
+当前正在更新的 policy $\pi_\theta$ 对旧 rollout 里同一个 token $y_t$ 的 log probability：
+$\log \pi_\theta(y_t \mid x, y_{<t})$。
+\\
+\code{old\_logprob}
+&
+采样这条 rollout 时的旧 policy $\pi_{\theta_\text{old}}$ 对同一个 token $y_t$ 的 log probability：
+$\log \pi_{\theta_\text{old}}(y_t \mid x, y_{<t})$。
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{关键点：} PPO 更新时，新模型不是重新生成一个 token 再比较，而是拿旧 policy 已经采样出来的同一个 token，分别问：
+\[
+\text{旧模型当时给它多大概率？}
+\qquad
+\text{新模型现在给它多大概率？}
+\]
+两者相除，才得到 importance sampling ratio。
+\end{warnbox}
+
+所以一次 PPO rollout / update 可以理解成：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 用 old policy $\pi_{\theta_\text{old}}$ 生成回答 $y_1,\ldots,y_T$；
+  \item 在生成时保存每个 token 的 \code{old\_logprob}；
+  \item PPO 更新时，把同一批 token 喂给当前 policy $\pi_\theta$；
+  \item 重新计算这些 token 的 \code{new\_logprob}；
+  \item 用 $\exp(\text{new\_logprob}-\text{old\_logprob})$ 得到 ratio。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{不要混淆：} PPO ratio 的分母是 old policy，不是 reference model。\\
+PPO 中常见的三个模型是：
+\[
+\pi_\theta
+\quad
+\pi_{\theta_\text{old}}
+\quad
+\pi_\text{ref}
+\]
+其中：
+\begin{itemize}[leftmargin=1.5em]
+  \item $\pi_\theta / \pi_{\theta_\text{old}}$ 用来计算 PPO importance sampling ratio；
+  \item $\pi_\theta$ 和 $\pi_\text{ref}$ 的差异用来计算 KL penalty；
+  \item $\pi_\text{ref}$ 通常是冻结的 SFT 模型，负责约束 policy 不要偏离太远。
+\end{itemize}
+\end{summarybox}
+
+\subsubsection{追问：old policy 到底是什么模型}
+
+old policy 不是一种新的模型结构。它就是\key{采样 rollout 时那一刻的 policy 快照}。
+
+假设当前正在训练的模型参数是 $\theta$。在一次 PPO iteration 开始时，先把当前 policy 固定下来：
+
+\[
+\pi_{\theta_\text{old}} \leftarrow \pi_\theta
+\]
+
+然后用这个固定的 $\pi_{\theta_\text{old}}$ 去生成回答：
+
+\[
+y \sim \pi_{\theta_\text{old}}(\cdot \mid x)
+\]
+
+生成时保存每个 token 的 old logprob：
+
+\[
+\log \pi_{\theta_\text{old}}(y_t \mid x, y_{<t})
+\]
+
+接下来 PPO 更新的是新的 $\pi_\theta$。在这轮更新过程中，$\pi_{\theta_\text{old}}$ 不再变化，只作为分母提供基准：
+
+\[
+\rho_t(\theta)
+=
+\frac{
+\pi_\theta(y_t \mid x, y_{<t})
+}{
+\pi_{\theta_\text{old}}(y_t \mid x, y_{<t})
+}
+\]
+
+\begin{intubox}
+\textbf{直觉：} old policy 就是“生成这批训练样本的那个旧版本模型”。PPO 问的是：当前新模型相比当时生成样本的旧模型，对同一个 token 的概率改了多少。
+\end{intubox}
+
+一次完整循环可以写成：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 令 $\pi_{\theta_\text{old}} \leftarrow \pi_\theta$；
+  \item 用 $\pi_{\theta_\text{old}}$ 采样一批回答，并保存 old logprob；
+  \item 固定 $\pi_{\theta_\text{old}}$，用 PPO 多步更新 $\pi_\theta$；
+  \item 这一批数据用完后，进入下一轮，再令新的当前 policy 变成下一轮的 old policy。
+\end{enumerate}
+
+\begin{warnbox}
+\textbf{不要混淆三个角色：}
+\begin{itemize}[leftmargin=1.5em]
+  \item $\pi_\theta$：正在被训练、参数会更新的当前 policy；
+  \item $\pi_{\theta_\text{old}}$：采样当前这批 rollout 时的 policy 快照，用于 PPO ratio 的分母；
+  \item $\pi_\text{ref}$：冻结的 reference model，通常是 SFT 模型，用于 KL penalty。
+\end{itemize}
+第一轮 PPO 开始时，$\pi_\theta$ 通常从 SFT 模型初始化；但训练过程中，old policy 是每一轮采样前的当前 policy 快照，不等于永远固定不动的 reference model。
+\end{warnbox}
+
+\subsubsection{追问：如果没有多步更新，old policy 又是什么}
+
+这里要区分两种说法。
+
+\paragraph{情况一：每批 rollout 只做一次 PPO 更新。}
+
+这是合理的。流程变成：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 令 $\pi_{\theta_\text{old}} \leftarrow \pi_\theta$；
+  \item 用 $\pi_{\theta_\text{old}}$ 采样一批回答；
+  \item 用这批数据对 $\pi_\theta$ 做一次 PPO 更新；
+  \item 丢掉这批 rollout；
+  \item 下一轮重新令 $\pi_{\theta_\text{old}} \leftarrow \pi_\theta$，再采样新回答。
+\end{enumerate}
+
+这种情况下，old policy 仍然是\key{采样当前这批数据的 policy}。只不过这批数据只被用了一次，没有像常见 PPO 那样对同一批 rollout 做多个 epoch / minibatch 更新。
+
+\begin{intubox}
+\textbf{直觉：} 如果每次更新后都重新采样新数据，那么 old policy 每轮都会刷新。这仍然是 on-policy 的，只是样本利用率较低，训练成本更高。
+\end{intubox}
+
+\paragraph{情况二：还在用同一批 rollout，却每个梯度步都更新 old policy。}
+
+这就不对。因为 PPO ratio 的分母必须是\key{生成这批 token 的那个 policy}：
+
+\[
+\rho_t(\theta)
+=
+\frac{
+\pi_\theta(y_t \mid x, y_{<t})
+}{
+\pi_{\theta_\text{old}}(y_t \mid x, y_{<t})
+}
+\]
+
+如果同一批 rollout 还没用完，就把 $\pi_{\theta_\text{old}}$ 也改成了最新的 $\pi_\theta$，那么分母不再代表“当时采样这些 token 的模型”。ratio 的重要性采样含义就被破坏了。
+
+极端情况下，如果每个梯度步之后都令：
+
+\[
+\pi_{\theta_\text{old}} \leftarrow \pi_\theta
+\]
+
+并且继续用旧 rollout 训练，那么下一步的 ratio 会被人为拉回接近 $1$。这样 PPO-clip 就很难准确限制“当前 policy 相对采样 policy 走了多远”。
+
+\begin{warnbox}
+\textbf{核心判断：} old policy 可以在每一轮新采样前刷新；但不能在复用同一批 rollout 的中途随便刷新。\\
+只要这批 token 还是由某个旧 policy 生成的，ratio 的分母就应该保持为那个生成它们的 policy。
+\end{warnbox}
+
+\begin{summarybox}
+\textbf{最小结论：}
+\[
+\text{old policy} = \text{behavior policy} = \text{生成当前这批 rollout 的 policy}
+\]
+如果每次更新都重新采样，old policy 就每轮更新一次，这是可以的。\\
+如果不重新采样、还在用旧数据，却把 old policy 跟着训练过程一起更新，那么 PPO ratio 就失去了正确含义。
+\end{summarybox}
+
+\subsubsection{追问：为什么有些 GRPO 实现里 ratio 看起来恒等于 1}
+
+在 open-r1 使用的 TRL \code{GRPOTrainer} 里，有一类实现会出现类似写法：
+
+\[
+\text{coef}
+=
+\exp\left(
+\text{per\_token\_logps}
+-
+\text{per\_token\_logps.detach()}
+\right)
+\]
+
+前向计算时：
+
+\[
+\text{per\_token\_logps}
+-
+\text{per\_token\_logps.detach()}
+=
+0
+\]
+
+所以：
+
+\[
+\text{coef} = \exp(0) = 1
+\]
+
+这就是“importance ratio 看起来恒等于 1”的来源。
+
+但这个写法不能只看前向值。因为 \code{detach()} 会切断分母那一侧的梯度：
+
+\[
+\nabla_\theta
+\left[
+\exp\left(
+\log \pi_\theta(y_t \mid s_t)
+-
+\operatorname{stopgrad}(\log \pi_\theta(y_t \mid s_t))
+\right)
+A_t
+\right]
+=
+A_t \nabla_\theta \log \pi_\theta(y_t \mid s_t)
+\]
+
+也就是说：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 前向数值上，ratio 是 $1$；
+  \item 反向传播时，它仍然给出 policy gradient；
+  \item 这个 loss 的数值本身不重要，重要的是它的梯度。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} 这不是在做“新 policy 除以旧 policy”的完整 PPO 多步 ratio，而是在没有复用旧 rollout 多步更新时，用一个 stop-gradient 技巧写出 REINFORCE 风格的梯度：
+\[
+-A_t \nabla_\theta \log \pi_\theta(y_t \mid s_t)
+\]
+\end{intubox}
+
+这通常对应一个特殊训练设置：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{8.8cm}}
+\hline
+\textbf{训练设置} & \textbf{old logprob 的处理} \\
+\hline
+每批 rollout 只更新一次，不做多轮复用
+&
+old policy 和当前 policy 在这次更新开始时相同，可以用 \code{per\_token\_logps.detach()} 作为分母；前向 ratio 为 $1$，但仍有 policy gradient。
+\\
+同一批 rollout 要复用多次更新
+&
+必须保存采样时的 \code{old\_per\_token\_logps}，否则 ratio 无法衡量当前 policy 相对采样 policy 走了多远。
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{关键区别：} ratio 前向为 $1$ 不等于“没有训练”。\\
+如果写成普通常数 $1 \cdot A_t$，确实没有 policy 梯度；但如果写成
+\[
+\exp(\log p - \operatorname{stopgrad}(\log p)) A_t
+\]
+前向值是 $A_t$，梯度却包含 $A_t \nabla \log p$。
+\end{warnbox}
+
+\begin{summarybox}
+\textbf{最小结论：} open-r1 / TRL 里看到 ratio 为 $1$，一般说明它处在“没有多步复用旧 rollout”的简化场景，或者使用了 stop-gradient 技巧。\\
+它和标准 PPO 里需要显式保存
+\[
+\log \pi_{\theta_\text{old}}(y_t \mid s_t)
+\]
+来做多步 clipped update 的场景不是一回事。
+\end{summarybox}
+
 \subsubsection{Advantage：这个回答该鼓励还是惩罚}
 
 Reward 本身只是一个分数。PPO 需要知道某个 token / trajectory 相比预期到底好多少，这就是 Advantage：

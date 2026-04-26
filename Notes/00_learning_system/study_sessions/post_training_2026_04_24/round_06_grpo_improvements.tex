@@ -1,0 +1,358 @@
+% ============================================================
+% Round 06: GRPO Improvements
+% ============================================================
+
+\subsection{Round 06：GRPO 的改进方向}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 在掌握 GRPO 基础之后，理解后续改进主要在修什么问题：长度偏置、无效 group、clip 过强、token-level ratio 高方差、局部归一化偏置、过度思考。\\
+\textbf{主线位置：}
+\[
+\text{GRPO}
+\to
+\text{DAPO / Dr.GRPO / GSPO / REINFORCE++ / DCPO / TreeRPO}
+\]
+\end{conceptbox}
+
+\subsubsection{为什么还要改进 GRPO}
+
+GRPO 的核心优点是：
+
+\[
+\text{去掉 critic，用 group relative reward 估计 advantage}
+\]
+
+但标准 GRPO 在大规模 reasoning RL 里会遇到几个实际问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{长度偏置。} 原始 objective 里常见的 $1/|o_i|$ 归一化会影响长短回答的梯度权重，可能鼓励错误回答变长，或改变正负样本的更新强度。
+  \item \textbf{无效 group。} 如果同一道题采样的一组回答全对或全错，组内 advantage 接近 $0$，这批样本几乎没有学习信号。
+  \item \textbf{clip 太死。} 固定对称 clipping 可能过早压制有用探索，导致 entropy collapse。
+  \item \textbf{token-level ratio 高方差。} reward 通常是整段回答级别，但 GRPO 常在 token 级别算 importance ratio，长序列里噪声会累积。
+  \item \textbf{局部归一化偏置。} 只在同一个 prompt 的小 group 内归一化 reward，可能带来 question-level difficulty bias 或小样本估计不稳。
+  \item \textbf{过度思考。} 只看最终答案 reward 时，模型可能学会越来越长的 reasoning，而不一定更高效。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{一句话：} GRPO 的后续改进，大多不是推翻 group-relative RL，而是在修它的归一化、采样、clip、长度和粒度问题。
+\end{summarybox}
+
+\subsubsection{改进路线图}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.6cm}p{4.4cm}p{5.8cm}}
+\hline
+\textbf{方法} & \textbf{主要修的问题} & \textbf{核心想法} \\
+\hline
+DAPO
+&
+无效 group、熵坍缩、长 CoT 训练不稳
+&
+动态采样、asymmetric clip、token-level loss、overlong reward shaping
+\\
+Dr.GRPO
+&
+GRPO 的长度偏置和 std 归一化偏置
+&
+去掉 $1/|o_i|$ 和 reward std scaling，用常数归一化恢复更无偏的目标
+\\
+GSPO
+&
+token-level importance ratio 高方差
+&
+把 importance ratio、clip、optimization 从 token level 移到 sequence level
+\\
+REINFORCE++ / RLOO
+&
+critic-free RL 的 advantage 估计
+&
+用全局 advantage normalization 或 leave-one-out baseline 替代 critic
+\\
+DCPO
+&
+固定 clipping 和相同 reward 组导致零梯度
+&
+动态 clipping、smooth advantage standardization，提高有效梯度利用率
+\\
+TreeRPO / WS-GRPO
+&
+只用最终答案 reward，过程信号弱或 rollout 过长
+&
+用树采样或弱监督信号给中间步骤 / prefix 更细的训练信号
+\\
+P-GRPO
+&
+不同用户 / 偏好分布混在一起
+&
+按 preference group 的历史 reward 归一化，避免主流偏好淹没少数偏好
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{第一类：长度偏置}
+
+原始 GRPO 常见写法中，对每条回答有：
+
+\[
+\frac{1}{|o_i|}
+\sum_{t=1}^{|o_i|}
+l_{i,t}
+\]
+
+这意味着每条 sequence 的 token loss 会先被自己的长度平均。
+
+问题是：当 advantage 为正或负时，长度平均会改变不同长度回答的更新强度。尤其在长 CoT reasoning 中，模型可能学到不理想的长度行为。
+
+Dr.GRPO 的核心批评是：
+
+\[
+\frac{1}{|o_i|}
+\text{ 会引入 response-level length bias}
+\]
+
+因此 Dr.GRPO 建议用全局常数归一化，例如最大生成长度 $L$：
+
+\[
+\mathcal{L}_\text{Dr.GRPO}
+=
+-
+\frac{1}{LG}
+\sum_{i=1}^{G}
+\sum_{t=1}^{|o_i|}
+l_{i,t}
+\]
+
+\begin{intubox}
+\textbf{直觉：} 原始 GRPO 是“每条回答自己平均一下”；Dr.GRPO 改成“大家用同一个固定尺度归一化”，避免长短回答被不同规则加权。
+\end{intubox}
+
+\subsubsection{第二类：无效 Group}
+
+GRPO 依赖同组比较。如果一个 group 的 reward 是：
+
+\[
+[0,0,0,0]
+\]
+
+或者：
+
+\[
+[1,1,1,1]
+\]
+
+那么组内相对 advantage 几乎没有区分度。
+
+DAPO 的 dynamic sampling 就是为了解决这个问题：只保留有区分度的 group，例如：
+
+\[
+0
+<
+\left|
+\{o_i \mid \operatorname{is\_correct}(o_i)\}
+\right|
+<
+G
+\]
+
+也就是说，一个有效 group 至少要有一个正确回答，也至少要有一个错误回答。
+
+\begin{summarybox}
+\textbf{直觉：} GRPO 需要“同题内部对比”。如果一组答案全一样好或全一样差，就没什么可学；DAPO 让训练更集中在有好坏差异的样本上。
+\end{summarybox}
+
+\subsubsection{第三类：Clip 和熵坍缩}
+
+标准 PPO / GRPO 通常使用对称 clip：
+
+\[
+\operatorname{clip}(\rho, 1-\epsilon, 1+\epsilon)
+\]
+
+DAPO 的 Clip-Higher 使用不对称边界：
+
+\[
+\operatorname{clip}
+(\rho, 1-\epsilon_\text{low}, 1+\epsilon_\text{high})
+\]
+
+通常令：
+
+\[
+\epsilon_\text{high} > \epsilon_\text{low}
+\]
+
+这样可以对提高好样本概率给更大的上升空间，同时仍然控制下降或异常更新。
+
+\begin{intubox}
+\textbf{直觉：} 对称 clip 有时太保守，可能过早压掉探索；Clip-Higher 给正向学习更多空间，帮助维持 entropy。
+\end{intubox}
+
+DCPO 进一步把 clip 做成动态的：不同 token 根据先验概率或训练状态使用不同 clip 范围，目标是减少 token 被过早截断导致的零梯度。
+
+\subsubsection{第四类：Token-Level vs Sequence-Level}
+
+GRPO 常用 token-level ratio：
+
+\[
+\rho_{i,t}
+=
+\frac{
+\pi_\theta(o_{i,t}\mid q,o_{i,<t})
+}{
+\pi_{\theta_\text{old}}(o_{i,t}\mid q,o_{i,<t})
+}
+\]
+
+但 reasoning reward 通常是 sequence-level：
+
+\[
+r_i = R(q,o_i)
+\]
+
+这会产生一个粒度不匹配：
+
+\[
+\text{reward 是整段级别，importance ratio 却逐 token 算}
+\]
+
+GSPO 的核心想法是改用 sequence-level ratio：
+
+\[
+\rho_i^\text{seq}
+=
+\left[
+\frac{
+\pi_\theta(o_i \mid q)
+}{
+\pi_{\theta_\text{old}}(o_i \mid q)
+}
+\right]^{1/|o_i|}
+\]
+
+等价写成 log 形式：
+
+\[
+\rho_i^\text{seq}
+=
+\exp
+\left(
+\frac{1}{|o_i|}
+\sum_{t=1}^{|o_i|}
+\log
+\frac{
+\pi_\theta(o_{i,t}\mid q,o_{i,<t})
+}{
+\pi_{\theta_\text{old}}(o_{i,t}\mid q,o_{i,<t})
+}
+\right)
+\]
+
+\begin{summarybox}
+\textbf{直觉：} GRPO 是每个 token 都单独算 ratio；GSPO 是整段回答算一个 sequence ratio。它试图让“优化单位”和“reward 单位”更一致。
+\end{summarybox}
+
+\subsubsection{第五类：局部归一化 vs 全局归一化}
+
+标准 GRPO 对同一个 prompt 的 group 做归一化：
+
+\[
+\hat{A}_i
+=
+\frac{r_i-\mu_\text{group}}{\sigma_\text{group}+\epsilon}
+\]
+
+这叫 prompt-level / local normalization。
+
+它的优点是每道题内部可比，缺点是 group 太小，估计可能不稳；而且不同题目的 reward 方差不同，可能引入 question-level difficulty bias。
+
+REINFORCE++ 的一个方向是使用 global advantage normalization：
+
+\[
+\hat{A}_i
+=
+\frac{r_i-\mu_\text{batch}}{\sigma_\text{batch}+\epsilon}
+\]
+
+其中均值和方差来自更大的 global batch，而不是单个 prompt 的小 group。
+
+\begin{intubox}
+\textbf{直觉：} GRPO 是“每道题内部比”；REINFORCE++ 更像“在更大的 batch 里统一标尺”。这可能让 advantage 估计更稳，但也会弱化 prompt 内部对比的纯粹性。
+\end{intubox}
+
+\subsubsection{第六类：过度思考和过程信号}
+
+RLVR 常用最终答案 reward：
+
+\[
+R(q,o)=
+\mathbb{1}[\text{final answer correct}]
+\]
+
+这个信号简单、客观，但只告诉模型最后对不对，不告诉模型中间哪一步开始变好或变坏。
+
+这可能带来：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 模型越写越长；
+  \item 有些 token 只是冗余思考，但仍然被同一个正 reward 鼓励；
+  \item 错误答案里的长推理也可能被复杂的归一化和长度项影响。
+\end{itemize}
+
+TreeRPO、WS-GRPO 这类方法试图给中间步骤或 partial trajectory 更细的信号：
+
+\[
+\text{最终 reward}
+\to
+\text{prefix / step-level guidance}
+\]
+
+\begin{summarybox}
+\textbf{直觉：} 标准 GRPO 像“只看最终卷面分”；过程型改进希望知道“哪一步开始走对，哪一步继续写是浪费”。
+\end{summarybox}
+
+\subsubsection{接下来的学习顺序}
+
+后面不用一下子全学。比较稳的顺序是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{DAPO：} 最实用，包含 dynamic sampling、Clip-Higher、token-level loss、overlong reward shaping；
+  \item \textbf{Dr.GRPO：} 理解 GRPO / DAPO 的 length bias 和 std scaling bias；
+  \item \textbf{GSPO：} 理解 token-level ratio 和 sequence-level ratio 的差异；
+  \item \textbf{REINFORCE++ / RLOO：} 理解 critic-free RL 不一定要 group std normalization；
+  \item \textbf{DCPO / TreeRPO / P-GRPO：} 作为扩展，分别看动态 clip、过程信号和个性化偏好。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{本轮最小结论：} GRPO 后续改进可以按五个问题理解：
+\[
+\text{长度怎么处理？}
+\]
+\[
+\text{group 有没有有效学习信号？}
+\]
+\[
+\text{clip 会不会压死探索？}
+\]
+\[
+\text{ratio 应该按 token 还是 sequence 算？}
+\]
+\[
+\text{advantage 应该局部归一化还是全局归一化？}
+\]
+先学 DAPO，再学 Dr.GRPO 和 GSPO，是最自然的路线。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 为什么全对或全错的 group 对 GRPO 学习信号很弱？
+  \item DAPO 的 dynamic sampling 想解决什么问题？
+  \item Dr.GRPO 为什么关注 $1/|o_i|$ 带来的长度偏置？
+  \item GSPO 为什么要把 token-level ratio 改成 sequence-level ratio？
+  \item local normalization 和 global normalization 的直觉差别是什么？
+\end{enumerate}

@@ -1,0 +1,247 @@
+% ============================================================
+% Round 00: Roadmap
+% ============================================================
+
+\subsection{Round 00：图像编辑后训练学习路线}
+
+\subsubsection{本阶段目标}
+
+\begin{conceptbox}
+\textbf{目标：} 把文本侧后训练中的核心对象：
+\[
+\text{policy}
+\quad
+\text{action}
+\quad
+\text{reward}
+\quad
+\text{trajectory}
+\quad
+\text{reference}
+\quad
+\text{preference}
+\]
+迁移到图像编辑模型里。最终能读懂 HP-Edit、Diffusion-DPO、DDPO、Flow-GRPO、LeapAlign 这类图像生成 / 图像编辑后训练论文。
+\end{conceptbox}
+
+\subsubsection{图像编辑问题的基本形式}
+
+图像编辑不是普通 text-to-image。它的输入通常是：
+
+\[
+(I_\text{src},\; c)
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $I_\text{src}$：原始图像；
+  \item $c$：编辑指令，例如“把红色车换成蓝色车”；
+  \item $I_\text{edit}$：模型输出的编辑后图像。
+\end{itemize}
+
+目标不是单纯生成好看的图片，而是同时满足：
+
+\[
+\text{编辑正确}
+\quad
++
+\quad
+\text{未编辑区域保持}
+\quad
++
+\quad
+\text{图像质量高}
+\quad
++
+\quad
+\text{符合人类偏好}
+\]
+
+\begin{warnbox}
+\textbf{关键差别：} 文本侧通常只看 prompt 到 answer；图像编辑侧必须同时看 input image、edit instruction 和 output image 三者之间的关系。
+\end{warnbox}
+
+\subsubsection{从文本侧到图像编辑侧的概念映射}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.7cm}p{5cm}}
+\hline
+\textbf{概念} & \textbf{文本侧} & \textbf{图像编辑侧} \\
+\hline
+Prompt / state
+&
+用户问题 $x$
+&
+原图 $I_\text{src}$ + 编辑指令 $c$ + 当前 denoising / flow 状态
+\\
+Action
+&
+下一个 token
+&
+去噪步骤、flow step、latent 更新，或最终编辑图像
+\\
+Policy
+&
+LLM $\pi_\theta(y\mid x)$
+&
+扩散 / flow 编辑模型 $p_\theta(I_\text{edit}\mid I_\text{src},c)$
+\\
+Reward
+&
+RM 分数、规则验证、偏好
+&
+编辑成功、保真度、美学、人类偏好、VLM scorer
+\\
+Trajectory
+&
+token 序列
+&
+denoising trajectory / flow trajectory / latent trajectory
+\\
+Reference
+&
+SFT model / old policy
+&
+原始编辑模型、冻结 diffusion / flow model
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{学习顺序}
+
+本阶段建议按 8 轮走：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{图像编辑任务本体：} 输入输出、编辑类型、保真度 vs 编辑强度。
+  \item \textbf{Diffusion / Flow 最小回顾：} 只补后训练需要的 denoising trajectory、logprob、flow matching、ODE / SDE。
+  \item \textbf{编辑模型 SFT：} paired editing data、instruction-following、teacher forcing 在 diffusion / flow 里的对应物。
+  \item \textbf{图像编辑 Reward：} CLIP、DINO、LPIPS、PickScore、ImageReward、HPS、VLM scorer、HP-Scorer。
+  \item \textbf{Diffusion-DPO / Preference Optimization：} 如何把 chosen / rejected 图像对变成 diffusion preference loss。
+  \item \textbf{DDPO / Diffusion RL：} 为什么 diffusion sampling 可以看成多步 MDP，reward 怎么回传到 denoising steps。
+  \item \textbf{Flow-GRPO / LeapAlign：} flow matching 生成模型如何做 GRPO / 偏好对齐。
+  \item \textbf{HP-Edit：} 图像编辑专用人类偏好后训练框架：RealPref-50K、HP-Scorer、RealPref-Bench、task-aware RL。
+\end{enumerate}
+
+\subsubsection{主线论文与资料}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{5cm}}
+\hline
+\textbf{主题} & \textbf{代表资料} & \textbf{学习目的} \\
+\hline
+编辑模型
+&
+Qwen-Image-Edit
+&
+理解现代图像编辑模型的输入结构：语义控制 + 外观控制。
+\\
+编辑偏好对齐
+&
+HP-Edit
+&
+理解图像编辑里如何构造 human-preference scorer、数据和 RL 后训练闭环。
+\\
+Diffusion RL
+&
+DDPO / DPOK / Diffusion-DPO
+&
+理解 diffusion trajectory 如何接上 policy gradient 或 preference loss。
+\\
+Flow RL
+&
+Flow-GRPO / LeapAlign
+&
+理解 flow matching 里如何定义 trajectory、reward、GRPO 和偏好对齐。
+\\
+Reward / Scorer
+&
+PickScore / ImageReward / HPS / VLM scorer
+&
+理解图像 reward model 的来源、偏置和 reward hacking 风险。
+\\
+评测
+&
+RealPref-Bench / editing benchmarks
+&
+理解图像编辑不能只看美学，还要看指令遵循和区域保持。
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{本阶段最重要的三条主线}
+
+\begin{summarybox}
+\textbf{主线一：编辑约束}\\
+图像编辑不是“越好看越好”，而是：
+\[
+\text{该改的地方要改}
+\quad
+\text{不该改的地方不能乱改}
+\]
+\end{summarybox}
+
+\begin{summarybox}
+\textbf{主线二：reward 设计}\\
+图像编辑 reward 通常是复合的：
+\[
+R
+=
+R_\text{instruction}
++
+R_\text{preservation}
++
+R_\text{quality}
++
+R_\text{preference}
+\]
+真正难点在于这些 reward 互相冲突。
+\end{summarybox}
+
+\begin{summarybox}
+\textbf{主线三：trajectory 信用分配}\\
+文本侧 trajectory 是 token 序列；图像侧 trajectory 是 denoising / flow 过程。后训练方法的核心问题是：
+\[
+\text{最终图像 reward 如何分配给中间生成步骤？}
+\]
+\end{summarybox}
+
+\subsubsection{建议的第一课}
+
+下一轮不要直接上 HP-Edit。先讲：
+
+\[
+\textbf{Round 01：图像编辑后训练到底在优化什么}
+\]
+
+这一课只回答四个问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 图像编辑和 text-to-image 生成有什么本质区别？
+  \item 图像编辑里的 policy、action、reward、trajectory 分别是什么？
+  \item 为什么图像编辑 reward 比文本 reward 更难设计？
+  \item 为什么 SFT 不够，后面需要 preference / RL？
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{本阶段路线：}
+\[
+\text{编辑任务本体}
+\to
+\text{Diffusion / Flow 后训练基础}
+\to
+\text{Reward / Preference}
+\to
+\text{Diffusion-DPO / DDPO}
+\to
+\text{Flow-GRPO / LeapAlign}
+\to
+\text{HP-Edit}
+\]
+\end{summarybox}

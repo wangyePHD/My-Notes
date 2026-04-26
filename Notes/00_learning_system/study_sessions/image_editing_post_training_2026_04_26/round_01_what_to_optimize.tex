@@ -1,0 +1,446 @@
+% ============================================================
+% Round 01: What Does Image Editing Post-Training Optimize?
+% ============================================================
+
+\subsection{Round 01：图像编辑后训练到底在优化什么}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 先不急着上 DDPO、Flow-GRPO 或 HP-Edit。先弄清楚图像编辑后训练的基本对象：输入是什么、输出是什么、什么叫“编辑成功”、reward 为什么难设计、为什么 SFT 不够。\\
+\textbf{主线位置：}
+\[
+\text{图像编辑任务本体}
+\to
+\text{Diffusion / Flow 后训练基础}
+\to
+\text{Reward / Preference}
+\to
+\text{Diffusion-DPO / DDPO / Flow-GRPO / HP-Edit}
+\]
+\end{conceptbox}
+
+\subsubsection{图像编辑和 Text-to-Image 的区别}
+
+普通 text-to-image 生成的输入通常是：
+
+\[
+c = \text{文本 prompt}
+\]
+
+输出是：
+
+\[
+I = \text{生成图像}
+\]
+
+目标大概是：
+
+\[
+\text{图像符合 prompt，且质量高}
+\]
+
+但图像编辑的输入是：
+
+\[
+(I_\text{src}, c)
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $I_\text{src}$：原始图像；
+  \item $c$：编辑指令；
+  \item $I_\text{edit}$：编辑后的输出图像。
+\end{itemize}
+
+目标不只是“生成好图”，而是：
+
+\[
+\text{在保留原图大部分内容的同时，精确完成指定编辑}
+\]
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+ & \textbf{Text-to-Image} & \textbf{Image Editing} \\
+\hline
+输入
+&
+文本 prompt
+&
+原图 + 编辑指令
+\\
+输出
+&
+新图像
+&
+编辑后的图像
+\\
+核心约束
+&
+符合文本、质量高
+&
+该改的要改，不该改的要保持
+\\
+失败类型
+&
+不符合 prompt、质量差
+&
+没改对、改多了、身份漂移、背景乱变、质量下降
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{关键区别：} 图像编辑比 text-to-image 多了一个强约束：输出必须和输入图像保持关系。不能只看输出图像本身好不好。
+\end{warnbox}
+
+\subsubsection{图像编辑的四个目标}
+
+一个好的图像编辑结果通常要同时满足四件事：
+
+\[
+R
+=
+R_\text{instruction}
++
+R_\text{preservation}
++
+R_\text{quality}
++
+R_\text{preference}
+\]
+
+分别是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Instruction following：} 是否完成了编辑指令。
+  \item \textbf{Preservation：} 不该改的区域是否保持。
+  \item \textbf{Visual quality：} 画面是否自然、清晰、无伪影。
+  \item \textbf{Human preference：} 人类是否更喜欢这个结果。
+\end{enumerate}
+
+举例：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{9.8cm}}
+\hline
+\textbf{编辑指令} & 把照片里的红色车改成蓝色车 \\
+\hline
+Instruction & 车是否真的变成蓝色 \\
+Preservation & 背景、车形状、光照、视角是否保持 \\
+Quality & 蓝色是否自然，有没有涂抹、边缘破损 \\
+Preference & 人类是否觉得这个结果更真实、更符合意图 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{直觉：} 图像编辑不是“越改越明显越好”，而是“只改用户要求的部分，而且改得自然”。
+\end{intubox}
+
+\subsubsection{为什么 Reward 更难设计}
+
+文本 RLVR 里，数学题可以用：
+
+\[
+R = \mathbb{1}[\text{final answer correct}]
+\]
+
+但图像编辑很少有这么简单的 verifier。
+
+比如指令是：
+
+\[
+\text{把天空变成黄昏}
+\]
+
+我们要判断：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 天空有没有变成黄昏？
+  \item 房子、人物、道路有没有不该变？
+  \item 光照变化是否自然？
+  \item 颜色是否符合人类偏好？
+  \item 如果原图没有天空怎么办？
+\end{itemize}
+
+这些都不是简单的 0/1 检查。
+
+所以图像编辑 reward 通常是复合的：
+
+\[
+R(I_\text{src},c,I_\text{edit})
+=
+\lambda_1 R_\text{edit}
++
+\lambda_2 R_\text{preserve}
++
+\lambda_3 R_\text{quality}
++
+\lambda_4 R_\text{pref}
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $R_\text{edit}$：编辑是否符合指令；
+  \item $R_\text{preserve}$：输入和输出中不该变的内容是否保持；
+  \item $R_\text{quality}$：图像质量 / 美学；
+  \item $R_\text{pref}$：人类偏好模型或 VLM scorer 的评分。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{难点：} 这些 reward 经常互相冲突。提高编辑强度可能破坏保真度；提高保真度可能导致编辑不明显；提高美学可能让模型擅自改背景。
+\end{warnbox}
+
+\subsubsection{图像编辑里的 Policy、Action、Trajectory}
+
+在文本侧，我们有：
+
+\[
+\pi_\theta(y_t\mid x,y_{<t})
+\]
+
+它每一步 action 是下一个 token。
+
+在图像生成 / 编辑侧，模型不是一个 token 一个 token 生成，而是在 latent 或 pixel 空间逐步去噪 / 积分。
+
+可以粗略写成：
+
+\[
+z_T
+\to
+z_{T-1}
+\to
+\cdots
+\to
+z_0
+\to
+I_\text{edit}
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $z_T$：噪声 latent；
+  \item $z_t$：中间 latent 状态；
+  \item $z_0$：最终 clean latent；
+  \item $I_\text{edit}$：VAE decoder 解码后的图像。
+\end{itemize}
+
+如果是图像编辑，条件里还包括：
+
+\[
+I_\text{src}, c
+\]
+
+所以生成过程可以看成：
+
+\[
+p_\theta(I_\text{edit}\mid I_\text{src}, c)
+\]
+
+或者更细：
+
+\[
+p_\theta(z_{t-1}\mid z_t, I_\text{src}, c, t)
+\]
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+\textbf{概念} & \textbf{文本侧} & \textbf{图像编辑侧} \\
+\hline
+State
+&
+prompt + 已生成 tokens
+&
+当前 latent $z_t$ + 原图 + 编辑指令
+\\
+Action
+&
+下一个 token
+&
+去噪一步 / flow step / latent 更新
+\\
+Trajectory
+&
+完整回答 token 序列
+&
+完整 denoising / flow 轨迹
+\\
+Reward
+&
+回答质量 / 正确性
+&
+最终编辑图像质量、指令遵循、保真度
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{最小映射：} 文本 RL 的 trajectory 是 token 序列；图像编辑 RL 的 trajectory 是从噪声 latent 到最终编辑图像的生成过程。
+\end{summarybox}
+
+\subsubsection{为什么 SFT 不够}
+
+图像编辑 SFT 通常使用 paired editing data：
+
+\[
+(I_\text{src}, c, I_\text{target})
+\]
+
+训练模型模仿目标图像：
+
+\[
+\text{给定原图和编辑指令，生成目标编辑图}
+\]
+
+这对应文本侧的 SFT：
+
+\[
+(x,y^\ast)
+\]
+
+但 SFT 有几个限制：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{目标图像不一定唯一。} 同一个指令可能有很多合理编辑结果。
+  \item \textbf{配对数据难且贵。} 高质量真实编辑前后图很难大规模获取。
+  \item \textbf{像素级模仿不等于人类偏好。} 两张都符合指令的图，人类可能明显更喜欢其中一张。
+  \item \textbf{难处理复合目标。} 编辑正确、区域保持、审美质量经常互相冲突。
+\end{enumerate}
+
+所以后训练要补上的东西是：
+
+\[
+\text{不只是模仿目标图，而是优化人类更喜欢的编辑结果}
+\]
+
+\begin{summarybox}
+\textbf{一句话：} 图像编辑 SFT 教模型“怎么做编辑”；偏好 / RL 后训练教模型“哪种编辑结果更好”。
+\end{summarybox}
+
+\subsubsection{偏好数据在图像编辑里长什么样}
+
+文本 DPO 的数据是：
+
+\[
+(x,y_w,y_l)
+\]
+
+图像编辑偏好数据变成：
+
+\[
+(I_\text{src}, c, I_w, I_l)
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $I_w$：人类更喜欢的编辑结果；
+  \item $I_l$：人类不喜欢的编辑结果；
+  \item 两者都对应同一个原图和同一个编辑指令。
+\end{itemize}
+
+这就可以训练：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 图像 reward model / scorer；
+  \item Diffusion-DPO 类 preference objective；
+  \item RLHF / RLVR 风格的在线优化。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} 图像编辑偏好比较必须是条件化的。不能只问“哪张图更好看”，而要问“在这张原图和这条编辑指令下，哪张编辑结果更好”。
+\end{intubox}
+
+\subsubsection{图像编辑后训练的三类路线}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+\textbf{路线} & \textbf{数据 / 信号} & \textbf{代表方法} \\
+\hline
+SFT
+&
+$(I_\text{src}, c, I_\text{target})$
+&
+instruction editing fine-tuning
+\\
+Preference Optimization
+&
+$(I_\text{src}, c, I_w, I_l)$
+&
+Diffusion-DPO, preference alignment
+\\
+RL / RLHF
+&
+模型在线生成 $I_\text{edit}$，scorer 打 reward
+&
+DDPO, Flow-GRPO, HP-Edit
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+三者关系可以写成：
+
+\[
+\text{SFT}
+\to
+\text{Preference}
+\to
+\text{Online RL}
+\]
+
+和文本侧非常像：
+
+\[
+\text{SFT}
+\to
+\text{DPO}
+\to
+\text{GRPO / RLVR}
+\]
+
+但区别是图像侧的 policy 和 trajectory 不再是 token，而是 diffusion / flow 生成过程。
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{图像编辑后训练到底在优化什么？}\\
+给定原图 $I_\text{src}$ 和编辑指令 $c$，优化模型生成的编辑结果 $I_\text{edit}$，使它同时满足：
+\[
+\text{指令遵循}
++
+\text{原图保持}
++
+\text{视觉质量}
++
+\text{人类偏好}
+\]
+核心难点是：reward 是复合且冲突的，trajectory 是 denoising / flow 过程，最终图像 reward 需要分配给中间生成步骤。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 图像编辑和 text-to-image 生成最大的区别是什么？
+  \item 为什么图像编辑不能只优化美学分数？
+  \item 图像编辑里的 policy、action、trajectory 分别是什么？
+  \item 为什么图像编辑 SFT 不够？
+  \item 图像编辑偏好数据为什么必须包含原图和编辑指令？
+\end{enumerate}

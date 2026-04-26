@@ -1,0 +1,609 @@
+% ============================================================
+% Round 05: GRPO / RLVR
+% ============================================================
+
+\subsection{Round 05：GRPO / RLVR}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解为什么 DPO 之后还需要在线 RL，RLVR 的 reward 从哪里来，以及 GRPO 如何在没有 value model / critic 的情况下估计 advantage。\\
+\textbf{主线位置：}
+\[
+\text{SFT} \to \text{Reward Model} \to \text{PPO / RLHF} \to \text{DPO} \to \text{GRPO / RLVR}
+\]
+\end{conceptbox}
+
+\subsubsection{为什么 DPO 之后还需要 GRPO}
+
+DPO 的训练链条是：
+
+\[
+\text{Preference Data}
+\to
+\text{Policy}
+\]
+
+它很简洁，但它主要是\key{离线偏好学习}。也就是说，训练信号来自已有的 chosen / rejected 数据：
+
+\[
+(x, y_w, y_l)
+\]
+
+如果数据里没有覆盖某类探索路径，DPO 自己不会主动生成大量新答案、试错、再根据结果改进。
+
+但数学、代码、逻辑推理这类任务有一个特殊性质：很多时候我们可以自动验证答案对不对。例如：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 数学题：最终答案是否等于标准答案；
+  \item 代码题：代码是否通过测试用例；
+  \item 格式任务：是否按要求输出在指定标签或框里；
+  \item 工具调用任务：执行结果是否满足约束。
+\end{itemize}
+
+这就引出 RLVR：
+
+\[
+\text{RLVR} = \text{Reinforcement Learning with Verifiable Rewards}
+\]
+
+\begin{summarybox}
+\textbf{一句话：} RLVR = 让模型自己生成答案，然后用可验证规则给 reward，再用 RL 更新模型。
+\end{summarybox}
+
+\subsubsection{RLVR 和 RLHF 的区别}
+
+RLHF 通常依赖人类偏好或 Reward Model：
+
+\[
+\text{模型回答}
+\to
+\text{Reward Model / Human Preference}
+\to
+\text{Reward}
+\]
+
+RLVR 则尽量使用可验证规则：
+
+\[
+\text{模型回答}
+\to
+\text{Verifier / Rule}
+\to
+\text{Reward}
+\]
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+ & \textbf{RLHF} & \textbf{RLVR} \\
+\hline
+Reward 来源 & 人类偏好或 reward model & 规则、答案检查器、测试用例、格式检查器 \\
+典型任务 & 聊天质量、有用性、安全性 & 数学、代码、可验证推理 \\
+主要风险 & Reward Model 不准、reward hacking & 验证器覆盖不全、只优化最终答案 \\
+优势 & 能覆盖主观偏好 & 信号更客观、更便宜、更可扩展 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{直觉：} RLHF 像“让评委判断哪个答案更好”；RLVR 像“让系统自动判卷或跑测试”。
+\end{intubox}
+
+\subsubsection{GRPO 想解决什么}
+
+PPO/RLHF 的核心困难之一是 advantage：
+
+\[
+A_t = R_t - V_\psi(s_t)
+\]
+
+这里的 $V_\psi(s_t)$ 是 value model / critic，用来估计当前状态后续大概能拿多少 reward。
+
+但在 LLM 后训练里，critic 很贵：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 需要额外训练一个 value model；
+  \item 增加显存和计算开销；
+  \item 长文本里 reward 常常只在最后出现，token 级 value 学起来不稳定；
+  \item value model 估错会直接污染 advantage。
+\end{itemize}
+
+GRPO 的核心动机是：
+
+\[
+\text{保留 PPO 的在线采样和 policy optimization，但去掉 critic}
+\]
+
+\begin{summarybox}
+\textbf{一句话：} GRPO = Group Relative Policy Optimization，用同一个 prompt 下多条回答的组内相对 reward 来估计 advantage，从而去掉 value model。
+\end{summarybox}
+
+\subsubsection{GRPO 的核心流程}
+
+对每个问题 $q$，GRPO 不只生成一个回答，而是从 old policy 采样一组回答：
+
+\[
+\{o_1, o_2, \ldots, o_G\}
+\sim
+\pi_{\theta_\text{old}}(\cdot \mid q)
+\]
+
+然后对每个回答打 reward：
+
+\[
+r_i = R(q, o_i)
+\]
+
+例如同一道数学题采样 $G=4$ 个回答：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.2cm}p{3.2cm}p{6.8cm}}
+\hline
+\textbf{回答} & \textbf{Reward} & \textbf{含义} \\
+\hline
+$o_1$ & $0$ & 最终答案错 \\
+$o_2$ & $1$ & 最终答案对 \\
+$o_3$ & $0$ & 格式对但答案错 \\
+$o_4$ & $1$ & 最终答案对 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+然后在同一组里计算均值和标准差：
+
+\[
+\mu = \operatorname{mean}(r_1,\ldots,r_G)
+\]
+
+\[
+\sigma = \operatorname{std}(r_1,\ldots,r_G)
+\]
+
+每个回答的 advantage 用组内相对分数估计：
+
+\[
+\hat{A}_i
+=
+\frac{r_i - \mu}{\sigma + \epsilon}
+\]
+
+其中 $\epsilon$ 是一个很小的数，防止除以 $0$。
+
+\begin{intubox}
+\textbf{直觉：} GRPO 不问“这个回答绝对好不好”，而问“在同一个问题采样出来的一组回答里，这个回答相对其他回答好不好”。
+\end{intubox}
+
+\subsubsection{组内 Advantage 的例子}
+
+假设同一个问题采样出 $4$ 个回答，reward 是：
+
+\[
+[0, 1, 0, 1]
+\]
+
+均值是：
+
+\[
+\mu = 0.5
+\]
+
+标准差近似是：
+
+\[
+\sigma = 0.5
+\]
+
+那么 advantage 是：
+
+\[
+\hat{A}
+=
+\left[
+\frac{0-0.5}{0.5},
+\frac{1-0.5}{0.5},
+\frac{0-0.5}{0.5},
+\frac{1-0.5}{0.5}
+\right]
+=
+[-1, 1, -1, 1]
+\]
+
+于是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item reward 高于组平均的回答，advantage 为正，模型会提高它们的概率；
+  \item reward 低于组平均的回答，advantage 为负，模型会降低它们的概率；
+  \item reward 接近组平均的回答，更新较小。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{重要现象：} 如果一组回答全错 $[0,0,0,0]$，或者全对 $[1,1,1,1]$，组内没有差异，advantage 信号会很弱。GRPO 最有用的是同一个 prompt 下既有好样本又有坏样本的情况。
+\end{warnbox}
+
+\subsubsection{GRPO 的目标函数}
+
+GRPO 仍然像 PPO 一样使用 old policy ratio 和 clip。
+
+对回答 $o_i$ 的第 $t$ 个 token，定义：
+
+\[
+\rho_{i,t}(\theta)
+=
+\frac{
+\pi_\theta(o_{i,t} \mid q, o_{i,<t})
+}{
+\pi_{\theta_\text{old}}(o_{i,t} \mid q, o_{i,<t})
+}
+\]
+
+然后优化 clipped objective：
+
+\[
+\mathcal{J}_\text{GRPO}(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{G}
+\sum_{i=1}^{G}
+\frac{1}{|o_i|}
+\sum_{t=1}^{|o_i|}
+\min
+\left(
+\rho_{i,t}(\theta)\hat{A}_i,\;
+\operatorname{clip}(\rho_{i,t}(\theta),1-\epsilon,1+\epsilon)\hat{A}_i
+\right)
+-
+\beta
+\mathbb{D}_\text{KL}
+\left(
+\pi_\theta
+\|
+\pi_\text{ref}
+\right)
+\right]
+\]
+
+这里：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $\pi_\theta$：当前正在训练的 policy；
+  \item $\pi_{\theta_\text{old}}$：采样这组回答时的 old policy；
+  \item $\pi_\text{ref}$：冻结的 reference policy，通常是 SFT / instruct 模型；
+  \item $\hat{A}_i$：第 $i$ 个回答的组内相对 advantage；
+  \item $\rho_{i,t}$：当前 policy 相比 old policy，对这个 token 的概率变化；
+  \item clip：限制 policy 一次更新不要离 old policy 太远；
+  \item KL：限制 policy 不要离 reference model 太远。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{GRPO 和 PPO 的关键差别：}
+\[
+\text{PPO: } A_t = R_t - V_\psi(s_t)
+\]
+\[
+\text{GRPO: } \hat{A}_i = \frac{r_i - \operatorname{mean}(\{r_j\})}{\operatorname{std}(\{r_j\}) + \epsilon}
+\]
+GRPO 用组内相对 reward 代替 value model / critic。
+\end{summarybox}
+
+\subsubsection{追问：GRPO 和 PPO 到底区别在哪里}
+
+GRPO 不是把 PPO 的所有东西都推翻。更准确地说：
+
+\[
+\text{GRPO 保留 PPO-style policy update，但替换 advantage 估计方式}
+\]
+
+它们相同的地方：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 都是在线 RL：先让当前模型生成回答，再根据 reward 更新模型；
+  \item 都有 old policy，用来计算 importance ratio；
+  \item 都可以使用 clip，限制 policy 一次更新不要太大；
+  \item 都可以使用 reference model / KL，防止模型偏离太远；
+  \item 都是在提高高 advantage 输出的概率，降低低 advantage 输出的概率。
+\end{itemize}
+
+真正核心差别是：
+
+\[
+\text{PPO 需要 critic 估计 baseline}
+\]
+
+\[
+\text{GRPO 用同组回答的平均 reward 当 baseline}
+\]
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+ & \textbf{PPO} & \textbf{GRPO} \\
+\hline
+采样方式
+&
+通常每个 prompt 采样 rollout
+&
+同一个 prompt 采样一组 outputs
+\\
+Advantage 来源
+&
+$A_t = R_t - V_\psi(s_t)$
+&
+$\hat{A}_i = (r_i-\mu_\text{group})/(\sigma_\text{group}+\epsilon)$
+\\
+是否需要 critic
+&
+需要 value model / critic
+&
+不需要 critic
+\\
+baseline 是什么
+&
+critic 预测的 $V_\psi(s_t)$
+&
+同组回答 reward 的均值
+\\
+比较对象
+&
+某个动作相对 critic 预期好不好
+&
+某个回答相对同题其他回答好不好
+\\
+工程成本
+&
+更重，需要训练 value model
+&
+更轻，但需要同题多采样
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{直觉：} PPO 像是“每个答案都问一个评分老师：这个状态本来预期能拿几分？”\\
+GRPO 像是“同一道题让模型答多次，然后在这几份答案里相互比较：谁比平均好，谁比平均差？”
+\end{intubox}
+
+\paragraph{PPO 的思路}
+
+PPO 对某个 token / action 的更新方向依赖 advantage：
+
+\[
+A_t = R_t - V_\psi(s_t)
+\]
+
+这里的 $V_\psi(s_t)$ 是 critic 的预测。它表示：
+
+\[
+\text{在状态 } s_t \text{ 下，平均预期能拿多少 reward}
+\]
+
+如果真实 reward 比 critic 预期高：
+
+\[
+A_t > 0
+\]
+
+就提高这条 trajectory 里 token 的概率。
+
+如果真实 reward 比 critic 预期低：
+
+\[
+A_t < 0
+\]
+
+就降低这些 token 的概率。
+
+\paragraph{GRPO 的思路}
+
+GRPO 不训练 critic。它对同一个 prompt 采样多个回答：
+
+\[
+o_1,o_2,\ldots,o_G
+\]
+
+然后打 reward：
+
+\[
+r_1,r_2,\ldots,r_G
+\]
+
+用组内平均 reward 作为 baseline：
+
+\[
+\mu_\text{group} = \operatorname{mean}(r_1,\ldots,r_G)
+\]
+
+于是：
+
+\[
+\hat{A}_i
+=
+\frac{r_i-\mu_\text{group}}{\sigma_\text{group}+\epsilon}
+\]
+
+如果某个回答比同组平均好：
+
+\[
+\hat{A}_i > 0
+\]
+
+就提高这个回答里 tokens 的概率。
+
+如果某个回答比同组平均差：
+
+\[
+\hat{A}_i < 0
+\]
+
+就降低这个回答里 tokens 的概率。
+
+\begin{summarybox}
+\textbf{最小区别：}
+\[
+\text{PPO：用 critic 判断“比预期好不好”}
+\]
+\[
+\text{GRPO：用同组回答判断“比同伴好不好”}
+\]
+所以 GRPO 的主要创新是去掉 critic，把 baseline 从 learned value model 换成 group mean reward。
+\end{summarybox}
+
+\subsubsection{为什么叫 Group Relative}
+
+这个名字可以拆开理解：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Group：} 对同一个 prompt 采样多个回答；
+  \item \textbf{Relative：} 每个回答的好坏不是看绝对 reward，而是和同组其他回答比较；
+  \item \textbf{Policy Optimization：} 用这个相对 advantage 更新生成模型的概率分布。
+\end{itemize}
+
+所以 GRPO 的核心不是“一个问题一个 reward”，而是：
+
+\[
+\text{一个问题}
+\to
+\text{一组回答}
+\to
+\text{组内相对好坏}
+\to
+\text{更新 policy}
+\]
+
+\subsubsection{GRPO 和 Teacher Forcing 的关系}
+
+GRPO 先让模型自由生成回答：
+
+\[
+o_i \sim \pi_{\theta_\text{old}}(\cdot \mid q)
+\]
+
+这些回答生成出来以后，就变成固定 token 序列。更新时，为了计算：
+
+\[
+\log \pi_\theta(o_i \mid q)
+\]
+
+或者 token 级 ratio：
+
+\[
+\rho_{i,t}(\theta)
+\]
+
+仍然会用 teacher forcing 的方式沿着这条已经生成的回答路径取 logprob：
+
+\[
+\log \pi_\theta(o_i \mid q)
+=
+\sum_t
+\log \pi_\theta(o_{i,t} \mid q, o_{i,<t})
+\]
+
+\begin{intubox}
+\textbf{直觉：} GRPO 的回答是模型先自由采样出来的；但训练更新时，计算这些回答的 logprob 仍然是沿着固定 token 路径打分。
+\end{intubox}
+
+这和 DPO 的差别是：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{4.8cm}}
+\hline
+ & \textbf{DPO} & \textbf{GRPO} \\
+\hline
+回答来源 & 数据集里的 chosen / rejected & 当前模型在线采样出的 group outputs \\
+是否自由生成 & 训练时不生成，直接对固定答案打分 & 先自由生成，再对生成结果打分和更新 \\
+Reward / preference & 离线偏好对 & verifier / reward function \\
+logprob 计算 & teacher forcing & 对生成出来的回答路径 teacher forcing \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{GRPO、DPO、PPO 的位置}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.4cm}p{3.5cm}p{3.5cm}p{3.4cm}}
+\hline
+\textbf{方法} & \textbf{是否在线采样} & \textbf{是否需要 critic} & \textbf{训练信号} \\
+\hline
+PPO / RLHF & 是 & 通常需要 & Reward Model / human preference \\
+DPO & 否 & 不需要 & 离线 chosen / rejected \\
+GRPO / RLVR & 是 & 不需要 & 组内相对 reward / verifier \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{三者最短区别：}
+\[
+\text{PPO：在线 RL，有 critic}
+\]
+\[
+\text{DPO：离线偏好学习，无 critic}
+\]
+\[
+\text{GRPO：在线 RL，无 critic，用组内相对 reward}
+\]
+\end{summarybox}
+
+\subsubsection{GRPO 的优点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 不需要 value model / critic，显存和训练复杂度更低；
+  \item 可以在线采样，让模型探索新的解题路径；
+  \item 适合数学、代码等可验证任务；
+  \item 组内 normalization 能把不同 prompt 的 reward 尺度拉到相近范围；
+  \item 可以自然接上 rule-based verifier。
+\end{itemize}
+
+\subsubsection{GRPO 的局限}
+
+GRPO 也有自己的问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{依赖 reward / verifier 质量。} 验证器错了，模型会学错方向。
+  \item \textbf{稀疏 reward 下信号可能弱。} 如果一组答案全错，组内没有好坏差异，学习信号很少。
+  \item \textbf{可能学会 reward hacking。} 如果格式 reward 或规则设计有漏洞，模型会钻规则空子。
+  \item \textbf{计算仍然不便宜。} 每个 prompt 要采样多个回答，生成成本高。
+  \item \textbf{最终答案正确不等于推理过程可靠。} outcome reward 可能只奖励结果，不能保证中间推理每一步都正确。
+\end{enumerate}
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{GRPO / RLVR 的核心：}\\
+RLVR 提供可验证 reward：
+\[
+\text{模型生成} \to \text{规则 / verifier 打分}
+\]
+GRPO 用组内相对 reward 估计 advantage：
+\[
+\hat{A}_i
+=
+\frac{r_i - \operatorname{mean}(\{r_j\})}{\operatorname{std}(\{r_j\})+\epsilon}
+\]
+再用 PPO-style ratio + clip + KL 更新 policy。\\
+核心意义：保留在线 RL 的探索能力，同时去掉 PPO 里的 value model / critic。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item DPO 已经能用偏好数据训练 policy，为什么还需要 GRPO / RLVR？
+  \item RLVR 的 reward 和 RLHF 的 reward 有什么区别？
+  \item GRPO 为什么可以去掉 value model / critic？
+  \item 组内 advantage $\hat{A}_i$ 是怎么计算的？
+  \item 如果同一组回答全对或全错，GRPO 的学习信号会怎样？
+  \item GRPO 里的 old policy、reference model 分别起什么作用？
+\end{enumerate}

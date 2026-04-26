@@ -1,0 +1,449 @@
+% ============================================================
+% Round 10: REINFORCE++ / RLOO
+% ============================================================
+
+\subsection{Round 10：REINFORCE++ / RLOO}
+
+\subsubsection{本轮问题}
+
+\begin{conceptbox}
+\textbf{学习目标：} 理解 critic-free RL 不只有 GRPO 一条路。REINFORCE++ / RLOO 代表另一类思路：回到基础 policy gradient，用 baseline、KL、clip 和 advantage normalization 获得稳定训练。\\
+\textbf{主线位置：}
+\[
+\text{PPO}
+\to
+\text{GRPO}
+\to
+\text{DAPO / Dr.GRPO / GSPO}
+\to
+\text{REINFORCE++ / RLOO}
+\]
+\end{conceptbox}
+
+\begin{conceptbox}
+\textbf{Highlight：REINFORCE++}\\
+\textbf{论文：} \emph{REINFORCE++: Stabilizing Critic-Free Policy Optimization with Global Advantage Normalization}\\
+\textbf{arXiv：} \href{https://arxiv.org/abs/2501.03262}{2501.03262}，submitted 2025-01-04，last revised 2025-11-10\\
+\textbf{早期标题：} \emph{REINFORCE++: A Simple and Efficient Approach for Aligning Large Language Models}\\
+\textbf{Code：} \href{https://github.com/OpenRLHF/OpenRLHF}{OpenRLHF/OpenRLHF}\\
+\textbf{关键词：} critic-free RL，global advantage normalization，PPO-clip，token-level KL，REINFORCE++ with baseline\\
+\textbf{核心定位：} 不训练 critic，也不依赖 prompt-level local normalization；用全局 advantage normalization 稳定 REINFORCE-style LLM RL。
+\end{conceptbox}
+
+\begin{conceptbox}
+\textbf{Highlight：RLOO}\\
+\textbf{论文：} \emph{Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs}\\
+\textbf{arXiv：} \href{https://arxiv.org/abs/2402.14740}{2402.14740}，submitted 2024-02-22，last revised 2024-02-26\\
+\textbf{关键词：} REINFORCE Leave-One-Out，critic-free RLHF，group baseline，online RL at lower cost\\
+\textbf{核心定位：} 证明很多 PPO 组件在 LLM RLHF 里未必必要，用更简单的 REINFORCE-style 方法也能有效做在线偏好优化。
+\end{conceptbox}
+
+\subsubsection{为什么要回到 REINFORCE}
+
+PPO 的问题是需要 critic：
+
+\[
+A_t = R_t - V_\psi(s_t)
+\]
+
+GRPO 的做法是去掉 critic，用同一 prompt 的 group reward 做相对 advantage：
+
+\[
+\hat{A}_i^\text{GRPO}
+=
+\frac{r_i-\mu_\text{group}}{\sigma_\text{group}+\epsilon}
+\]
+
+但这带来我们前面讲过的问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item prompt-level / local normalization 可能有偏；
+  \item group 太小，advantage 估计不稳；
+  \item 全对 / 全错 group 没有信号；
+  \item std scaling 可能改变不同 prompt 的训练权重。
+\end{itemize}
+
+REINFORCE++ 的问题意识是：
+
+\[
+\text{能不能保留 critic-free 的简单性，但不用局部 group std normalization？}
+\]
+
+\begin{summarybox}
+\textbf{一句话：} REINFORCE++ = 回到 REINFORCE policy gradient，但吸收 PPO 的稳定化技巧，并用 global advantage normalization 替代局部 group normalization。
+\end{summarybox}
+
+\subsubsection{REINFORCE 基础公式}
+
+最基础的 REINFORCE policy gradient 是：
+
+\[
+\nabla_\theta J(\theta)
+=
+\mathbb{E}_{y\sim\pi_\theta(\cdot\mid x)}
+\left[
+R(x,y)
+\nabla_\theta
+\log \pi_\theta(y\mid x)
+\right]
+\]
+
+因为：
+
+\[
+\log \pi_\theta(y\mid x)
+=
+\sum_{t=1}^{T}
+\log \pi_\theta(y_t\mid x,y_{<t})
+\]
+
+所以梯度可以理解成：
+
+\[
+R(x,y)
+\sum_{t=1}^{T}
+\nabla_\theta
+\log \pi_\theta(y_t\mid x,y_{<t})
+\]
+
+如果 reward 高，就提高这整段回答 token 路径的概率；如果 reward 低，就降低。
+
+为了降低方差，通常加 baseline：
+
+\[
+\nabla_\theta J(\theta)
+=
+\mathbb{E}
+\left[
+(R-b)
+\nabla_\theta
+\log \pi_\theta(y\mid x)
+\right]
+\]
+
+这里：
+
+\[
+A = R-b
+\]
+
+就是 advantage。
+
+\begin{intubox}
+\textbf{直觉：} REINFORCE 不问 critic 这个状态应该拿几分。它只看这条完整回答拿了多少 reward，再用 baseline 判断它比基准好还是差。
+\end{intubox}
+
+\subsubsection{RLOO：Leave-One-Out Baseline}
+
+RLOO = REINFORCE Leave-One-Out。
+
+它也会对同一个 prompt 采样多个回答：
+
+\[
+y_1,y_2,\ldots,y_G
+\]
+
+并得到 reward：
+
+\[
+r_1,r_2,\ldots,r_G
+\]
+
+对第 $i$ 个回答，baseline 不用 critic，而是用同组其他回答的平均值：
+
+\[
+b_i^\text{RLOO}
+=
+\frac{1}{G-1}
+\sum_{j\ne i}
+r_j
+\]
+
+于是：
+
+\[
+A_i^\text{RLOO}
+=
+r_i-b_i^\text{RLOO}
+\]
+
+\begin{summarybox}
+\textbf{RLOO 的直觉：} 判断 $y_i$ 好不好时，不拿它自己参与 baseline，而是问：它比同题其他回答平均水平高还是低？
+\end{summarybox}
+
+这和 GRPO 很像，都是 group-based critic-free baseline。但区别是：
+
+\[
+\text{GRPO 通常用 group mean/std normalization}
+\]
+
+\[
+\text{RLOO 用 leave-one-out mean baseline}
+\]
+
+\subsubsection{REINFORCE++：全局 Advantage Normalization}
+
+REINFORCE++ 的核心强调是 Global Advantage Normalization。
+
+GRPO 的 local normalization 是在每个 prompt 的小 group 内做：
+
+\[
+\hat{A}_i^\text{local}
+=
+\frac{r_i-\mu_\text{group}}{\sigma_\text{group}+\epsilon}
+\]
+
+REINFORCE++ 更强调在 global batch 上做归一化。先得到一批样本的 advantage：
+
+\[
+A_1,A_2,\ldots,A_N
+\]
+
+然后用整个 batch 的均值和标准差归一化：
+
+\[
+\hat{A}_i^\text{global}
+=
+\frac{
+A_i-\mu_\text{batch}
+}{
+\sigma_\text{batch}+\epsilon
+}
+\]
+
+其中：
+
+\[
+\mu_\text{batch}
+=
+\operatorname{mean}(A_1,\ldots,A_N)
+\]
+
+\[
+\sigma_\text{batch}
+=
+\operatorname{std}(A_1,\ldots,A_N)
+\]
+
+\begin{intubox}
+\textbf{直觉：} GRPO 是“每道题内部统一标尺”；REINFORCE++ 是“整个 batch 用一个统一标尺”。后者希望减少小 group 局部归一化带来的偏置和不稳定。
+\end{intubox}
+
+\subsubsection{REINFORCE++ with Baseline}
+
+REINFORCE++ 也有 group-sampling 版本，常被称为 REINFORCE++ with baseline。
+
+对复杂 reasoning 任务，可以先对同一个 prompt 采样多个回答，用 group baseline 得到初始 advantage：
+
+\[
+A_i
+=
+r_i-\mu_\text{group}
+\]
+
+然后不在 prompt 内部除以 group std，而是把所有样本放到 global batch 里统一归一化：
+
+\[
+\hat{A}_i
+=
+\frac{
+A_i-\mu_\text{batch}
+}{
+\sigma_\text{batch}+\epsilon
+}
+\]
+
+这样它结合了两件事：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item group baseline：保留同题内部比较；
+  \item global normalization：避免每个小 group 自己的 std 改写权重。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{和 Dr.GRPO 的关系：} Dr.GRPO 也批评 group std scaling。REINFORCE++ with baseline 的思路相近：可以减去 group mean，但不要只靠 prompt-level std normalization；把归一化放到更大的 global batch 上。
+\end{summarybox}
+
+\subsubsection{REINFORCE++ 吸收了 PPO 的哪些技巧}
+
+REINFORCE++ 不是裸 REINFORCE。它吸收了 PPO/RLHF 里几个常用稳定化组件：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{PPO-clip：} 限制 new policy 相对 old policy 的更新幅度；
+  \item \textbf{token-level KL penalty：} 在 reward 或 loss 中约束 policy 不要偏离 reference 太远；
+  \item \textbf{mini-batch updates：} 对采样数据做小批量、多步更新；
+  \item \textbf{advantage normalization：} 用 global batch 标准化降低梯度方差；
+  \item \textbf{reward clipping / scaling：} 处理异常 reward，提升数值稳定性。
+\end{itemize}
+
+所以它可以写成一种 PPO-style critic-free objective：
+
+\[
+\mathcal{J}_\text{R++}(\theta)
+=
+\mathbb{E}
+\left[
+\sum_t
+\min
+\left(
+\rho_t(\theta)\hat{A}_t,\;
+\operatorname{clip}(\rho_t(\theta),1-\epsilon,1+\epsilon)\hat{A}_t
+\right)
+-
+\beta \operatorname{KL}
+\right]
+\]
+
+区别在于：
+
+\[
+\hat{A}
+\text{ 不来自 critic，而来自 reward / baseline / global normalization}
+\]
+
+\begin{warnbox}
+\textbf{关键点：} REINFORCE++ 不是“完全不用 PPO 技巧”。它是不训练 critic，但保留 PPO-clip、KL、advantage normalization 等稳定化手段。
+\end{warnbox}
+
+\subsubsection{REINFORCE++ / RLOO / GRPO 对比}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.7cm}p{3.3cm}p{3.4cm}p{3.4cm}}
+\hline
+ & \textbf{GRPO} & \textbf{RLOO} & \textbf{REINFORCE++} \\
+\hline
+是否需要 critic
+&
+不需要
+&
+不需要
+&
+不需要
+\\
+采样方式
+&
+同 prompt group sampling
+&
+同 prompt group sampling
+&
+$k\ge 1$；可单样本，也可 group
+\\
+baseline
+&
+group mean
+&
+leave-one-out group mean
+&
+可无 baseline，也可 group baseline
+\\
+归一化
+&
+local group std normalization
+&
+通常用 group baseline，形式更简单
+&
+global batch advantage normalization
+\\
+主要目标
+&
+去 critic，用组内相对 reward
+&
+用 leave-one-out 降低方差
+&
+去 critic，同时降低 local normalization 偏置
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{和 Dr.GRPO / GSPO 的关系}
+
+这些方法关注的维度不同：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{9.5cm}}
+\hline
+\textbf{方法} & \textbf{主要修的问题} \\
+\hline
+Dr.GRPO
+&
+批评 GRPO 的 response length normalization 和 reward std scaling bias。
+\\
+GSPO
+&
+批评 token-level ratio 和 sequence-level reward 的粒度不匹配。
+\\
+REINFORCE++
+&
+批评 prompt-level local normalization 不稳 / 有偏，改用 global advantage normalization。
+\\
+RLOO
+&
+用 leave-one-out group baseline 简化 critic-free advantage 估计。
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{直觉：} Dr.GRPO 问“归一化有没有引入长度和难度偏置”；GSPO 问“ratio 粒度对不对”；REINFORCE++ 问“advantage 归一化应该在小 group 里做，还是在更大的 batch 上做”。
+\end{intubox}
+
+\subsubsection{什么时候更像 GRPO，什么时候更像 REINFORCE++}
+
+如果任务是数学 / 代码，且每个 prompt 能采样多个回答并自动验证，那么 GRPO / DAPO 很自然：
+
+\[
+\text{同题多样本}
+\to
+\text{组内比较}
+\]
+
+如果任务更一般，或者每个 prompt 不一定采很多样本，REINFORCE++ 的 $k\ge 1$ 设定更灵活：
+
+\[
+\text{采样一批 outputs}
+\to
+\text{全局 advantage normalization}
+\]
+
+如果既想保留同题比较，又想避免 group std bias，可以用 REINFORCE++ with baseline：
+
+\[
+A_i = r_i-\mu_\text{group}
+\quad
+\to
+\quad
+\text{global normalization}
+\]
+
+\subsubsection{本轮最小结论}
+
+\begin{summarybox}
+\textbf{REINFORCE++ / RLOO 的核心：}\\
+它们和 GRPO 一样，都是 critic-free。不同点在 advantage / baseline 的处理：
+\[
+\text{GRPO：local group mean/std normalization}
+\]
+\[
+\text{RLOO：leave-one-out group baseline}
+\]
+\[
+\text{REINFORCE++：global advantage normalization}
+\]
+REINFORCE++ 的主张是：不用 critic，也不用小 group 的局部 std normalization；在全局 batch 上归一化 advantage，可以更稳定、更接近无偏。
+\end{summarybox}
+
+\subsubsection{本轮检查题}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item REINFORCE 为什么天然不需要 critic？
+  \item RLOO 的 leave-one-out baseline 怎么计算？
+  \item GRPO 的 local normalization 和 REINFORCE++ 的 global normalization 有什么区别？
+  \item REINFORCE++ 保留了 PPO 的哪些稳定化技巧？
+  \item REINFORCE++ with baseline 和 Dr.GRPO 在批评 group std scaling 上有什么相似点？
+\end{enumerate}
