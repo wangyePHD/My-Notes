@@ -1,0 +1,871 @@
+% ============================================================
+% Round 09: Image Editing Specific RL
+% ============================================================
+
+\subsection{Round 09：图像编辑专属 RL：从“生成好图”到“改对且不乱改”}
+
+\subsubsection{Highlight}
+
+\begin{conceptbox}
+\textbf{本章相关论文：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{RePlan}：arXiv 2025-12-18，Reasoning-guided Region Planning for Complex Instruction-based Image Editing。核心是 plan-then-execute：先用 VLM planner 把复杂编辑指令分解并定位到区域，再交给 diffusion editor 执行。论文：\url{https://arxiv.org/abs/2512.16864}，项目页：\url{https://replan-iv-edit.github.io/}
+  \item \textbf{CogniEdit}：arXiv 2025-12-15，Dense Gradient Flow Optimization for Fine-Grained Image Editing。核心是多模态推理 + Dynamic Token Focus Relocation + Dense GRPO，让连续 denoising steps 有轨迹级监督。论文：\url{https://arxiv.org/abs/2512.13276}
+  \item \textbf{ThinkRL-Edit}：arXiv 2026-01-06，v3 2026-02-26，Thinking in Reinforcement Learning for Reasoning-Centric Image Editing。核心是把 reasoning exploration 从 denoising 随机性里拆出来，用 CoT planning / reflection 和 checklist reward 做复杂编辑。论文：\url{https://arxiv.org/abs/2601.03467}
+  \item \textbf{UniRef-Image-Edit}：arXiv 2026-02-15，Towards Scalable and Consistent Multi-Reference Image Editing。核心是 SELF 表示和 Multi-Source GRPO，用于多参考图编辑和多图合成。论文：\url{https://arxiv.org/abs/2602.14186}
+  \item \textbf{RC-GRPO-Editing}：arXiv 2026-04-10，Region-Constrained Group Relative Policy Optimization for Flow-Based Image Editing。核心是 region-constrained exploration 和 attention concentration reward，减少背景扰动带来的 noisy advantage。论文：\url{https://arxiv.org/abs/2604.09386}
+  \item \textbf{HP-Edit}：arXiv 2026-04-21，CVPR 2026，A Human-Preference Post-Training Framework for Image Editing。核心是 RealPref-50K、HP-Scorer、RealPref-Bench，把人类偏好系统化接入图像编辑后训练。论文：\url{https://arxiv.org/abs/2604.19406}
+\end{itemize}
+\end{conceptbox}
+
+\begin{warnbox}
+\textbf{关于代码链接：}\\
+RePlan 的 arXiv 页面给出了项目页。其他几篇我目前没有在 arXiv 页面里看到稳定的官方 GitHub 链接；UniRef-Image-Edit 在摘要里说会开源代码、模型、训练数据和 reward 数据，但当前笔记先只记录论文链接。
+\end{warnbox}
+
+\subsubsection{为什么图像编辑不能直接照搬文生图 GRPO}
+
+文生图的目标通常是：
+
+\[
+\text{prompt } c
+\Rightarrow
+\text{image } y
+\]
+
+它的 reward 可以粗略理解成：
+
+\[
+R_\text{t2i}(y,c)
+=
+\text{文本对齐}
++
+\text{视觉质量}
++
+\text{美学偏好}
+\]
+
+但图像编辑的输入多了原图：
+
+\[
+(x,c)
+\Rightarrow
+y
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $x$ 是原图；
+  \item $c$ 是编辑指令；
+  \item $y$ 是编辑后的图；
+  \item $m$ 是应该被编辑的区域 mask，$1-m$ 是应该保持不变的区域。
+\end{itemize}
+
+所以图像编辑的目标不是“生成一张好图”，而是：
+
+\[
+\text{改对该改的}
+\quad
+\text{同时不乱改不该改的}
+\]
+
+这可以写成：
+
+\[
+R_\text{edit}(y,x,c,m)
+=
+\lambda_\text{target}R_\text{target}(y,c,m)
++
+\lambda_\text{preserve}R_\text{preserve}(y,x,1-m)
++
+\lambda_\text{quality}R_\text{quality}(y)
+\]
+
+其中：
+
+\[
+R_\text{target}
+\Rightarrow
+\text{编辑区域是否符合指令}
+\]
+
+\[
+R_\text{preserve}
+\Rightarrow
+\text{非编辑区域是否保持原图内容}
+\]
+
+\[
+R_\text{quality}
+\Rightarrow
+\text{整体是否自然、清晰、没有伪影}
+\]
+
+\begin{summarybox}
+\textbf{关键转变：}\\
+文生图 RL 主要优化：
+\[
+\text{prompt-image alignment}
+\]
+图像编辑 RL 还必须同时优化：
+\[
+\text{instruction following}
+\quad
+\text{localization}
+\quad
+\text{source preservation}
+\quad
+\text{human preference}
+\]
+这就是为什么会出现图像编辑专属 RL 工作，而不是直接复用 T2I 的 Flow-GRPO。
+\end{summarybox}
+
+\subsubsection{编辑任务里的三类失败}
+
+我们先不看论文名字，先看问题本身。图像编辑 RL 主要在修三类失败。
+
+\textbf{第一类：理解失败。}
+
+复杂指令不是简单 prompt，例如：
+
+\[
+\text{把左边第二个人的蓝色外套改成红色，但保持背景和其他人不变}
+\]
+
+模型需要先知道：
+
+\[
+\text{left second person}
+\Rightarrow
+\text{target instance}
+\]
+
+\[
+\text{blue coat}
+\Rightarrow
+\text{target attribute}
+\]
+
+\[
+\text{red}
+\Rightarrow
+\text{new attribute}
+\]
+
+\[
+\text{background and other people}
+\Rightarrow
+\text{preserve constraints}
+\]
+
+如果没有推理和区域规划，模型可能会改错人、改错衣服、或者把背景一起改了。
+
+\textbf{第二类：执行失败。}
+
+就算模型理解了指令，denoising / flow trajectory 里也可能出现：
+
+\[
+\text{早期步骤改动范围太大}
+\Rightarrow
+\text{背景漂移}
+\]
+
+\[
+\text{中后期步骤局部修正不足}
+\Rightarrow
+\text{细节没改对}
+\]
+
+这时问题不是语义理解，而是 credit assignment：
+
+\[
+\text{到底是哪一段 trajectory 导致目标区域没改好？}
+\]
+
+\[
+\text{到底是哪一段 trajectory 导致非目标区域被污染？}
+\]
+
+\textbf{第三类：评价失败。}
+
+图像编辑的 reward 很难写成一个单一分数。假设两个输出：
+
+\[
+y_a:
+\text{目标改对了，但背景变了}
+\]
+
+\[
+y_b:
+\text{背景保持住了，但目标只改了一半}
+\]
+
+哪个更好？这不是普通美学分数能回答的问题。它需要任务相关偏好：
+
+\[
+\text{edit success}
+\quad
+\text{preservation}
+\quad
+\text{identity consistency}
+\quad
+\text{naturalness}
+\quad
+\text{user preference}
+\]
+
+\begin{intubox}
+\textbf{直觉：}\\
+图像编辑 RL 的难点不是“让 reward 变大”这么简单，而是 reward 自身必须知道：哪里应该变，哪里不应该变，什么叫人类真的满意。
+\end{intubox}
+
+\subsubsection{主线 A：先推理再编辑}
+
+这一类工作的核心判断是：
+
+\[
+\text{复杂编辑失败}
+\neq
+\text{只是生成模型不够强}
+\]
+
+而是：
+
+\[
+\text{模型没有先把编辑任务想清楚}
+\]
+
+\textbf{RePlan} 的做法是 plan-then-execute：
+
+\[
+(x,c)
+\xrightarrow{\text{planner}}
+z
+\xrightarrow{\text{editor}}
+y
+\]
+
+其中 $z$ 不是图像，而是编辑计划：
+
+\[
+z
+=
+\{
+\text{target regions},
+\text{sub-instructions},
+\text{editing order},
+\text{preserve constraints}
+\}
+\]
+
+RePlan 的重点不是让 diffusion editor 自己猜区域，而是先让 planner 产出 region-aligned plan：
+
+\[
+c
+\Rightarrow
+\text{step-by-step reasoning}
+\Rightarrow
+\text{region grounding}
+\Rightarrow
+\text{editor execution}
+\]
+
+它还用 GRPO 来强化 planner 的格式可靠性和 reasoning fidelity。也就是说，RL 优化的重点不一定是最终图像模型本身，也可以是：
+
+\[
+\pi_\theta(z\mid x,c)
+\]
+
+也就是“规划策略”。
+
+\textbf{ThinkRL-Edit} 更进一步，把 reasoning exploration 从 denoising 随机性里拿出来。普通图像 RL 的探索主要来自：
+
+\[
+\epsilon_t
+\sim
+\mathcal{N}(0,I)
+\]
+
+也就是采样噪声。但复杂编辑里，更关键的探索其实是：
+
+\[
+\text{我该如何理解这条指令？}
+\]
+
+\[
+\text{我该先改什么、后改什么？}
+\]
+
+\[
+\text{这个编辑计划是否和原图语义一致？}
+\]
+
+所以 ThinkRL-Edit 把策略拆成：
+
+\[
+\pi_\theta(z,y\mid x,c)
+=
+\pi_\theta(z\mid x,c)
+\pi_\theta(y\mid x,c,z)
+\]
+
+其中 $z$ 是 reasoning chain / plan / reflection。
+
+这样 GRPO 优化的不只是图像输出，还包括：
+
+\[
+\text{reasoning chain 的质量}
+\Rightarrow
+\text{最终编辑质量}
+\]
+
+\begin{summarybox}
+\textbf{这条主线的核心：}\\
+RePlan 和 ThinkRL-Edit 都在说：复杂图像编辑不能只靠 denoising 随机性探索。更重要的是先把编辑任务变成显式 plan，再用 RL 奖励好的 plan。
+\end{summarybox}
+
+\subsubsection{主线 B：细粒度编辑需要 dense trajectory supervision}
+
+如果指令是：
+
+\[
+\text{把杯子左侧的小蓝色 logo 改成黄色}
+\]
+
+模型不仅要理解目标，还要在采样轨迹里持续关注这个细节。
+
+普通 GRPO 常见做法是：采样 $G$ 个结果，计算最终 reward：
+
+\[
+R_1,\ldots,R_G
+\]
+
+再得到组内 advantage：
+
+\[
+A_i
+=
+\frac{
+R_i-\text{mean}(R_1,\ldots,R_G)
+}{
+\text{std}(R_1,\ldots,R_G)+\epsilon
+}
+\]
+
+问题是：同一个 $A_i$ 被分配给整条生成轨迹。
+
+\[
+A_i
+\Rightarrow
+\{t_1,t_2,\ldots,t_K\}
+\]
+
+但细粒度编辑里，不同时间步做的事情不一样：
+
+\[
+\text{early steps}
+\Rightarrow
+\text{布局和大结构}
+\]
+
+\[
+\text{middle steps}
+\Rightarrow
+\text{目标属性和局部形状}
+\]
+
+\[
+\text{late steps}
+\Rightarrow
+\text{纹理、边缘、细节}
+\]
+
+\textbf{CogniEdit} 针对的就是这个问题。它认为只在单个 sampling step 上优化，反馈太稀疏，不能形成 trajectory-level control。
+
+可以把它的思想抽象成：
+
+\[
+\text{instruction}
+\Rightarrow
+\text{actionable directives}
+\Rightarrow
+\text{token focus}
+\Rightarrow
+\text{dense GRPO over consecutive steps}
+\]
+
+也就是：
+
+\[
+A_{i,k:k+h}
+\Rightarrow
+\{t_k,t_{k+1},\ldots,t_{k+h}\}
+\]
+
+而不是只把一个最终分数硬塞给所有步骤。
+
+动态 token focus 的作用是：当指令里出现颜色、数量、位置等细节时，让模型在相关 token / region 上投入更多优化信号：
+
+\[
+\text{blue}
+\quad
+\text{left}
+\quad
+\text{two}
+\quad
+\text{small logo}
+\]
+
+这些词不是普通 prompt token，而是编辑成功与否的关键属性。
+
+\begin{intubox}
+\textbf{直觉：}\\
+CogniEdit 关心的是“细节到底在哪个步骤被改坏或改好”。它不是只问最终图像好不好，而是让 reward 信号沿着连续 denoising steps 更密地传回去。
+\end{intubox}
+
+\subsubsection{主线 C：区域约束的 GRPO}
+
+图像编辑和文生图最大的区别在这里：
+
+\[
+\text{编辑区域应该变化}
+\]
+
+\[
+\text{非编辑区域应该不变}
+\]
+
+如果我们仍然做全局探索：
+
+\[
+x_T
+=
+x_T^\text{base}
++
+\sigma\epsilon
+\]
+
+那么 $\epsilon$ 会影响整张图。结果是：
+
+\[
+\text{目标区域变化}
++
+\text{背景随机漂移}
+\]
+
+这会污染 reward。
+
+设总 reward 是：
+
+\[
+R
+=
+R_\text{target}
++
+R_\text{background}
+\]
+
+组内方差是：
+
+\[
+\text{Var}(R)
+=
+\text{Var}(R_\text{target})
++
+\text{Var}(R_\text{background})
++
+2\text{Cov}(R_\text{target},R_\text{background})
+\]
+
+我们真正想利用的是：
+
+\[
+\text{Var}(R_\text{target})
+\]
+
+因为它告诉我们目标区域哪个样本更好。
+
+但全局探索会让：
+
+\[
+\text{Var}(R_\text{background})
+\]
+
+变大。这样 advantage 就变噪：
+
+\[
+A_i
+=
+\frac{R_i-\bar{R}}{\text{std}(R)+\epsilon}
+\]
+
+里面的 $R_i$ 不再只反映编辑好坏，还混进了背景漂移。
+
+\textbf{RC-GRPO-Editing} 的思想是：探索也应该局部化。
+
+可以抽象成：
+
+\[
+\epsilon
+=
+m\odot\epsilon_\text{edit}
++
+(1-m)\odot\epsilon_\text{bg}
+\]
+
+并让：
+
+\[
+\|\epsilon_\text{bg}\|
+\ll
+\|\epsilon_\text{edit}\|
+\]
+
+这样随机性主要发生在编辑区域，而不是整张图。
+
+它还引入 attention concentration reward，让 cross-attention 更集中到目标区域。可以写成：
+
+\[
+R_\text{attn}
+=
+\frac{
+\sum_{p\in m}A(p)
+}{
+\sum_{p}A(p)+\epsilon
+}
+\]
+
+其中 $A(p)$ 表示目标编辑 token 对空间位置 $p$ 的 attention mass。
+
+如果模型注意力扩散到背景：
+
+\[
+R_\text{attn}
+\downarrow
+\]
+
+如果模型注意力集中在编辑区域：
+
+\[
+R_\text{attn}
+\uparrow
+\]
+
+\begin{summarybox}
+\textbf{RC-GRPO-Editing 的核心问题：}\\
+普通 GRPO 的组内比较假设“组内差异主要来自任务相关探索”。但图像编辑里，全局探索会制造大量背景差异。RC-GRPO-Editing 的目标是把探索和 credit 都限制在该编辑的区域里。
+\end{summarybox}
+
+\subsubsection{主线 D：人类偏好怎么进入图像编辑}
+
+前面几条主线主要在修算法：
+
+\[
+\text{planning}
+\quad
+\text{dense credit}
+\quad
+\text{region-constrained exploration}
+\]
+
+但还有一个更基础的问题：
+
+\[
+\text{reward 到底从哪里来？}
+\]
+
+图像编辑的偏好不是一个简单标签。人类看编辑结果时，通常同时看：
+
+\[
+\text{是否按指令改了}
+\]
+
+\[
+\text{原图身份 / 背景 / 风格是否保留}
+\]
+
+\[
+\text{结果是否自然}
+\]
+
+\[
+\text{有没有过度编辑}
+\]
+
+\textbf{HP-Edit} 做的是把人类偏好数据、自动 scorer、benchmark 连接起来：
+
+\[
+\text{human preference data}
+\Rightarrow
+\text{HP-Scorer}
+\Rightarrow
+\text{reward for post-training}
+\Rightarrow
+\text{RealPref-Bench evaluation}
+\]
+
+偏好数据可以抽象成：
+
+\[
+\mathcal{D}_\text{pref}
+=
+\{
+(x,c,y^+,y^-)
+\}
+\]
+
+其中 $y^+$ 是人更喜欢的编辑结果，$y^-$ 是相对更差的结果。
+
+训练 scorer：
+
+\[
+s_\phi(x,c,y)
+\]
+
+使得：
+
+\[
+s_\phi(x,c,y^+)
+>
+s_\phi(x,c,y^-)
+\]
+
+然后后训练时直接把 scorer 当 reward：
+
+\[
+R(y,x,c)
+=
+s_\phi(x,c,y)
+\]
+
+这样图像编辑 RL 就不再依赖零散的 CLIP / aesthetic / VLM 打分，而是有一个更贴近真实编辑偏好的 reward。
+
+\begin{warnbox}
+\textbf{注意：}\\
+HP-Edit 解决的不是“GRPO 公式怎么改”，而是“图像编辑的 reward model 和 benchmark 怎么建立”。没有可靠 reward，再精巧的 RL 算法也只是在优化错误目标。
+\end{warnbox}
+
+\subsubsection{主线 E：多参考图编辑}
+
+单图编辑是：
+
+\[
+(x,c)
+\Rightarrow
+y
+\]
+
+多参考图编辑是：
+
+\[
+(x^{(1)},x^{(2)},\ldots,x^{(n)},c)
+\Rightarrow
+y
+\]
+
+比如：
+
+\[
+\text{用图 1 的人物，穿图 2 的衣服，站在图 3 的场景里}
+\]
+
+这里的问题是 reference 之间可能冲突：
+
+\[
+x^{(1)}
+\Rightarrow
+\text{人物身份}
+\]
+
+\[
+x^{(2)}
+\Rightarrow
+\text{服装风格}
+\]
+
+\[
+x^{(3)}
+\Rightarrow
+\text{背景光照}
+\]
+
+如果这些约束互相不一致，模型必须学会取舍和融合。
+
+\textbf{UniRef-Image-Edit} 的关键是 SELF：
+
+\[
+\text{Sequence-Extended Latent Fusion}
+\]
+
+把多个 reference 动态序列化成一个统一 latent sequence：
+
+\[
+\{x^{(1)},\ldots,x^{(n)}\}
+\Rightarrow
+z_\text{SELF}
+\]
+
+并在固定 pixel budget 下训练模型处理不同数量、不同分辨率、不同作用的参考图。
+
+RL 阶段则使用 Multi-Source GRPO：
+
+\[
+\text{MSGRPO}
+\]
+
+它的目标不是只让输出符合一个 prompt，而是协调多个 source constraints：
+
+\[
+R
+=
+\sum_{j=1}^{n}
+\lambda_j R_j(y,x^{(j)},c)
+\]
+
+其中 $R_j$ 可以对应身份、物体、姿态、风格、背景等不同参考源。
+
+\begin{intubox}
+\textbf{直觉：}\\
+多参考图编辑的本质是“多条件约束优化”。MSGRPO 不是单纯奖励最终图好不好，而是让模型学会在多个 reference 之间做一致性协调。
+\end{intubox}
+
+\subsubsection{这一章的统一框架}
+
+现在把这几篇论文放到同一个框架里：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.2cm}p{5.4cm}}
+\hline
+\textbf{论文} & \textbf{主要解决的问题} & \textbf{对应的抽象模块} \\
+\hline
+RePlan
+&
+复杂指令需要区域规划
+&
+$\pi_\theta(z\mid x,c)$：先生成 region-aligned plan
+\\
+ThinkRL-Edit
+&
+复杂编辑需要 reasoning exploration
+&
+$\pi_\theta(z,y\mid x,c)$：reasoning chain + image synthesis
+\\
+CogniEdit
+&
+细粒度属性需要轨迹级 dense feedback
+&
+$A_{k:k+h}$：连续步骤上的 dense GRPO
+\\
+RC-GRPO-Editing
+&
+全局探索污染背景，导致 advantage noisy
+&
+$m\odot\epsilon$：局部探索 + attention concentration reward
+\\
+HP-Edit
+&
+真实编辑偏好缺少可扩展 reward
+&
+$s_\phi(x,c,y)$：human preference aligned scorer
+\\
+UniRef-Image-Edit
+&
+多参考图约束冲突
+&
+$\sum_j \lambda_j R_j$：multi-source GRPO
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+可以进一步统一成：
+
+\[
+\max_\theta
+\mathbb{E}_{z,y\sim\pi_\theta}
+\left[
+R_\phi(y,x,c,m,z)
+\right]
+-
+\beta
+D_\text{KL}
+\left(
+\pi_\theta
+\|
+\pi_\text{ref}
+\right)
+\]
+
+其中：
+
+\[
+z
+=
+\text{plan / reasoning chain / reference fusion state}
+\]
+
+\[
+R_\phi
+=
+\text{target edit reward}
++
+\text{preservation reward}
++
+\text{preference reward}
++
+\text{region attention reward}
+\]
+
+\begin{summarybox}
+\textbf{一句话总结：}\\
+图像编辑专属 RL 的核心不是把 Flow-GRPO 公式换个名字，而是把 action、trajectory、reward、advantage 都改造成适合编辑任务的形式：
+\[
+\text{plan-aware}
+\quad
+\text{region-aware}
+\quad
+\text{trajectory-aware}
+\quad
+\text{preference-aware}
+\quad
+\text{reference-aware}
+\]
+\end{summarybox}
+
+\subsubsection{下一步该怎么学}
+
+后面如果继续深入，最自然的顺序是：
+
+\[
+\text{RC-GRPO-Editing}
+\Rightarrow
+\text{CogniEdit}
+\Rightarrow
+\text{ThinkRL-Edit / RePlan}
+\Rightarrow
+\text{HP-Edit}
+\Rightarrow
+\text{UniRef-Image-Edit}
+\]
+
+原因是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{RC-GRPO-Editing} 最贴近我们刚学过的 Flow-GRPO，可以直接理解 region-constrained advantage。
+  \item \textbf{CogniEdit} 接着解决 dense trajectory supervision，和 DenseGRPO / credit assignment 连得上。
+  \item \textbf{ThinkRL-Edit / RePlan} 再引入 reasoning / planning，把 policy 从图像轨迹扩展到语义计划。
+  \item \textbf{HP-Edit} 解决 reward source，是后训练系统落地必须面对的问题。
+  \item \textbf{UniRef-Image-Edit} 最后处理多参考图，是更复杂的多条件编辑场景。
+\end{enumerate}
+
+\begin{conceptbox}
+\textbf{下一节建议：RC-GRPO-Editing}\\
+它最适合作为第一篇精读，因为它直接回答：
+\[
+\text{为什么普通 GRPO 在图像编辑里会因为背景扰动产生 noisy advantage？}
+\]
+这个问题一旦懂了，后面 CogniEdit、HP-Edit、UniRef 的动机都会更清楚。
+\end{conceptbox}
