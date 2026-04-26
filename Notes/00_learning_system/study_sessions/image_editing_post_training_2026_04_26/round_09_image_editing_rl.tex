@@ -279,6 +279,61 @@ c
 
 也就是“规划策略”。
 
+\begin{center}
+\includegraphics[width=\linewidth]{imgs/replan.png}
+
+{\small\textbf{图：RePlan 架构图。}上半部分是从复杂指令到 region-aligned guidance 再到编辑结果；下半部分是 planner 输出的区域提示如何进入 MMDiT 编辑器。}
+\end{center}
+
+这张图可以按 4 步读：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{输入：} 左侧给定原图 $x$ 和编辑指令 $c$。例子里不是简单“生成盆栽”，而是要判断哪个 cup 已经用过、哪个 cup 在左边、哪个 glass 需要保持不变。
+  \item \textbf{VLM planner：} VLM 先做 thought / chain-of-thought reasoning，把自然语言指令转成结构化的 global hint 和 region hint。
+  \item \textbf{Region-aligned guidance：} planner 不只输出文本，还输出每个 region 的 bounding box。于是编辑器知道：
+  \[
+  \text{Region 1}
+  \Rightarrow
+  \text{replace red cup with small potted plant}
+  \]
+  \[
+  \text{Region 2}
+  \Rightarrow
+  \text{keep glass unchanged}
+  \]
+  \[
+  \text{Global}
+  \Rightarrow
+  \text{keep remaining region unchanged}
+  \]
+  \item \textbf{MMDiT editor：} 输入图像经过 VAE encoder 变成 image patch tokens；region bbox 把这些 patch 分组；region-decoupled text encoder 把每个 hint 编成对应 token；最后通过 attention mask injection，让不同 region 的 hint 只主要影响自己的 patch group。
+\end{enumerate}
+
+因此 RePlan 的关键不是“多加一段提示词”，而是把编辑指令变成：
+
+\[
+\text{global hint}
++
+\{(\text{bbox}_r,\text{region hint}_r)\}_{r=1}^{R}
+\]
+
+也就是：
+
+\[
+\text{语言级规划}
+\Rightarrow
+\text{空间区域绑定}
+\Rightarrow
+\text{区域级注意力注入}
+\Rightarrow
+\text{最终编辑}
+\]
+
+\begin{intubox}
+\textbf{直觉：}\\
+普通编辑模型像是“看一句话然后整张图一起改”。RePlan 像是先拿笔在图上圈出每个要处理的区域，再给每个区域单独贴一张小纸条：这里改什么、那里保持什么。这样复杂编辑就不再完全依赖模型自己在隐空间里猜。
+\end{intubox}
+
 \textbf{ThinkRL-Edit} 更进一步，把 reasoning exploration 从 denoising 随机性里拿出来。普通图像 RL 的探索主要来自：
 
 \[
