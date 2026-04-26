@@ -401,6 +401,166 @@ RealPref-50K, HP-Scorer, RealPref-Bench
 所以后续前沿阅读不应该只沿 Flow Matching 走，而要分成“图像编辑、连续 flow、离散/AR/VAR、视频、统一多模态生成”五条线。
 \end{summarybox}
 
+\subsubsection{研究主线总览：从论文列表到研究地图}
+
+这些论文不能按时间顺序硬读。更好的方式是按“它到底在修 Flow-GRPO / Diffusion RL 的哪一个痛点”来分组。
+
+\begin{conceptbox}
+\textbf{分类原则：}\\
+下面的主线不是互斥分类。一篇论文可能同时属于多个方向，比如 TaRoS 既是 video GRPO，也是在处理 reward hacking；ReasonGen-R1 既是 AR 图像生成，也属于 reasoning-driven generation。这里按“主要研究问题”归档。
+\end{conceptbox}
+
+{\small
+\begin{longtable}{p{2.45cm}p{3.7cm}p{5.8cm}p{3.3cm}}
+\hline
+\textbf{研究主线} & \textbf{核心问题} & \textbf{代表工作} & \textbf{读论文时抓什么} \\
+\hline
+\endfirsthead
+\hline
+\textbf{研究主线} & \textbf{核心问题} & \textbf{代表工作} & \textbf{读论文时抓什么} \\
+\hline
+\endhead
+连续 flow 的信用分配
+&
+terminal reward 太粗，不能说明哪个 timestep / chunk / branch 真正导致好结果
+&
+\href{https://arxiv.org/abs/2505.05470}{Flow-GRPO},
+\href{https://arxiv.org/abs/2508.04324}{TempFlow-GRPO},
+\href{https://arxiv.org/abs/2510.21583}{Chunk-GRPO},
+\href{https://arxiv.org/abs/2601.20218}{DenseGRPO},
+\href{https://arxiv.org/abs/2509.25774}{PCPO},
+\href{https://arxiv.org/abs/2604.19234}{OTCA},
+\href{https://arxiv.org/abs/2603.12648}{MV-GRPO}
+&
+advantage 是分给 step、chunk、branch、objective，还是多视角 condition
+\\
+\hline
+采样效率、轨迹选择与直接梯度
+&
+图像 / 视频 rollout 很贵；哪些旧轨迹能复用，哪些步骤值得采样，能不能不走 logprob
+&
+\href{https://arxiv.org/abs/2604.04142}{OP-GRPO},
+\href{https://arxiv.org/abs/2601.00423}{E-GRPO},
+\href{https://arxiv.org/abs/2512.18766}{MaskFocus},
+\href{https://arxiv.org/abs/2604.15311}{LeapAlign}
+&
+on-policy / off-policy、replay buffer、entropy step、critical step、direct-gradient 的差别
+\\
+\hline
+reward 设计、多目标与 reward hacking
+&
+单个 scalar reward 太粗，reward 可能饱和、被钻空子，或者牺牲多样性
+&
+\href{https://arxiv.org/abs/2512.21514}{DiverseGRPO},
+\href{https://www.mdpi.com/1424-8220/26/4/1120}{Flow-Multi},
+\href{https://arxiv.org/abs/2511.19356}{TaRoS},
+\href{https://arxiv.org/abs/2508.18032}{Visual-CoG},
+\href{https://arxiv.org/abs/2511.18719}{ViPO},
+\href{https://arxiv.org/abs/2604.19406}{HP-Edit}
+&
+reward 是单目标、多目标、component-level、pixel-level，还是人类偏好 scorer
+\\
+\hline
+图像编辑专属 RL
+&
+编辑任务不是单纯生成：既要改对目标区域，又要保护非目标区域，还要能处理复杂指令 / 多参考图
+&
+\href{https://arxiv.org/abs/2601.03467}{ThinkRL-Edit},
+\href{https://arxiv.org/abs/2602.14186}{UniRef-Image-Edit},
+\href{https://arxiv.org/abs/2512.13276}{CogniEdit},
+\href{https://arxiv.org/abs/2512.16864}{RePlan},
+\href{https://arxiv.org/abs/2604.09386}{RC-GRPO-Editing},
+\href{https://arxiv.org/abs/2604.19406}{HP-Edit}
+&
+reward 是否区分 edit region / preserve region；是否先规划再编辑；是否有编辑偏好数据
+\\
+\hline
+离散、AR、VAR、masked / hybrid 生成
+&
+不是所有视觉生成都是 continuous diffusion / flow；离散 token、VAR、MAR、UDM 的 action 和 logprob 要重新定义
+&
+\href{https://arxiv.org/abs/2508.06924}{AR-GRPO},
+\href{https://arxiv.org/abs/2509.25027}{STAGE},
+\href{https://arxiv.org/abs/2509.22485}{GCPO},
+\href{https://arxiv.org/abs/2601.02256}{VAR RL Done Right},
+\href{https://arxiv.org/abs/2604.06966}{MAR-GRPO},
+\href{https://arxiv.org/abs/2604.18518}{UDM-GRPO},
+\href{https://arxiv.org/abs/2505.24875}{ReasonGen-R1}
+&
+action 是 token、clean sample、diffusion head，还是 hybrid trajectory；KL / entropy 怎么稳定
+\\
+\hline
+视频生成与时序一致性
+&
+视频多了时间维度：trajectory 更长，reward 更容易饱和，运动一致性和跨场景一致性更难
+&
+\href{https://arxiv.org/abs/2601.05729}{TAGRPO},
+\href{https://arxiv.org/abs/2505.07818}{DanceGRPO},
+\href{https://arxiv.org/abs/2505.17574}{InfLVG},
+\href{https://arxiv.org/abs/2603.17461}{AR-CoPO},
+\href{https://arxiv.org/abs/2603.26599}{VGGRPO},
+\href{https://arxiv.org/abs/2511.19356}{TaRoS}
+&
+reward 是否看 motion、geometry、context、trajectory alignment；credit 是否按帧 / chunk 分配
+\\
+\hline
+统一多模态与推理驱动生成
+&
+模型不再只是生成一张图，而是在同一条轨迹里推理、写文本、生成图像、甚至多轮交错
+&
+\href{https://arxiv.org/abs/2603.23500}{UniGRPO},
+\href{https://arxiv.org/abs/2603.09538}{Unified Interleaved GRPO},
+\href{https://arxiv.org/abs/2505.24875}{ReasonGen-R1},
+\href{https://arxiv.org/abs/2508.18032}{Visual-CoG}
+&
+text policy 和 image policy 怎么共存；reward 是 outcome-level 还是 process-level
+\\
+\hline
+综述与全局路线
+&
+当分支太多时，需要反过来整理整个领域的 taxonomy
+&
+\href{https://arxiv.org/abs/2603.06623}{Advances in GRPO for Generation Models: A Survey}
+&
+用它校准分类，不把某一条线误认为全部前沿
+\\
+\hline
+\end{longtable}
+}
+
+\begin{summarybox}
+\textbf{最适合我们当前学习目标的主线：}\\
+因为我们的主题是“图像生成 / 图像编辑侧后训练”，优先级应该是：
+\[
+\text{图像编辑专属 RL}
+\Rightarrow
+\text{连续 flow 信用分配}
+\Rightarrow
+\text{reward 设计}
+\Rightarrow
+\text{离散 / AR / VAR 扩展}
+\Rightarrow
+\text{视频和统一多模态}
+\]
+也就是说，不是先把所有视频、AR、统一多模态论文都读完，而是先围绕图像编辑把核心技术链打穿。
+\end{summarybox}
+
+\subsubsection{按目标选择阅读路径}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{如果目标是图像编辑：} ThinkRL-Edit $\rightarrow$ RePlan $\rightarrow$ CogniEdit $\rightarrow$ RC-GRPO-Editing $\rightarrow$ HP-Edit $\rightarrow$ UniRef-Image-Edit。
+  \item \textbf{如果目标是 Flow-GRPO 算法本身：} Flow-GRPO $\rightarrow$ TempFlow-GRPO $\rightarrow$ Chunk-GRPO $\rightarrow$ DenseGRPO $\rightarrow$ PCPO / OTCA $\rightarrow$ OP-GRPO / E-GRPO。
+  \item \textbf{如果目标是 reward 和偏好建模：} DiverseGRPO $\rightarrow$ Flow-Multi $\rightarrow$ Visual-CoG $\rightarrow$ ViPO $\rightarrow$ TaRoS $\rightarrow$ HP-Edit。
+  \item \textbf{如果目标是新生成范式：} AR-GRPO $\rightarrow$ STAGE / GCPO $\rightarrow$ VAR RL Done Right $\rightarrow$ UDM-GRPO $\rightarrow$ MAR-GRPO $\rightarrow$ MaskFocus。
+  \item \textbf{如果目标是视频：} TAGRPO $\rightarrow$ DanceGRPO $\rightarrow$ InfLVG $\rightarrow$ VGGRPO $\rightarrow$ AR-CoPO $\rightarrow$ TaRoS。
+  \item \textbf{如果目标是统一多模态：} ReasonGen-R1 $\rightarrow$ Visual-CoG $\rightarrow$ UniGRPO $\rightarrow$ Unified Interleaved GRPO。
+\end{enumerate}
+
+\begin{warnbox}
+\textbf{不要被论文名字带偏：}\\
+很多论文都叫 GRPO，但它们真正研究的对象不一样。有的研究 \textbf{算法本身}，有的研究 \textbf{reward}，有的研究 \textbf{图像编辑任务约束}，有的只是把 GRPO 迁移到 \textbf{新生成范式}。读之前先判断它属于哪条主线，理解会快很多。
+\end{warnbox}
+
 \subsubsection{主线一：Flow-GRPO 的信用分配改进}
 
 Flow-GRPO 的基本做法是：
@@ -740,41 +900,76 @@ Flow-GRPO 需要 logprob，适合黑盒 reward。\\
 LeapAlign 不需要 logprob，但更依赖可微 reward / surrogate reward，因为它走 direct-gradient。
 \end{warnbox}
 
-\subsubsection{建议阅读顺序}
+\subsubsection{建议阅读顺序：以图像编辑为主线}
 
-从我们的学习基础出发，建议后面按这个顺序读：
+如果我们后面继续围绕“图像编辑侧后训练”上课，不建议从 UDM-GRPO 或视频论文开始。更合理的顺序是先读图像编辑专属 RL，再回到通用 Flow-GRPO 技术。
 
 \begin{enumerate}[leftmargin=1.5em]
-  \item \textbf{UDM-GRPO：} 因为你点名了它，而且它把 GRPO 推到离散扩散，是 2026-04 的最新工作。
-  \item \textbf{OP-GRPO：} 解决 Flow-GRPO on-policy 样本效率低，是非常直接的工程痛点。
-  \item \textbf{DenseGRPO：} 解决 sparse terminal reward，是信用分配最核心的一篇。
-  \item \textbf{E-GRPO / TempFlow-GRPO：} 解决哪些时间步值得探索、哪些时间步该承担 credit。
-  \item \textbf{LeapAlign：} 单独学 direct-gradient flow 后训练，和 GRPO 路线形成对照。
-  \item \textbf{MAR-GRPO / UniGRPO / TAGRPO：} 看 GRPO 如何迁移到新生成范式：AR-diffusion、统一多模态、视频。
-  \item \textbf{DiverseGRPO / Flow-Multi：} 看 reward hacking、多目标 reward、多样性退化这些更偏系统和评价的问题。
+  \item \textbf{ThinkRL-Edit / RePlan：} 先理解复杂编辑为什么需要 reasoning / planning，而不是直接靠 denoising 随机探索。
+  \item \textbf{CogniEdit：} 接着看图像编辑里 dense GRPO / trajectory-level supervision 怎么做。
+  \item \textbf{RC-GRPO-Editing：} 再看编辑任务最核心的 edit region 与 preserve region 如何分开做 credit assignment。
+  \item \textbf{HP-Edit：} 然后看真实图像编辑里的 human preference dataset、scorer 和 benchmark 如何构造。
+  \item \textbf{UniRef-Image-Edit：} 最后扩到多参考图编辑，理解 reference conflict 和 multi-source reward。
+  \item \textbf{DenseGRPO / TempFlow-GRPO / Chunk-GRPO：} 回头补通用 Flow-GRPO 信用分配，为理解上面几篇提供算法底座。
+  \item \textbf{OP-GRPO / E-GRPO / LeapAlign：} 再看效率、采样步骤选择，以及不用 logprob 的 direct-gradient 路线。
+  \item \textbf{AR-GRPO / UDM-GRPO / MAR-GRPO：} 最后再进入离散、AR、hybrid 生成范式。
 \end{enumerate}
 
 \begin{summarybox}
-\textbf{下一篇建议：UDM-GRPO}\\
-原因是它最新、你点名了，而且它的问题非常有代表性：
+\textbf{下一节建议：图像编辑专属 RL}\\
+我们现在最该学的不是“又一个 GRPO 变体”，而是：
 \[
-\text{当生成模型不是 continuous diffusion / flow，而是 discrete diffusion 时，GRPO 的 action、trajectory、logprob 应该怎么重新定义？}
+\text{当任务从 text-to-image 变成 image editing 时，reward、action、trajectory、credit assignment 分别要怎么改？}
 \]
+所以下一节可以从 ThinkRL-Edit、RePlan、CogniEdit、RC-GRPO-Editing 这条线开始。
 \end{summarybox}
 
 \subsubsection{参考链接}
 
 \begin{itemize}[leftmargin=1.5em]
-  \item Flow-GRPO：\url{https://arxiv.org/abs/2505.05470}
-  \item TempFlow-GRPO：\url{https://arxiv.org/abs/2508.04324}
-  \item Chunk-GRPO：\url{https://arxiv.org/abs/2510.21583}
-  \item DiverseGRPO：\url{https://arxiv.org/abs/2512.21514}
-  \item E-GRPO：\url{https://arxiv.org/abs/2601.00423}
-  \item DenseGRPO：\url{https://arxiv.org/abs/2601.20218}
-  \item TAGRPO：\url{https://arxiv.org/abs/2601.05729}
-  \item UniGRPO：\url{https://arxiv.org/abs/2603.23500}
-  \item OP-GRPO：\url{https://arxiv.org/abs/2604.04142}
-  \item MAR-GRPO：\url{https://arxiv.org/abs/2604.06966}
-  \item LeapAlign：\url{https://arxiv.org/abs/2604.15311}
-  \item UDM-GRPO：\url{https://arxiv.org/abs/2604.18518}
+  \item \textbf{Flow-GRPO 基础与信用分配：}
+  \href{https://arxiv.org/abs/2505.05470}{Flow-GRPO},
+  \href{https://arxiv.org/abs/2508.04324}{TempFlow-GRPO},
+  \href{https://arxiv.org/abs/2510.21583}{Chunk-GRPO},
+  \href{https://arxiv.org/abs/2601.20218}{DenseGRPO},
+  \href{https://arxiv.org/abs/2509.25774}{PCPO},
+  \href{https://arxiv.org/abs/2604.19234}{OTCA},
+  \href{https://arxiv.org/abs/2603.12648}{MV-GRPO}。
+  \item \textbf{效率、探索与直接梯度：}
+  \href{https://arxiv.org/abs/2604.04142}{OP-GRPO},
+  \href{https://arxiv.org/abs/2601.00423}{E-GRPO},
+  \href{https://arxiv.org/abs/2512.18766}{MaskFocus},
+  \href{https://arxiv.org/abs/2604.15311}{LeapAlign}。
+  \item \textbf{reward 与偏好建模：}
+  \href{https://arxiv.org/abs/2512.21514}{DiverseGRPO},
+  \href{https://www.mdpi.com/1424-8220/26/4/1120}{Flow-Multi},
+  \href{https://arxiv.org/abs/2511.19356}{TaRoS},
+  \href{https://arxiv.org/abs/2508.18032}{Visual-CoG},
+  \href{https://arxiv.org/abs/2511.18719}{ViPO},
+  \href{https://arxiv.org/abs/2604.19406}{HP-Edit}。
+  \item \textbf{图像编辑专属：}
+  \href{https://arxiv.org/abs/2601.03467}{ThinkRL-Edit},
+  \href{https://arxiv.org/abs/2512.16864}{RePlan},
+  \href{https://arxiv.org/abs/2512.13276}{CogniEdit},
+  \href{https://arxiv.org/abs/2604.09386}{RC-GRPO-Editing},
+  \href{https://arxiv.org/abs/2604.19406}{HP-Edit},
+  \href{https://arxiv.org/abs/2602.14186}{UniRef-Image-Edit}。
+  \item \textbf{离散、AR、VAR、hybrid：}
+  \href{https://arxiv.org/abs/2508.06924}{AR-GRPO},
+  \href{https://arxiv.org/abs/2509.25027}{STAGE},
+  \href{https://arxiv.org/abs/2509.22485}{GCPO},
+  \href{https://arxiv.org/abs/2601.02256}{VAR RL Done Right},
+  \href{https://arxiv.org/abs/2604.06966}{MAR-GRPO},
+  \href{https://arxiv.org/abs/2604.18518}{UDM-GRPO}。
+  \item \textbf{视频与统一多模态：}
+  \href{https://arxiv.org/abs/2601.05729}{TAGRPO},
+  \href{https://arxiv.org/abs/2505.07818}{DanceGRPO},
+  \href{https://arxiv.org/abs/2505.17574}{InfLVG},
+  \href{https://arxiv.org/abs/2603.17461}{AR-CoPO},
+  \href{https://arxiv.org/abs/2603.26599}{VGGRPO},
+  \href{https://arxiv.org/abs/2603.23500}{UniGRPO},
+  \href{https://arxiv.org/abs/2603.09538}{Unified Interleaved GRPO},
+  \href{https://arxiv.org/abs/2505.24875}{ReasonGen-R1}。
+  \item \textbf{综述：}
+  \href{https://arxiv.org/abs/2603.06623}{Advances in GRPO for Generation Models: A Survey}。
 \end{itemize}
