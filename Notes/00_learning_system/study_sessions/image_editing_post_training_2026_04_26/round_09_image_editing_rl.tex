@@ -971,6 +971,545 @@ A_{i,k:k+h}
 
 这些词不是普通 prompt token，而是编辑成功与否的关键属性。
 
+\textbf{CogniEdit 细节一：先把复杂指令变成可执行指令。}
+
+CogniEdit 认为细粒度编辑失败的第一层原因是 understanding gap：
+
+\[
+\text{用户原始指令}
+\not\Rightarrow
+\text{模型能直接执行的视觉约束}
+\]
+
+比如：
+
+\[
+\text{Change the car to a sports car}
+\]
+
+里面隐含了：
+
+\[
+\text{low profile}
+\quad
+\text{aerodynamic shape}
+\quad
+\text{sporty visual features}
+\]
+
+普通编辑模型可能只知道“换成车”，但不知道 sports car 应该长什么样。
+
+所以 CogniEdit 先用 MLLM 做 instruction enhancement。它把复杂指令拆成：
+
+\[
+\text{semantic decomposition}
+\quad
+\text{knowledge injection}
+\quad
+\text{spatial grounding}
+\]
+
+论文补充材料里给了结构化输出形式，可以理解成：
+
+\[
+\text{\texttt{<info>}}
+\Rightarrow
+\text{图像描述}
+\]
+
+\[
+\text{\texttt{<think>}}
+\Rightarrow
+\text{推理过程}
+\]
+
+\[
+\text{\texttt{<answer>}}
+\Rightarrow
+\text{增强后的编辑指令}
+\]
+
+\[
+\text{\texttt{<object>}}
+\Rightarrow
+\text{目标对象 / 区域说明}
+\]
+
+也就是：
+
+\[
+(x,c)
+\xrightarrow{\text{MLLM}}
+c^\star
+\]
+
+其中 $c^\star$ 是更明确、更细粒度、更有视觉知识的编辑指令。
+
+\begin{intubox}
+\textbf{直觉：}\\
+RePlan 偏向“把区域规划出来”，ThinkRL-Edit 偏向“让模型先思考再反思”，CogniEdit 这里偏向“把原始指令翻译成模型更容易执行的细粒度视觉指令”。
+\end{intubox}
+
+\textbf{CogniEdit 细节二：GRPO for Image Editing 不是直接照搬 Flow-GRPO。}
+
+CogniEdit 指出，编辑模型常用 deterministic ODE 来保证一致性：
+
+\[
+x_{t+\Delta t}
+=
+x_t
++
+s_\theta(x_t,t)\Delta t
+\]
+
+但如果完全确定性，同一个输入采样 $G$ 次会得到几乎一样的结果：
+
+\[
+x_0^1
+\approx
+x_0^2
+\approx
+\cdots
+\approx
+x_0^G
+\]
+
+这会让 GRPO 的组内比较失去意义。
+
+所以它沿用 Flow-GRPO 思路，引入受控随机性：
+
+\[
+x_{t+\Delta t}
+=
+x_t
++
+s_\theta(x_t,t)\Delta t
++
+\sqrt{\Delta t}\sigma_t\epsilon
+\]
+
+其中：
+
+\[
+\epsilon
+\sim
+\mathcal{N}(0,I)
+\]
+
+而：
+
+\[
+s_\theta(x_t,t)
+=
+v_\theta(x_t,t)
++
+\frac{\sigma_t^2}{2}
+\left[
+x_t
++
+(1-t)v_\theta(x_t,t)
+\right]
+\]
+
+这一步的作用是：
+
+\[
+\text{deterministic edit}
+\Rightarrow
+\text{可产生组内差异的 stochastic edit}
+\]
+
+但 CogniEdit 又发现：图像编辑同一个输入下的组内差异仍然有限，如果只在同一个样本内部归一化 advantage，方差会很大。
+
+所以它用 batch-level advantage。设一个 batch 有 $B$ 个编辑任务，每个任务采样 $G$ 个结果：
+
+\[
+\{x_0^{b,i}\},
+\qquad
+b=1,\ldots,B,
+\quad
+i=1,\ldots,G
+\]
+
+batch reward 均值是：
+
+\[
+\mu_\text{batch}
+=
+\frac{1}{BG}
+\sum_{b=1}^{B}
+\sum_{i=1}^{G}
+R(x_0^{b,i},c_b)
+\]
+
+batch 标准差是：
+
+\[
+\sigma_\text{batch}
+=
+\text{std}
+\left(
+\{R(x_0^{b,i},c_b)\}_{b,i}
+\right)
+\]
+
+第 $b$ 个编辑任务的 advantage 写成：
+
+\[
+\hat{A}^{b}
+=
+\frac{1}{G}
+\sum_{i=1}^{G}
+\frac{
+R(x_0^{b,i},c_b)
+-
+\mu_\text{batch}
+}{
+\sigma_\text{batch}
+}
+\]
+
+这和普通 GRPO 的区别是：
+
+\[
+\text{普通 GRPO：同 prompt 组内归一化}
+\]
+
+\[
+\text{CogniEdit：跨 batch 的编辑结果一起做统计}
+\]
+
+这样对编辑任务更稳，因为编辑任务的组内 diversity 天然比文生图小。
+
+\textbf{CogniEdit 细节三：Dynamic Token Focus Relocation。}
+
+CogniEdit 观察到，模型容易一直关注：
+
+\[
+\text{change}
+\quad
+\text{add}
+\quad
+\text{replace}
+\]
+
+这些 generic action words，却忽略真正决定编辑是否成功的属性词：
+
+\[
+\text{purple}
+\quad
+\text{five}
+\quad
+\text{on the left}
+\quad
+\text{in the background}
+\]
+
+所以它不是固定强调某些 token，而是让不同层动态选择要关注的 token。
+
+设第 $i$ 层的 instruction token 表示为：
+
+\[
+h_i^l
+\in
+\mathbb{R}^{l\times d}
+\]
+
+其中 $l$ 是 token 数，$d$ 是 hidden dimension。CogniEdit 加一个轻量 predictor：
+
+\[
+\text{pos}
+=
+p_\eta(h_i^l),
+\qquad
+\text{pos}\in[0,l-\xi]
+\]
+
+这里 $\xi$ 是要强调的连续 token 数。
+
+然后给每一层一个可学习 soft token：
+
+\[
+s_i^{1:\xi}
+=
+E(i)
+\in
+\mathbb{R}^{\xi\times d}
+\]
+
+把原来位置上的 token embedding 替换为 soft token：
+
+\[
+h_i^{\text{pos}:\text{pos}+\xi}
+\leftarrow
+s_i^{1:\xi}
+\]
+
+再用这些 soft token 去影响 attention：
+
+\[
+a_i^{\text{pos}:\text{pos}+\xi}
+=
+s_i^{1:\xi}
+\cdot
+A^l
+\]
+
+这里沿用论文里的记号，$A^l$ 表示对应层的 attention map。不要把这个 $l$ 和上面的 token 长度死扣，核心是：soft token 被放到某个预测位置后，会成为这一层的 attention anchor。
+
+这套机制的直觉是：
+
+\[
+\text{early layers}
+\Rightarrow
+\text{high-level semantics}
+\]
+
+\[
+\text{deep layers}
+\Rightarrow
+\text{fine-grained attributes}
+\]
+
+所以不同层应该关注不同指令成分。它不是手动指定“蓝色重要”，而是让 predictor 和 soft tokens 在训练中学会：
+
+\[
+\text{哪个层该看哪个 token}
+\]
+
+\begin{warnbox}
+\textbf{注意：}\\
+Dynamic Token Focus Relocation 不是简单 prompt reweighting。它是在模型内部每一层动态重定位 token focus，并用 learnable soft tokens 当 attention anchor。
+\end{warnbox}
+
+\textbf{CogniEdit 细节四：Dense GRPO 是连续 $k$ 步的 ratio，而不是单步 ratio。}
+
+标准 Flow-GRPO 的 objective 会在每个 timestep 上使用单步 ratio：
+
+\[
+r_i^t(\theta)
+=
+\frac{
+p_\theta(x_{t-1}^i\mid x_t^i,c)
+}{
+p_{\theta_\text{old}}(x_{t-1}^i\mid x_t^i,c)
+}
+\]
+
+CogniEdit 认为这样仍然太碎，而且不能让梯度沿连续采样轨迹传播。
+
+它随机选择一个能连续去噪 $k$ 步的起始 timestep。按照我们这里的写法：
+
+\[
+r
+\in
+\{k,\ldots,T\}
+\]
+
+这样才能从 $x_r$ 合法地走到 $x_{r-k}$。如果另一篇论文把时间索引反过来，也可能写成 $r\in[0,T-k]$，本质都是“选一段长度为 $k$ 的连续 denoising window”。
+
+然后连续跑 $k$ 个 denoising steps：
+
+\[
+x_r
+\rightarrow
+x_{r-1}
+\rightarrow
+\cdots
+\rightarrow
+x_{r-k}
+\]
+
+单步更新写成：
+
+\[
+x_{t-1}
+=
+x_t
+-
+\frac{1}{T}
+s_\theta(\text{sg}(x_t),t)
++
+\frac{\sigma_t}{\sqrt{T}}\epsilon
+\]
+
+这里：
+
+\[
+\text{sg}(\cdot)
+\]
+
+是 stop-gradient。它的作用是稳定梯度路径，避免后续“补完图像”的过程把梯度乱传回不该更新的地方。
+
+对这连续 $k$ 步，CogniEdit 不再只算单步 ratio，而是算整段 log-ratio。为了避免倒序求和的歧义，可以把它写成：
+
+\[
+\psi_b^{r:r-k}(\theta)
+=
+\sum_{j=0}^{k-1}
+\log
+\frac{
+p_\theta(x_{r-j-1}^{b}\mid x_{r-j}^{b},c_b)
+}{
+p_{\theta_\text{old}}(x_{r-j-1}^{b}\mid x_{r-j}^{b},c_b)
+}
+\]
+
+也就是把连续 $k$ 步的 ratio 先相乘：
+
+\[
+r_b^{r:r-k}(\theta)
+=
+\prod_{j=0}^{k-1}
+\frac{
+p_\theta(x_{r-j-1}^{b}\mid x_{r-j}^{b},c_b)
+}{
+p_{\theta_\text{old}}(x_{r-j-1}^{b}\mid x_{r-j}^{b},c_b)
+}
+\]
+
+再取 log 变成求和，数值更稳定。
+
+再把它转成 trajectory-level clipped ratio：
+
+\[
+\tilde{r}_b^{r:r-k}(\theta)
+=
+\exp
+\left(
+\text{clip}
+\left(
+\psi_b^{r:r-k}(\theta),
+-\log(1+\epsilon),
+\log(1+\epsilon)
+\right)
+\right)
+\]
+
+最终 Dense GRPO objective 是：
+
+\[
+\begin{aligned}
+\mathcal{J}_\text{Dense}(\theta)
+&=
+\mathbb{E}
+\Bigg[
+\frac{1}{B}
+\sum_{b=1}^{B}
+\min
+\Big(
+\tilde{r}_b^{r:r-k}\hat{A}^{b},
+\\
+&\quad
+\text{clip}
+\left(
+\tilde{r}_b^{r:r-k},
+1-\epsilon,
+1+\epsilon
+\right)
+\hat{A}^{b}
+\Big)
+-
+\hat{\beta}
+D_\text{KL}
+(\pi_\theta\|\pi_\text{ref})
+\Bigg]
+\end{aligned}
+\]
+
+这里的 $\hat{A}^{b}$ 不是在 $x_{r-k}$ 这个中间态上直接算的，而是继续 denoise 到完整结果 $x_0$ 后，用最终 reward 来算。论文里的训练流程是：
+
+\[
+x_r
+\xrightarrow{k\text{ steps}}
+x_{r-k}
+\xrightarrow{\text{stop-gradient complete}}
+x_0
+\xrightarrow{R}
+\hat{A}^{b}
+\]
+
+\textbf{CogniEdit 细节五：reward 不是 CLIP，而是 MLLM 多维评价。}
+
+CogniEdit 的最终 reward 来自 Qwen2.5-VL-7B-Instruct 这类 MLLM evaluator。输入是：
+
+\[
+(\text{edited image},\text{original image},\text{editing instruction})
+\]
+
+它先做 word-level analysis，检查 instruction 里的 subject、object、color、number、lighting、style、activity 等元素有没有被正确体现；然后给多个维度打分：
+
+\[
+S_\text{alignment}
+\quad
+S_\text{coherence}
+\quad
+S_\text{style}
+\quad
+S_\text{consistency}
+\]
+
+其中：
+
+\[
+S_\text{alignment}
+\Rightarrow
+\text{是否符合指令}
+\]
+
+\[
+S_\text{coherence}
+\Rightarrow
+\text{是否逻辑一致、无明显伪影、无数量/颜色错误}
+\]
+
+\[
+S_\text{consistency}
+\Rightarrow
+\text{是否保持原图未编辑区域}
+\]
+
+论文没有把 style score 放进最终 reward，因为 style 更像审美质量，可能和编辑正确性无关。最终 reward 可以写成：
+
+\[
+R
+=
+S_\text{alignment}
++
+S_\text{coherence}
++
+S_\text{consistency}
+\]
+
+所以 CogniEdit 的 reward 对应的是：
+
+\[
+\text{改对}
+\quad
+\text{改得合理}
+\quad
+\text{不乱改}
+\]
+
+而不是单纯：
+
+\[
+\text{图像好看}
+\]
+
+\begin{summarybox}
+\textbf{CogniEdit 的核心不是一句“dense reward”：}\\
+它实际做了三件事：
+\[
+\text{MLLM 指令增强}
+\Rightarrow
+\text{layer-wise token focus}
+\Rightarrow
+\text{连续 } k \text{ 步 Dense GRPO}
+\]
+其中 Dense GRPO 的关键是整段 trajectory ratio $\tilde{r}_b^{r:r-k}$，而不是把最终 reward 简单平均分给每一步。
+\end{summarybox}
+
 \begin{intubox}
 \textbf{直觉：}\\
 CogniEdit 关心的是“细节到底在哪个步骤被改坏或改好”。它不是只问最终图像好不好，而是让 reward 信号沿着连续 denoising steps 更密地传回去。
