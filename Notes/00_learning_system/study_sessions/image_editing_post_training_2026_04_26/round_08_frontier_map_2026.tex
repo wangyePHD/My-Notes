@@ -1,0 +1,527 @@
+% ============================================================
+% Round 08: Frontier Map 2026
+% ============================================================
+
+\subsection{Round 08：2026 最新科研工作地图}
+
+\subsubsection{基础部分结束}
+
+\begin{summarybox}
+\textbf{到这里，基础部分已经打通：}\\
+我们已经学完了：
+\[
+\text{图像编辑任务}
+\Rightarrow
+\text{Diffusion / Flow 基础}
+\Rightarrow
+\text{SFT}
+\Rightarrow
+\text{Reward}
+\Rightarrow
+\text{Diffusion-DPO}
+\Rightarrow
+\text{DDPO / DPOK}
+\Rightarrow
+\text{Flow-GRPO}
+\]
+后面进入前沿论文阶段。重点不再是“这个公式是什么”，而是读懂每篇新工作到底解决 Flow-GRPO / Diffusion RL 的哪个具体痛点。
+\end{summarybox}
+
+\subsubsection{检索说明}
+
+\begin{warnbox}
+\textbf{关于 LeapGRPO：}\\
+我检索了 \code{LeapGRPO}、\code{Leap-GRPO}、\code{Leap GRPO}、\code{LeapGRPO arXiv}、\code{LeapGRPO GitHub} 等关键词，目前没有找到可靠的 arXiv / GitHub 记录。\\
+目前确定存在、且名字非常接近的是 \textbf{LeapAlign}：
+\[
+\text{LeapAlign: Post-Training Flow Matching Models at Any Generation Step by Building Two-Step Trajectories}
+\]
+它是 2026-04 的 CVPR 2026 工作，不是 GRPO ratio 路线，而是 two-step leap trajectory + direct reward gradient 路线。后面我们可以单独学它。
+\end{warnbox}
+
+\subsubsection{前沿论文总表}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.7cm}p{2.1cm}p{4.2cm}p{4.2cm}}
+\hline
+\textbf{工作} & \textbf{时间} & \textbf{核心问题} & \textbf{关键词} \\
+\hline
+Flow-GRPO
+&
+2025-05
+&
+Flow Matching ODE 没有 logprob，如何做在线 RL
+&
+ODE-to-SDE, GRPO, Denoising Reduction
+\\
+TempFlow-GRPO
+&
+2025-08
+&
+Flow-GRPO 对所有 timestep 一视同仁，信用分配太粗
+&
+trajectory branching, noise-aware weighting, temporal credit
+\\
+Chunk-GRPO
+&
+2025-10
+&
+step-level 优化粒度太细，忽略生成过程的时间结构
+&
+chunk-level policy optimization
+\\
+DiverseGRPO
+&
+2025-12
+&
+GRPO 后期容易模式坍缩，生成多样性下降
+&
+diversity-aware reward, early-stage regularization
+\\
+E-GRPO
+&
+2026-01
+&
+低熵步骤探索价值低，但仍消耗大量 RL 更新
+&
+high-entropy steps, step merging, entropy-aware GRPO
+\\
+DenseGRPO
+&
+2026-01
+&
+terminal reward 太稀疏，无法判断每一步贡献
+&
+dense reward, step-wise reward gain, adaptive stochasticity
+\\
+TAGRPO
+&
+2026-01
+&
+I2V 直接套 GRPO 效果不稳定，视频轨迹需要对齐
+&
+direct trajectory alignment, memory bank, image-to-video
+\\
+UniGRPO
+&
+2026-03
+&
+统一模型中同时优化文本推理和图像生成
+&
+reasoning-driven visual generation, text GRPO + FlowGRPO
+\\
+OP-GRPO
+&
+2026-04
+&
+Flow-GRPO 是 on-policy，样本效率低
+&
+off-policy GRPO, replay buffer, sequence-level IS
+\\
+MAR-GRPO
+&
+2026-04
+&
+AR-diffusion 混合模型里 diffusion head 带来 noisy gradients
+&
+multi-trajectory expectation, uncertainty selection
+\\
+LeapAlign
+&
+2026-04
+&
+direct-gradient flow 后训练穿过长轨迹会爆显存和梯度
+&
+two-step leap trajectory, gradient discounting
+\\
+UDM-GRPO
+&
+2026-04
+&
+Uniform Discrete Diffusion 如何稳定接入 GRPO
+&
+final clean sample as action, forward trajectory reconstruction
+\\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{主线一：Flow-GRPO 的信用分配改进}
+
+Flow-GRPO 的基本做法是：
+
+\[
+A_j
+=
+\frac{
+R_j-\text{mean}(R_1,\ldots,R_G)
+}{
+\text{std}(R_1,\ldots,R_G)+\epsilon
+}
+\]
+
+然后把同一个 trajectory-level advantage 用到很多 flow steps：
+
+\[
+\sum_{k=1}^{K}
+\min
+\left(
+r_{j,k}A_j,
+\text{clip}(r_{j,k})A_j
+\right)
+\]
+
+这个做法能跑通，但问题很明显：
+
+\[
+\text{最终 reward 高}
+\not\Rightarrow
+\text{每一个 timestep 都同样该被奖励}
+\]
+
+所以 2025-2026 的一批工作都在解决：
+
+\[
+\text{哪个 timestep / chunk / branch 真正导致了 reward 变化}
+\]
+
+\textbf{TempFlow-GRPO} 的方向是 temporal credit assignment。它认为 Flow-GRPO 的问题是 temporal uniformity，也就是所有时间步被同样对待。它通过 trajectory branching 把随机性集中到指定 branching point，然后观察最终 reward 差异，从而更精确地归因。
+
+\[
+\text{branch at } t_k
+\Rightarrow
+\text{reward difference}
+\Rightarrow
+\text{credit for } t_k
+\]
+
+\textbf{DenseGRPO} 的方向是 dense reward。它不满足于只用最终 reward，而是用 ODE-based intermediate clean image 去估计每一步带来的 reward gain：
+
+\[
+\Delta R_k
+\approx
+R(\hat{x}_{0\mid t_{k-1}})
+-
+R(\hat{x}_{0\mid t_k})
+\]
+
+这样每一步不再共享同一个 $A_j$，而是有更细粒度的 step-wise reward。
+
+\textbf{Chunk-GRPO} 的方向是 chunk-level credit。它认为单步太细、整条轨迹太粗，所以把连续时间步组成 chunk：
+
+\[
+\mathcal{C}_m
+=
+\{t_a,t_{a-1},\ldots,t_b\}
+\]
+
+然后在 chunk 级别优化：
+
+\[
+\sum_m
+\log p_\theta(\mathcal{C}_m)
+A_m
+\]
+
+\begin{summarybox}
+\textbf{这一类工作的共同问题：}\\
+Flow-GRPO 的 terminal reward 太粗。TempFlow-GRPO、DenseGRPO、Chunk-GRPO 都是在回答：
+\[
+\text{reward 应该分配给哪个时间尺度？step、chunk、branch，还是整条 trajectory？}
+\]
+\end{summarybox}
+
+\subsubsection{主线二：Flow-GRPO 的采样效率改进}
+
+Flow-GRPO 是 on-policy：
+
+\[
+\tau\sim\pi_{\theta_\text{old}}
+\]
+
+采样完、更新几轮后，这批样本通常就不能继续用了。
+
+问题是图像 / 视频生成采样很贵：
+
+\[
+\text{cost}
+\propto
+\text{batch size}
+\times
+\text{group size}
+\times
+\text{sampling steps}
+\]
+
+\textbf{OP-GRPO} 的方向是 off-policy。它把高质量轨迹放进 replay buffer：
+
+\[
+\mathcal{B}
+\leftarrow
+\mathcal{B}
+\cup
+\{\tau_\text{high-reward}\}
+\]
+
+后续训练中重复使用这些轨迹。
+
+但 off-policy 会带来分布偏移：
+
+\[
+\tau
+\sim
+\pi_{\theta_\text{behavior}}
+\neq
+\pi_{\theta}
+\]
+
+所以 OP-GRPO 要做 sequence-level importance sampling correction：
+
+\[
+\rho(\tau)
+=
+\frac{
+p_\theta(\tau)
+}{
+p_{\theta_\text{behavior}}(\tau)
+}
+\]
+
+并且它观察到 late denoising steps 的 off-policy ratio 容易病态，所以会截断 late steps。
+
+\begin{intubox}
+\textbf{直觉：} Flow-GRPO 是“现采现用”；OP-GRPO 是“好轨迹别浪费，放进经验池复用”，但必须处理新旧策略分布不一致的问题。
+\end{intubox}
+
+\subsubsection{主线三：探索空间和熵}
+
+Flow-GRPO 通过 SDE 给 ODE 加随机性：
+
+\[
+x_{t-\Delta t}
+=
+\mu_\theta(x_t,t,c)
++
+\sigma_t\sqrt{\Delta t}\epsilon
+\]
+
+但不是每个时间步都同样需要随机探索。
+
+\textbf{E-GRPO} 的观点是：high entropy steps 更适合 RL 探索，low entropy steps 产生的 rollouts 区分度低，训练信号弱。
+
+所以它会合并连续 low entropy steps：
+
+\[
+\text{low entropy steps}
+\Rightarrow
+\text{merged into one high entropy SDE step}
+\]
+
+其他步骤则用 ODE 采样，减少无效随机性。
+
+\textbf{DenseGRPO} 也发现均匀 stochasticity injection 不合适，于是根据 reward-aware signal 调整每个 timestep 的随机性。
+
+\begin{warnbox}
+\textbf{这一类工作的核心：} SDE 不是“噪声越多越好”。随机性应该放在真正影响生成结果、且能产生区分度的时间步上。
+\end{warnbox}
+
+\subsubsection{主线四：避免 Reward Hacking 和模式坍缩}
+
+GRPO 优化 reward 后，可能出现：
+
+\[
+\text{reward 上升}
+\quad
+\text{diversity 下降}
+\]
+
+或者：
+
+\[
+\text{metric 高}
+\quad
+\text{人看起来变单调}
+\]
+
+\textbf{DiverseGRPO} 专门处理这个问题。它从两个层面入手：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item reward 层面：给语义上更少见的模式 distributional creativity bonus；
+  \item generation 层面：在早期 denoising 阶段加入 structure-aware regularization，保护多样性。
+\end{itemize}
+
+可以抽象成：
+
+\[
+R_\text{total}
+=
+R_\text{quality}
++
+\lambda R_\text{diversity}
+-
+\beta R_\text{collapse}
+\]
+
+它提醒我们：图像后训练不能只看平均 reward，还要看分布层面的 diversity。
+
+\begin{intubox}
+\textbf{直觉：} 如果模型发现“某一种构图总能骗到高分”，GRPO 会不断强化这种构图。DiverseGRPO 的目标是让模型既高分，又不要只会一种答案。
+\end{intubox}
+
+\subsubsection{主线五：新生成范式上的 GRPO}
+
+前面我们主要学的是 diffusion / flow。2026 的趋势是：
+
+\[
+\text{GRPO 不只用于 diffusion / flow}
+\]
+
+它正在扩展到统一多模态、离散扩散、AR-diffusion、视频和 3D。
+
+\textbf{UDM-GRPO} 研究的是 Uniform Discrete Diffusion Model。它指出，直接把 GRPO 套到 UDM 上不稳定。它的两个核心设计是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把 final clean sample 当作 action，而不是把中间 noisy sample 当作 action；
+  \item 用 diffusion forward process 重建 trajectory，使概率路径更贴近预训练分布。
+\end{itemize}
+
+抽象对比：
+
+\[
+\text{naive UDM-GRPO: intermediate noisy action}
+\]
+
+\[
+\text{UDM-GRPO: final clean sample as action + forward trajectory reconstruction}
+\]
+
+\textbf{MAR-GRPO} 研究的是 masked autoregressive + diffusion head 的混合模型。它发现 diffusion head 会带来 noisy gradients，于是用 multi-trajectory expectation：
+
+\[
+\nabla J
+\approx
+\frac{1}{M}
+\sum_{m=1}^{M}
+\nabla J^{(m)}
+\]
+
+来降低 diffusion trajectory 的随机梯度噪声。
+
+\textbf{UniGRPO} 研究的是统一模型里的 interleaved generation。它同时优化文本推理策略和图像生成策略：
+
+\[
+\text{text reasoning GRPO}
++
+\text{visual FlowGRPO}
+\]
+
+并且为了多轮生成 / 编辑扩展，去掉 CFG 以保持 rollout 线性、用 velocity MSE penalty 替代 latent KL。
+
+\textbf{TAGRPO} 研究 image-to-video。它不只是给整条视频一个 reward，而是用 direct trajectory alignment 在 intermediate latents 上对齐高 reward 轨迹、远离低 reward 轨迹，并用 memory bank 提高效率和多样性。
+
+\begin{summarybox}
+\textbf{这一类工作的共同趋势：}\\
+GRPO 正在从“Flow Matching 文生图后训练方法”变成更通用的生成模型后训练范式：
+\[
+\text{continuous flow}
+\quad
+\text{discrete diffusion}
+\quad
+\text{AR-diffusion}
+\quad
+\text{interleaved multimodal}
+\quad
+\text{video generation}
+\]
+\end{summarybox}
+
+\subsubsection{主线六：Direct-Gradient Flow 后训练}
+
+并不是所有前沿工作都沿着 GRPO ratio 走。
+
+\textbf{LeapAlign} 是另一条路线：
+
+\[
+\text{reward gradient}
+\Rightarrow
+\text{direct backprop through flow}
+\]
+
+它解决的问题是：完整 flow trajectory 太长，直接反传会显存高、梯度爆炸，而且很难更新早期生成步骤。
+
+LeapAlign 把长轨迹压缩成 two-step leap trajectory：
+
+\[
+x_k
+\Rightarrow
+\hat{x}_{j\mid k}
+\Rightarrow
+x_j
+\Rightarrow
+\hat{x}_{0\mid j}
+\Rightarrow
+x_0
+\]
+
+其中：
+
+\[
+\hat{x}_{j\mid k}
+=
+x_k-(k-j)v_\theta(x_k,k,c)
+\]
+
+\[
+\hat{x}_{0\mid j}
+=
+x_j-jv_\theta(x_j,j,c)
+\]
+
+这样 reward gradient 不需要穿过几十步 ODE，只需要穿过两个 leap。
+
+\begin{warnbox}
+\textbf{LeapAlign 和 Flow-GRPO 的范式差别：}\\
+Flow-GRPO 需要 logprob，适合黑盒 reward。\\
+LeapAlign 不需要 logprob，但更依赖可微 reward / surrogate reward，因为它走 direct-gradient。
+\end{warnbox}
+
+\subsubsection{建议阅读顺序}
+
+从我们的学习基础出发，建议后面按这个顺序读：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{UDM-GRPO：} 因为你点名了它，而且它把 GRPO 推到离散扩散，是 2026-04 的最新工作。
+  \item \textbf{OP-GRPO：} 解决 Flow-GRPO on-policy 样本效率低，是非常直接的工程痛点。
+  \item \textbf{DenseGRPO：} 解决 sparse terminal reward，是信用分配最核心的一篇。
+  \item \textbf{E-GRPO / TempFlow-GRPO：} 解决哪些时间步值得探索、哪些时间步该承担 credit。
+  \item \textbf{LeapAlign：} 单独学 direct-gradient flow 后训练，和 GRPO 路线形成对照。
+  \item \textbf{MAR-GRPO / UniGRPO / TAGRPO：} 看 GRPO 如何迁移到新生成范式：AR-diffusion、统一多模态、视频。
+  \item \textbf{DiverseGRPO / Flow-Multi：} 看 reward hacking、多目标 reward、多样性退化这些更偏系统和评价的问题。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{下一篇建议：UDM-GRPO}\\
+原因是它最新、你点名了，而且它的问题非常有代表性：
+\[
+\text{当生成模型不是 continuous diffusion / flow，而是 discrete diffusion 时，GRPO 的 action、trajectory、logprob 应该怎么重新定义？}
+\]
+\end{summarybox}
+
+\subsubsection{参考链接}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Flow-GRPO：\url{https://arxiv.org/abs/2505.05470}
+  \item TempFlow-GRPO：\url{https://arxiv.org/abs/2508.04324}
+  \item Chunk-GRPO：\url{https://arxiv.org/abs/2510.21583}
+  \item DiverseGRPO：\url{https://arxiv.org/abs/2512.21514}
+  \item E-GRPO：\url{https://arxiv.org/abs/2601.00423}
+  \item DenseGRPO：\url{https://arxiv.org/abs/2601.20218}
+  \item TAGRPO：\url{https://arxiv.org/abs/2601.05729}
+  \item UniGRPO：\url{https://arxiv.org/abs/2603.23500}
+  \item OP-GRPO：\url{https://arxiv.org/abs/2604.04142}
+  \item MAR-GRPO：\url{https://arxiv.org/abs/2604.06966}
+  \item LeapAlign：\url{https://arxiv.org/abs/2604.15311}
+  \item UDM-GRPO：\url{https://arxiv.org/abs/2604.18518}
+\end{itemize}
