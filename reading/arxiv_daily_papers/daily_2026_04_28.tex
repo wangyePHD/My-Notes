@@ -1,0 +1,265 @@
+% ============================================================
+% arXiv & Daily Papers daily note
+% ============================================================
+
+\section{arXiv \& Daily Papers 日报：2026年4月28日}
+
+\begin{conceptbox}
+\textbf{方向}：后训练 · 视频生成/编辑 · 图像生成/编辑 · 统一理解与生成 · 世界模型 · 具身智能 · Style\\
+\textbf{数据来源}：\href{https://huggingface.co/papers}{Hugging Face Daily Papers Apr 28} · \href{https://arxiv.org/list/cs.CV/new}{arXiv cs.CV} · \href{https://arxiv.org/list/cs.CL/new}{cs.CL} · \href{https://arxiv.org/list/cs.AI/new}{cs.AI} · \href{https://arxiv.org/list/cs.RO/new}{cs.RO} · \href{https://arxiv.org/list/cs.LG/new}{cs.LG}\\
+\textbf{整理日期}：2026-04-28
+\end{conceptbox}
+
+\subsection{今日重点}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{World-R1: Reinforcing 3D Constraints for Text-to-Video Generation}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.24764}{2604.24764}\\
+  HF Daily Papers 今日第一。核心是把 \textbf{Flow-GRPO} 用到视频基础模型上，用预训练 3D foundation model 和 VLM 给文本到视频生成提供几何一致性反馈；不改底座结构，而是通过 RL 对齐 3D constraints。它把“视频生成后训练”和“world simulation”直接接起来。
+
+  \item \textbf{Tuna-2: Pixel Embeddings Beat Vision Encoders for Multimodal Understanding and Generation}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.24763}{2604.24763}\\
+  今日统一理解与生成最值得跟的一篇。它反过来挑战 BAGEL/Janus/BLIP3o 等常见模块化路线：不用预训练视觉编码器，也不用 VAE/representation encoder，而是用简单 patch embedding 从 pixel embedding 端到端学习理解与生成。
+
+  \item \textbf{Improving Vision-language Models with Perception-centric Process Reward Models}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.24583}{2604.24583}\\
+  Perceval 把 PRM 从数学/代码推理推进到 VLM 感知链路：抽取回答里的 image-related claims，与图像证据逐条比对，再把 hallucinated spans 变成 token-level advantage penalty。它同时服务 RL 训练和 test-time scaling。
+
+  \item \textbf{Edit Where You Mean: Region-Aware Adapter Injection for Mask-Free Local Image Editing}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.23763}{2604.23763}\\
+  REDEdit 针对 DiT 局部编辑泄漏问题，用 region-aware adapter、SpatialGate 和 region-aware loss 给冻结 DiT 注入“改哪里”的通道；并训练 MaskPredictor 在部署时免用户 mask。
+
+  \item \textbf{Breaking Lock-In: Preserving Steerability under Low-Data VLA Post-Training}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.23121}{2604.23121}\\
+  很贴近具身后训练风险：小数据 SFT 后 VLA 会出现 concept lock-in 和 spatial lock-in。DeLock 的观点是保留预训练视觉 grounding，并在测试时用 contrastive prompt guidance 调整 denoising dynamics。
+\end{enumerate}
+
+\subsection{后训练与 LLM/VLM}
+
+\subsubsection{SHEAR: Hidden States Know Where Reasoning Diverges}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23318}{2604.23318}
+
+标准 GRPO 把同一条 rollout 的所有 token 共享同一个 advantage，信用分配太粗。SHEAR 观察到同组 correct/incorrect rollouts 的 span-level hidden-state 分布差异，可以用 Wasserstein distance 定位推理分歧段，再对 token-level advantages 重加权。优点是不额外训练 reward model，也不需要 step annotation。
+
+\subsubsection{Stabilizing Efficient Reasoning with Step-Level Advantage Selection}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24003}{2604.24003}
+
+短上下文 post-training 本身就会诱导 reasoning compression，但也会带来训练不稳定和准确率下降。SAS 在 reasoning-step 层面选择性置零 advantage：正确 rollout 中低置信步骤不强推，验证失败 rollout 中高置信步骤不重罚，从而改善准确率--推理长度 trade-off。
+
+\subsubsection{DataPRM: Process-Level Reward Modeling for Agentic Data Analysis}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24198}{2604.24198}
+
+面向动态数据分析 agent 的 PRM。一般 PRM 容易漏掉 silent errors，也会把探索性操作误判为错误；DataPRM 作为 environment-aware active verifier，可主动检查执行状态，并用 reflection-aware ternary reward 区分可修复 grounding error 与不可恢复错误。
+
+\subsubsection{Perceval: Perception-centric PRM for VLMs}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24583}{2604.24583}
+
+这是今天 VLM 后训练最关键的一篇。它把 perceptual hallucination 从 outcome-level 对错拆到 claim/span 级别，既可在 RLVR 中替代 sequence-level GRPO 惩罚，也可在推理时截断错误片段后重写或反思。
+
+\subsubsection{AeSlides: Verifiable Aesthetic Rewards for Slide Generation}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22840}{2604.22840}
+
+用 verifiable rewards 监督 LLM slide generation 的视觉版式质量，并用 GRPO 优化布局。指标覆盖 aspect ratio、whitespace、element collision、visual imbalance 等，是“可验证视觉审美奖励”路线的一个很实用例子。
+
+\subsubsection{HF Daily 补充：ReTAS / ProEval / DIVERT}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{ReTAS}：\href{https://arxiv.org/abs/2604.19548}{2604.19548}，用 dialectical CoT + GRPO 缓解 agent 自反思和旁观审计之间的 Actor-Observer Asymmetry。
+  \item \textbf{ProEval}：\href{https://arxiv.org/abs/2604.23099}{2604.23099}，用预训练 Gaussian Process + Bayesian quadrature 做 generative AI failure discovery / performance estimation。
+  \item \textbf{DIVERT}：\href{https://arxiv.org/abs/2604.21480}{2604.21480}，把 agent-user evaluation 从线性 rollouts 改成 snapshot branching，提升失败发现效率。
+\end{itemize}
+
+\subsection{视频生成、视频编辑与视频理解}
+
+\subsubsection{World-R1}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24764}{2604.24764}
+
+建议优先深读。它不是额外加几何模块，而是把 3D 一致性评估变成 reward signal，再通过 Flow-GRPO 直接后训练视频生成模型；periodic decoupled training 用来平衡刚性几何一致性和动态场景流动性。
+
+\subsubsection{FreqFormer: Frequency-Domain Attention for Long-Sequence Video DiT}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22808}{2604.22808}
+
+面向超长视频 DiT 的注意力效率问题。低频走压缩全局 attention，中频走 block-sparse，高频走 sliding-window local attention，并由 spectral routing 随层和 diffusion timestep 调度。偏系统/架构，不是方法评测型论文。
+
+\subsubsection{PhysLayer: Language-Guided Layered Animation with Depth-Aware Physics}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23574}{2604.23574}
+
+从静态图像生成可控动画：先用视觉基础模型做语言引导的层级场景理解，再用 depth-aware layered physics simulation 生成对象轨迹，最后注入视频合成。适合放在 controllable I2V / physical plausibility 方向。
+
+\subsubsection{Talker-T2AV: Joint Talking Audio-Video Generation}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23586}{2604.23586}
+
+统一 talking audio-video 生成：共享自回归 LM 在 patch-level token space 做高层跨模态建模，两个轻量 DiT heads 分别解码 audio/video latents。和“统一生成但低层解耦”的思路一致。
+
+\subsection{图像生成编辑与统一理解生成}
+
+\subsubsection{Tuna-2}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24763}{2604.24763}
+
+可作为 unified understanding \& generation 专题的新增对照项。它的关键问题是：预训练视觉编码器到底是不是统一模型必须的？Tuna-2 的结论倾向于否定，认为 scale 起来的 pixel-space end-to-end learning 能同时拿到更好的细粒度理解和高质量图像生成。
+
+\subsubsection{REDEdit}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23763}{2604.23763}
+
+局部编辑的核心矛盾是“全局 instruction following 强，但局部区域保护弱”。REDEdit 用 adapter 分离 instruction semantics 与 spatial mask，再用 SpatialGate 限制 adapter signal 只进入编辑区域，是 mask-free local editing 的强相关工作。
+
+\subsubsection{POCA: Pareto-Optimal Curriculum Alignment for Visual Text Generation}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24171}{2604.24171}
+
+解决 visual text generation 中文字准确率、图像 coherence、审美和 instruction following 之间的多目标冲突。它不用简单 reward 加权，而是先找 Pareto-optimal set，再用 easy-to-hard curriculum 做 RL alignment。
+
+\subsubsection{AD-Relight}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24407}{2604.24407}
+
+面向广告 banner 插入后的训练 free relighting。虽然不是通用图像编辑模型，但很贴近生产工作流：用 diffusion relighting prior 在测试时适配 Photoshop 生成区域，让插入内容符合原场景照明。
+
+\subsubsection{DiGSeg: Diffusion Model as a Generalist Segmentation Learner}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24575}{2604.24575}
+
+把预训练 diffusion backbone 从纯生成器改造成 text-conditioned/open-vocabulary segmentation 接口。值得注意的是它强调 diffusion denoising trajectories 本身携带 spatially aligned priors，适合作为“生成模型反哺理解”的例子。
+
+\subsubsection{SketchVLM}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22875}{2604.22875}
+
+训练 free 地让 VLM 输出可编辑 SVG overlay，用于图像推理解释和用户引导。它不是图像生成主线，但属于 VLM 从纯文本回答走向视觉可操作输出的有趣方向。
+
+\subsection{世界模型、3D 与空间智能}
+
+\subsubsection{ReVSI}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24300}{2604.24300}
+
+HF 今日靠前的 VLM 3D reasoning benchmark。重点不是新模型，而是指出点云标注转成视频 QA ground truth 时会有对象缺失、身份错标和几何错误；并按 16/32/64/all frame budget 重新控制问题是否真的 answerable。
+
+\subsubsection{MetaEarth3D}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22828}{2604.22828}
+
+主张把 spatial scale 当作 foundation model 的新 scaling axis，面向 planetary-scale 3D scene generation。它把大地理尺度的世界生成作为 ultra-wide spatial intelligence 问题，而不是普通 bounded scene generation。
+
+\subsubsection{Zero-to-CAD}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24479}{2604.24479}
+
+把 CAD construction history synthesis 变成 agentic search：LLM 在可执行 CAD 环境中生成、执行、校验代码，产出百万级可解释、可编辑 CAD sequences。适合和程序化 3D 生成、设计工具自动化联系起来看。
+
+\subsubsection{GenAssets / Point-MF}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{GenAssets}：\href{https://arxiv.org/abs/2604.23010}{2604.23010}，面向自动驾驶仿真的 in-the-wild 3D asset latent diffusion。
+  \item \textbf{Point-MF}：\href{https://arxiv.org/abs/2604.24586}{2604.24586}，用 Mean Flow 做 single-image point cloud one-step generation，低 NFE 是亮点。
+\end{itemize}
+
+\subsection{具身智能、VLA 与机器人后训练}
+
+\subsubsection{Vision-Language-Action in Robotics: A Survey of Datasets, Benchmarks, and Data Engines}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23001}{2604.23001}
+
+VLA 数据基础设施综述，核心判断是未来瓶颈不只是架构，而是 dataset、benchmark、data engine 的共同设计。可作为具身智能学习路线的索引文献。
+
+\subsubsection{DeLock: Breaking Lock-In}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23121}{2604.23121}
+
+今天最贴“VLA post-training”的机器人论文。它明确把低数据 SFT 后泛化崩掉归为 lock-in，并拆成 concept lock-in 与 spatial lock-in；DeLock 用保留视觉 grounding 和 test-time contrastive prompt guidance 保持 steerability。
+
+\subsubsection{RL Token: Bootstrapping Online RL with VLA Models}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23073}{2604.23073}
+
+用 compact ``RL token'' 作为在线 RL 的接口，把大 VLA 的预训练知识保留下来，再训练小 actor-critic head 微调动作。真实机器人任务中几分钟到几小时即可提升成功率和速度，适合作为 VLA + online RL 的实践参考。
+
+\subsubsection{MoSS: Modular Sensory Stream for VLA}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23272}{2604.23272}
+
+把 tactile、torque 等物理反馈作为 decoupled modality streams 接入 VLA action stream，并用预测未来物理信号的辅助任务增强 contact dynamics 表征。和只靠 RGB 的 VLA 相比，更贴近真实操作。
+
+\subsubsection{\texorpdfstring{$M^2$-VLA}{M2-VLA}}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24182}{2604.24182}
+
+不直接把 VLM 全量端到端 fine-tune 成 VLA，而是通过 Mixture of Layers 选择任务关键语义层，再用 Meta Skill Module 给轨迹学习加入强归纳偏置。关注点是避免灾难性遗忘和保持 zero-shot 泛化。
+
+\subsubsection{VLA Safety}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.23775}{2604.23775}
+
+HF 今日靠前的 VLA safety survey。它按 attack timing 和 defense timing 组织训练时/推理时威胁，覆盖 data poisoning、backdoor、adversarial patches、cross-modal perturbations、semantic jailbreaks、freezing attacks 等。
+
+\subsubsection{AsyncShield}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24086}{2604.24086}
+
+面向云端 VLA navigation 的工程安全问题：网络抖动和推理延迟会让过去 ego frame 里的 intent 在当前位置变成错误空间目标。AsyncShield 用边缘端 pose buffer 和运动学映射修正时延，并用 PPO-Lagrangian adapter 在 intent tracking 与 LiDAR obstacle avoidance 之间做约束权衡。
+
+\subsubsection{Affordance-R1 / SARM / GeCO}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Affordance-R1}：\href{https://arxiv.org/abs/2508.06206}{2508.06206}，GRPO + cognitive CoT 的 affordance grounding；今日为 replacement，但和具身后训练强相关。
+  \item \textbf{SARM}：\href{https://arxiv.org/abs/2509.25358}{2509.25358}，stage-aware video reward model + Reward-Aligned BC，用于长程机器人操作。
+  \item \textbf{GeCO}：\href{https://arxiv.org/abs/2603.17834}{2603.17834}，time-unconditional flow matching，把 action synthesis 从固定积分改成自适应优化，并给 OOD safety signal。
+\end{itemize}
+
+\subsection{Style / Voice / Identity / Design Workflow}
+
+\subsubsection{Can You Make It Sound Like You?}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24444}{2604.24444}
+
+研究用户 post-edit LLM 生成文本后，是否能恢复个人写作 style。结果很实用：post-edit 会提高与本人风格的相似度、降低与纯 LLM 输出的相似度，但成品仍然更接近 LLM style，且 stylistic diversity 下降。
+
+\subsubsection{Seeing Is No Longer Believing}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24197}{2604.24197}
+
+从 synthetic visual evidence 风险角度分析前沿图像模型。它的判断是风险不只来自 photorealism，而来自 realism、legible text、identity persistence、fast iteration 和传播语境的汇合。适合放在 identity preservation / provenance / synthetic evidence 风险线。
+
+\subsubsection{AeSlides / POCA / AD-Relight}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{AeSlides}：用可验证审美奖励优化 slide layout，是 style/design reward 的明确例子。
+  \item \textbf{POCA}：多目标 RL 对齐 visual text generation，直接涉及文字准确性、图像 coherence 和 aesthetic quality 的权衡。
+  \item \textbf{AD-Relight}：广告 banner 场景 relighting，贴近商业设计合成工作流。
+\end{itemize}
+
+\subsection{值得深读}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{优先级 A}：World-R1、Tuna-2、Perceval、REDEdit、DeLock。
+  \item \textbf{优先级 B}：SHEAR、SAS、DataPRM、RL Token、MoSS、ReVSI、POCA、VLA Safety。
+  \item \textbf{适合拆单篇笔记}：World-R1（Flow-GRPO 视频后训练）、Tuna-2（pixel-space unified model）、Perceval（VLM PRM/RLVR）、DeLock（VLA post-training lock-in）。
+\end{itemize}
+
+\subsection{暂时略过}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 医疗影像、遥感、OCR、传统检测/分割、SLAM/控制优化类论文：除非明显连接到生成、VLM/VLA、world model 或后训练，否则本轮不展开。
+  \item 普通 agent orchestration、RAG、SQL/DSL 系统论文：只保留和 RL、evaluation、multi-agent safety 直接相关的少数条目。
+  \item 今日有不少 replaced 条目很相关，例如 Affordance-R1、SARM、GeCO、DriVerse；日报中只作为索引保留，后续深读时需要核对是否此前已经读过旧版。
+\end{itemize}
+
+\subsection{后续动作}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把 \textbf{World-R1} 放进 Flow-GRPO / video post-training 主线，重点比较它的 3D reward、periodic decoupled training 和现有 Flow-GRPO 图像生成工作。
+  \item 把 \textbf{Tuna-2} 补到统一理解与生成专题，与 BAGEL、Transfusion、Janus、BLIP3o 对比“pixel embedding vs VAE/视觉编码器”。
+  \item 把 \textbf{Perceval} 和 \textbf{SHEAR/SAS} 放进“细粒度 credit assignment”专题：一个面向 VLM perceptual errors，一个面向 LLM hidden-state / reasoning-step。
+  \item 把 \textbf{DeLock/RL Token/MoSS} 合并成 VLA 后训练小专题：低数据 SFT lock-in、在线 RL 接口、物理反馈多模态注入。
+\end{itemize}

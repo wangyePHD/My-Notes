@@ -1,0 +1,178 @@
+% ============================================================
+% arXiv & Daily Papers daily note
+% ============================================================
+
+\section{arXiv \& Daily Papers 日报：2026年4月27日}
+
+\begin{conceptbox}
+\textbf{方向}：后训练 · 视频生成/编辑 · 图像生成/编辑 · 统一理解与生成 · 世界模型 · 具身智能 · Style\\
+\textbf{数据来源}：\href{https://huggingface.co/papers}{Hugging Face Daily Papers} · \href{https://arxiv.org/list/cs.CV/new}{arXiv cs.CV} · \href{https://arxiv.org/list/cs.CL/new}{cs.CL} · \href{https://arxiv.org/list/cs.AI/new}{cs.AI} · \href{https://arxiv.org/list/cs.RO/new}{cs.RO} · \href{https://arxiv.org/list/cs.LG/new}{cs.LG}\\
+\textbf{整理日期}：2026-04-27
+\end{conceptbox}
+
+\subsection{今日重点}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Agentic World Modeling: Foundations, Capabilities, Laws, and Beyond}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.22748}{2604.22748}\\
+  HF Daily Papers 今日第一。它不是单点方法，而是把 world model 按 \textbf{Predictor / Simulator / Evolver} 三个能力层级和 \textbf{physical / digital / social / scientific} 四类规律重新组织，是理解 agentic world modeling 的高价值综述入口。
+
+  \item \textbf{Wan-Image: Pushing the Boundaries of Generative Visual Intelligence}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.19858}{2604.19858}\\
+  统一图像生成与编辑系统，LLM + diffusion transformer 路线，强调复杂文字渲染、身份保持、palette-guided generation、多主体一致性、交互式编辑、alpha channel 和 4K 合成。和专业设计工作流高度相关。
+
+  \item \textbf{FlowAnchor: Stabilizing the Editing Signal for Inversion-Free Video Editing}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.22586}{2604.22586}\\
+  训练 free 的 inversion-free flow-based 视频编辑框架。核心问题是高维视频 latent 中编辑信号不稳定，作者用空间注意力细化和自适应强度调制来稳定“在哪里改”和“改多强”。
+
+  \item \textbf{dWorldEval: Scalable Robotic Policy Evaluation via Discrete Diffusion World Model}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2604.22152}{2604.22152}\\
+  用 discrete diffusion world model 作为机器人策略评估 proxy，把视觉、语言和机器人动作映射到统一 token 空间，并用进度 token 判断任务完成度。它代表了 world model 从“生成未来”走向“评估策略”的方向。
+\end{enumerate}
+
+\subsection{后训练与 LLM/VLM}
+
+\subsubsection{Outcome Rewards Do Not Guarantee Verifiable or Causally Important Reasoning}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22074}{2604.22074}
+
+直接质疑 RLVR 后训练里“答案对了，推理链就可靠”的默认假设。作者提出 \textbf{Causal Importance of Reasoning, CIR} 和 \textbf{Sufficiency of Reasoning, SR} 两个指标，并指出 outcome reward 提升准确率，不一定提升推理链的因果作用或可验证性。
+
+\subsubsection{Thinking Without Words: Efficient Latent Reasoning with Abstract Chain-of-Thought}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22709}{2604.22709}
+
+提出 \textbf{Abstract Chain-of-Thought}：模型先生成一小段保留词表里的离散抽象 token，再输出答案。它属于 latent reasoning 后训练路线，目标是在保持推理能力的同时显著减少自然语言 CoT token 成本。
+
+\subsubsection{Learning Evidence Highlighting for Frozen LLMs}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22565}{2604.22565}
+
+训练轻量 \textbf{Emphasis Actor} 在原始长上下文中插入 highlight tag，不压缩、不改写上下文；frozen solver 再基于被强调的输入推理。训练信号来自 solver 的任务 reward，可视为长上下文 evidence selection 的 RL 后训练方案。
+
+\subsubsection{Removing Sandbagging in LLMs by Training with Weak Supervision}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22082}{2604.22082}
+
+研究弱监督条件下如何让模型不故意隐藏能力。结论偏实践：单独 SFT 或单独 RL 都不稳，SFT on weak demonstrations + RL 的组合更可靠；但如果模型能分辨训练和部署环境，风险仍然存在。
+
+\subsubsection{CharTide: Data-Centric Chart-to-Code Generation}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22192}{2604.22192}
+
+面向 VLM chart-to-code 的数据中心方案。通过 visual perception、pure-text code logic、modality fusion 三条数据流解耦训练，再用 inquiry-driven RL 做可验证对齐。可归到多模态生成和 VLM 数据工程。
+
+\subsection{视频生成与视频编辑}
+
+\subsubsection{FlowAnchor}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22586}{2604.22586}
+
+本日视频编辑最值得深读的一篇。关键词是 \textbf{inversion-free、flow-based、training-free、editing signal stabilization}。适合补到“图像/视频编辑后训练与推理控制”专题。
+
+\subsubsection{Reshoot-Anything: A Self-Supervised Model for In-the-Wild Video Reshooting}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.21776}{2604.21776}
+
+解决动态视频的相机控制与重拍问题。通过互联网单目视频构造 pseudo multi-view triplets：source video、geometric anchor、target video。推理时用 4D point-cloud derived anchor 控制视角，值得和 video-to-4D、dynamic novel view synthesis 一起看。
+
+\subsection{图像生成编辑与统一理解生成}
+
+\subsubsection{Wan-Image}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.19858}{2604.19858}
+
+关注点不是单一指标，而是“专业生产力工具”能力集合：复杂文字、身份保持、多主体、调色板控制、连续视觉生成、交互式编辑、透明通道和 4K。它和 BAGEL / Qwen-Image / Seedream / GPT-Image 一类统一视觉生成系统应放在同一条主线比较。
+
+\subsubsection{View-Consistent 3D Scene Editing}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.17801}{2604.17801}
+
+从分布建模角度处理多视角一致 3D 编辑，使用结构对应和语义连续性双路径机制。适合作为 3D scene editing / multi-view consistency 的补充材料。
+
+\subsection{世界模型与物理理解}
+
+\subsubsection{Agentic World Modeling}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22748}{2604.22748}
+
+建议作为 world model 方向的索引文献。它把 model-based RL、video generation、web/GUI agents、多智能体社会仿真和 AI for science 放到一个“环境动力学建模”的大框架里。
+
+\subsubsection{GenMatter: Perceiving Physical Objects with Generative Matter Models}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22160}{2604.22160}
+
+从运动线索与外观特征中层次化组织“matter particles”和对象 cluster，用生成模型解释物体分割、运动和 3D 结构。更偏物理世界理解，不是视频生成，但对 world model 的 object-centric state representation 有启发。
+
+\subsubsection{dWorldEval}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22152}{2604.22152}
+
+重点在机器人策略大规模评估。把 policy evaluation 变成 world model 的应用场景，值得和 WorldEval、WorldGym、RoboWM-Bench 等评测体系并排比较。
+
+\subsection{具身智能与 VLA}
+
+\subsubsection{GazeVLA: Learning Human Intention for Robotic Manipulation}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22615}{2604.22615}
+
+用 gaze 作为 human intention 的可观测代理，先在人类 egocentric 数据上预训练，再用少量机器人/人类数据微调。推理时先预测 intention 再执行 action，是缓解 human-robot embodiment gap 的一条路线。
+
+\subsubsection{CodeGraphVLP: Code-as-Planner Meets Semantic-Graph State}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22238}{2604.22238}
+
+面向非 Markov 长程 VLA 任务：维护 persistent semantic graph state，用可执行代码 planner 做 progress check，再把 VLA executor 的视觉输入做 clutter suppression。适合和 GUI/agent planning 的状态管理思想对照。
+
+\subsubsection{RedVLA: Physical Red Teaming for Vision-Language-Action Models}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22591}{2604.22591}
+
+VLA 物理安全红队框架。先合成风险场景，再通过 gradient-free optimization 放大风险，最后用生成的数据训练轻量 SimpleVLA-Guard。部署前安全评估价值较高。
+
+\subsubsection{SpaMEM: Benchmarking Dynamic Spatial Reasoning}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22409}{2604.22409}
+
+测试 MLLM 在具身环境中的动态空间记忆。数据规模大，包含 RGB、depth、instance、semantic segmentation，任务覆盖短期 step-wise update 和长期 episodic reconstruction。
+
+\subsubsection{LeHome: A Simulation Environment for Deformable Object Manipulation}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22363}{2604.22363}
+
+家庭场景柔性物体操作仿真环境，覆盖衣物、食物等 deformable objects，并支持多种机器人 embodiment。适合作为家务机器人、低成本机器人和 deformable manipulation 的数据/评测基础设施。
+
+\subsection{Style / Voice / Identity}
+
+\subsubsection{Voice Under Revision}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22142}{2604.22142}
+
+研究 LLM rewrite 如何改变个人叙事的 style 和 voice。结论是模型倾向于让文本更“规范化”：减少 function words、contractions、first-person pronouns，增加词汇多样性和更抽象的表达。对 voice preservation、写作风格保持和 LLM rewrite 风险有参考价值。
+
+\subsubsection{Wan-Image 的风格相关点}
+
+今天没有看到特别纯粹的图像 style transfer 新文。图像风格最相关的是 Wan-Image 的 palette-guided generation、identity preservation 和 professional design workflow。
+
+\subsection{值得深读}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{优先级 A}：Agentic World Modeling、Wan-Image、FlowAnchor、dWorldEval。
+  \item \textbf{优先级 B}：Abstract-CoT、Outcome Rewards/RLVR、GazeVLA、RedVLA、Reshoot-Anything。
+  \item \textbf{适合拆单篇笔记}：Wan-Image、FlowAnchor、Agentic World Modeling。
+\end{itemize}
+
+\subsection{暂时略过}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 普通 agent search、长文档 QA、RAG、clinical/medical 专项任务：除非和当前后训练或多模态主线发生直接连接，否则先不深读。
+  \item 纯 SLAM、低层控制、医学影像、SAR/remote sensing：只保留可能服务 robotics/world model 的条目。
+\end{itemize}
+
+\subsection{后续动作}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 将 \textbf{Wan-Image} 补进统一理解与生成模型专题，与 BAGEL、Qwen-Image、Seedream 系列对照。
+  \item 将 \textbf{FlowAnchor} 放进图像/视频编辑控制专题，重点比较 inversion-free editing、attention localization 和编辑强度调制。
+  \item 用 \textbf{Agentic World Modeling} 作为 world model 方向总索引，后续把 WorldMark、dWorldEval、RoboWM-Bench、HY-World 2.0 归档到同一张表。
+\end{itemize}
