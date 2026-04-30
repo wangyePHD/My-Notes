@@ -1,0 +1,306 @@
+% ============================================================
+% Survey: Discrete Diffusion Models, 2025-2026
+% ============================================================
+
+\subsection{近一年 discrete diffusion models 调研：2025--2026}
+
+\begin{conceptbox}
+\textbf{一句话：} 过去一年 discrete diffusion 的核心变化，是从“小规模非自回归生成范式”升级为可训练、可后训练、可加速、可多模态统一的 foundation model 候选路线。\\
+\textbf{关键矛盾：} 它用并行去噪换取全局规划和任意顺序生成，但会付出多步采样、KV cache 不友好、长度控制困难、评测指标不统一等成本。\\
+\textbf{主线判断：} 2025--2026 年的重点不是“能不能做”，而是“能不能规模化、能不能比 AR 更快、能不能像 LLM 一样后训练、能不能统一文本/图像/语音/动作 token”。
+\end{conceptbox}
+
+\subsubsection{0. 必要前置：三种离散扩散口味}
+
+\textbf{Masked diffusion / absorbing-state diffusion}
+
+最常见于 dLLM。前向过程把 token 逐渐替换为 \code{[MASK]}，反向过程从全 mask 或部分 mask 序列中反复预测并 unmask。优点是训练目标接近 masked language modeling，工程上容易接到 Transformer；缺点是 hard mask 会丢掉上一步的 soft belief，推理也天然需要多轮 refinement。
+
+\textbf{Uniform-state diffusion}
+
+前向过程把 token 腐蚀到接近均匀 categorical 噪声，而不是单一 mask token。它更接近“在完整离散词表上扩散”，近年来在 scaling law 和图像 token 生成里重新变得重要。优点是生成状态空间更对称；缺点是训练和采样信号解释更复杂。
+
+\textbf{Discrete flow matching / CTMC}
+
+把离散 token 转移建模成连续时间马尔可夫链或概率流。研究重点通常是 few-step 采样和速度-质量 Pareto frontier。它不一定长得像传统 DDPM，但解决的是同一个问题：如何在离散空间里从噪声分布快速输运到数据分布。
+
+\begin{intubox}
+学习时不要先纠结名字。可以先问三个问题：\\
+1. 噪声终点是什么？是 \code{[MASK]}、uniform categorical，还是某个 continuous simplex/flow 表示？\\
+2. 模型每一步预测什么？clean token、score、transition rate、endpoint，还是 unmask order？\\
+3. 推理瓶颈在哪里？采样步数、KV cache、长度控制、还是后训练 reward 信号？
+\end{intubox}
+
+\subsubsection{1. 近一年论文地图}
+
+\begingroup
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.12\linewidth} >{\raggedright\arraybackslash}p{0.27\linewidth} >{\raggedright\arraybackslash}p{0.21\linewidth} >{\raggedright\arraybackslash}p{0.33\linewidth}}
+\toprule
+\textbf{时间} & \textbf{论文} & \textbf{方向} & \textbf{一句话}\\
+\midrule
+\endhead
+
+2025-05 &
+\href{https://arxiv.org/abs/2505.10446}{DCoLT} &
+RL / reasoning &
+把 diffusion 反向去噪中间步骤当成 latent thinking action，用 outcome RL 优化整条 reasoning trajectory。\\
+
+2025-05 &
+\href{https://arxiv.org/abs/2505.16933}{LLaDA-V} &
+MLLM understanding &
+在 LLaDA 上做视觉指令微调，探索纯 diffusion MLLM 的多模态理解能力。\\
+
+2025-05 &
+\href{https://arxiv.org/abs/2505.19223}{LLaDA 1.5 / VRPO} &
+preference alignment &
+面向 masked diffusion model 的 variance-reduced preference optimization，补上 dLLM 人类偏好对齐链路。\\
+
+2025-06 &
+\href{https://arxiv.org/abs/2506.13759}{Discrete Diffusion in LLM and Multimodal Models: Survey} &
+survey &
+系统整理 dLLM/dMLLM 的历史、数学、模型和应用，适合作为第一篇总览。\\
+
+2025-06 &
+\href{https://arxiv.org/abs/2506.20639}{DiffuCoder} &
+code generation / RL &
+面向代码训练 7B masked diffusion model，并分析 denoising behavior 与 coupled-GRPO。\\
+
+2025-08 &
+\href{https://arxiv.org/abs/2508.09192}{D2F: Discrete Diffusion Forcing} &
+inference acceleration &
+把 dLLM 改造成 AR-diffusion hybrid：block-wise AR 支持 KV cache，同时做 inter-block parallel decoding。\\
+
+2025-08 &
+\href{https://arxiv.org/abs/2508.15487}{Dream 7B} &
+open dLLM &
+用 AR-based initialization 和 context-adaptive token noise rescheduling 做开源 7B diffusion LLM。\\
+
+2025-08 &
+\href{https://arxiv.org/abs/2508.20072}{Discrete Diffusion VLA} &
+robotics / VLA &
+把连续动作离散成 action token，用 discrete diffusion 在单 Transformer 内做 action chunk decoding。\\
+
+2025-09 &
+\href{https://arxiv.org/abs/2509.01142}{Dream-Coder 7B} &
+code model &
+面向代码的开源 discrete diffusion language model，强调 any-order generation 和任务自适应 decoding。\\
+
+2025-09 &
+\href{https://arxiv.org/abs/2509.20624}{FS-DFM} &
+few-step generation &
+Few-Step Discrete Flow-Matching，把采样步数作为显式条件，用少步逼近长步轨迹。\\
+
+2025-10 &
+\href{https://arxiv.org/abs/2510.17206}{Soft-Masked Diffusion Language Models} &
+sampling / memory &
+用 top-k 预测 token embedding 与 mask embedding 软混合，让被保留的 mask 也携带上一步 soft 信息。\\
+
+2025-12 &
+\href{https://arxiv.org/abs/2512.10858}{Scaling Behavior of Discrete Diffusion Language Models} &
+scaling law &
+比较 masked 与 uniform diffusion 的 scaling behavior，报告 uniform diffusion 在参数/数据效率上有优势。\\
+
+2025-12 &
+\href{https://arxiv.org/abs/2512.15745}{LLaDA2.0} &
+frontier-scale dLLM &
+把 AR 模型系统转换成 dLLM，扩到 16B/100B MoE，并接 SFT/DPO 对齐。\\
+
+2025-12 &
+\href{https://arxiv.org/abs/2512.22630}{On the Role of Discreteness in Diffusion LLMs} &
+mechanism analysis &
+从 diffusion process 与 language modeling 两个视角讨论“离散性”到底提供了什么，以及结构性 trade-off。\\
+
+2026-01 &
+\href{https://arxiv.org/abs/2601.07568}{d3LLM} &
+distillation / speed &
+用 pseudo-trajectory distillation 和 entropy-based multi-block decoding 给 Dream/LLaDA 类模型加速。\\
+
+2026-02 &
+\href{https://arxiv.org/abs/2602.01326}{DreamOn} &
+variable-length infilling &
+给 diffusion code infilling 加长度控制状态，解决固定 mask canvas 与真实补全长度不匹配的问题。\\
+
+2026-02 &
+\href{https://arxiv.org/abs/2602.15014}{Scaling Beyond Masked Diffusion Language Models} &
+scaling / comparison &
+比较 masked、uniform-state、interpolating discrete diffusion，指出跨 family 只看 perplexity 会误导。\\
+
+2026-02 &
+\href{https://arxiv.org/abs/2602.21472}{Tri-Modal Masked Diffusion Models} &
+text-image-audio &
+从 scratch 训练 tri-modal masked diffusion，系统研究 text、image-text、audio-text 设计空间。\\
+
+2026-03 &
+\href{https://arxiv.org/abs/2603.01331}{MetaState} &
+cross-step memory &
+给 frozen dLLM 加持久工作记忆，缓解每步 hard mask 导致的信息孤岛问题。\\
+
+2026-03 &
+\href{https://arxiv.org/abs/2603.06577}{Omni-Diffusion} &
+any-to-any multimodal &
+用 mask-based discrete diffusion 统一 text、speech、image 的理解与生成。\\
+
+2026-03 &
+\href{https://arxiv.org/abs/2603.15803}{Mask Is What dLLM Needs} &
+training schedule &
+用 information-density-driven smart noise scheduler 替代 uniform random masking，强化代码/数学推理关键 token。\\
+
+2026-04 &
+\href{https://arxiv.org/abs/2604.18518}{UDM-GRPO} &
+image token / RL &
+首次把 GRPO 稳定接到 Uniform Discrete Diffusion Model，强调 final clean sample as action 和 forward trajectory reconstruction。\\
+
+2026-04 &
+\href{https://arxiv.org/abs/2604.20796}{LLaDA2.0-Uni} &
+unified multimodal generation &
+用 fully semantic discrete tokenizer + MoE dLLM backbone + diffusion decoder 统一多模态理解、图像生成和编辑。\\
+
+\bottomrule
+\end{longtable}
+\endgroup
+
+\subsubsection{2. 第一条主线：dLLM 从可行性走向规模化}
+
+\textbf{代表论文：} \href{https://arxiv.org/abs/2508.15487}{Dream 7B}、\href{https://arxiv.org/abs/2512.15745}{LLaDA2.0}、\href{https://arxiv.org/abs/2512.10858}{Scaling Behavior}、\href{https://arxiv.org/abs/2602.15014}{Scaling Beyond Masked Diffusion}。
+
+这一条线回答的问题是：\textbf{discrete diffusion language model 能不能像 AR LLM 一样 scale？}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Dream 7B} 证明开源 7B 规模 diffusion LLM 可以在通用、数学、代码任务上接近或超过早期 dLLM，并展示任意顺序生成、infilling、速度-质量 trade-off。
+  \item \textbf{LLaDA2.0} 的重点是从 AR 模型继承知识并转换成 dLLM，而不是完全从零训练；这说明产业路线可能是 \key{AR pretrain -> diffusion adaptation -> SFT/DPO}。
+  \item \textbf{Scaling Behavior} 和 \textbf{Scaling Beyond} 开始比较 masked、uniform、interpolating 等 family；重要结论是 perplexity 不能单独决定好坏，因为不同 family 的采样效率差异很大。
+\end{itemize}
+
+\begin{summarybox}
+这条线的学习重点不是某个模型跑分，而是三件事：\\
+1. masked diffusion 是否只是 masked LM 的生成化？\\
+2. uniform-state diffusion 为什么在 scaling 或 reasoning 上可能更有优势？\\
+3. dLLM 的真正指标应该是 perplexity、wall-clock latency、tokens/sec、还是 speed-quality Pareto frontier？
+\end{summarybox}
+
+\subsubsection{3. 第二条主线：推理加速与 KV cache 兼容}
+
+\textbf{代表论文：} \href{https://arxiv.org/abs/2508.09192}{D2F}、\href{https://arxiv.org/abs/2509.20624}{FS-DFM}、\href{https://arxiv.org/abs/2601.07568}{d3LLM}、\href{https://arxiv.org/abs/2510.17206}{Soft-Masked Diffusion}、\href{https://arxiv.org/abs/2603.01331}{MetaState}。
+
+dLLM 理论上能并行预测多个 token，但实际推理会遇到两个硬问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{需要很多 denoising steps}：一步全预测通常质量差，多步又抵消并行优势。
+  \item \textbf{bidirectional attention 不天然支持 KV cache}：每一步输入 mask 状态都变，缓存复用不像 AR 那样直接。
+\end{itemize}
+
+不同论文的解决路径：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{D2F}：承认需要 block-wise AR 来用 KV cache，但允许后续 block 在前面 block 未完全完成时并行预测，形成 AR-diffusion hybrid。
+  \item \textbf{FS-DFM}：从训练目标入手，把 step budget 作为条件，让 8 步近似 1024 步基线。
+  \item \textbf{d3LLM}：通过 pseudo-trajectory distillation 教模型哪些 token 可以早解码，再用 entropy-based multi-block decoding 加速。
+  \item \textbf{Soft-Masked}：hard mask 太浪费信息，把 mask embedding 和 top-k predicted token embeddings 混合，让下一步看到更连续的 partial belief。
+  \item \textbf{MetaState}：给 frozen dLLM 加跨步 persistent memory，减少每一步都从 hard token state 重新理解上下文的冗余。
+\end{itemize}
+
+\subsubsection{4. 第三条主线：后训练与 reasoning}
+
+\textbf{代表论文：} \href{https://arxiv.org/abs/2505.10446}{DCoLT}、\href{https://arxiv.org/abs/2505.19223}{LLaDA 1.5 / VRPO}、\href{https://arxiv.org/abs/2506.20639}{DiffuCoder}、\href{https://arxiv.org/abs/2604.18518}{UDM-GRPO}。
+
+这里的核心问题是：\textbf{传统 LLM 的 SFT、DPO、RLVR、GRPO 能不能直接搬到 diffusion trajectory 上？}
+
+答案是不能直接搬，原因有三类：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{action 定义不清楚：} AR 的 action 是下一个 token；dLLM 的 action 可能是一整轮 unmask、一组 token、一个 unmask order、甚至最终 clean sample。
+  \item \textbf{credit assignment 更复杂：} 最终答案奖励要分配给多个 denoising step 和多个并行 token。
+  \item \textbf{old policy / logprob 更难重算：} 如果采样路径包含 remasking、排序、并行 token 选择，importance ratio 的定义更容易出错。
+\end{enumerate}
+
+\textbf{DCoLT} 把中间 diffusion step 视为 latent thinking action，做 outcome RL；\textbf{VRPO} 针对 masked diffusion 的 preference optimization 降低方差；\textbf{DiffuCoder} 在代码任务中研究 denoising behavior，并引入 diffusion-native RL；\textbf{UDM-GRPO} 则强调在 UDM 里不要把 noisy intermediate prediction 当 action，而应把最终 clean sample 作为 action，再用 forward diffusion 重建训练轨迹。
+
+\begin{warnbox}
+学习 dLLM 后训练时要特别警惕一个误区：不要把 AR 的 token-level policy gradient 机械套到 diffusion step 上。必须先定义清楚 action、trajectory、old policy、reward attribution 和训练分布是否与预训练分布一致。
+\end{warnbox}
+
+\subsubsection{5. 第四条主线：代码生成是 dLLM 的天然试验场}
+
+\textbf{代表论文：} \href{https://arxiv.org/abs/2506.20639}{DiffuCoder}、\href{https://arxiv.org/abs/2509.01142}{Dream-Coder 7B}、\href{https://arxiv.org/abs/2602.01326}{DreamOn}。
+
+代码生成适合 discrete diffusion 的原因：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 代码存在强全局约束：函数签名、变量定义、调用关系、测试行为不是严格左到右局部决定。
+  \item infilling 很常见：补中间代码、修 bug、编辑局部，比纯 left-to-right 更适合任意顺序生成。
+  \item 评测可验证：HumanEval、MBPP、LiveCodeBench 这类任务能给 outcome reward。
+\end{itemize}
+
+\textbf{Dream-Coder} 报告了一个有意思现象：模型会根据任务自适应选择生成顺序，例如复杂算法先 sketch 再填细节，简单补全近似 left-to-right，理解任务可能 interleaved reasoning。这个现象是 diffusion LLM 相对 AR LLM 最值得研究的潜在优势之一。
+
+\textbf{DreamOn} 则解决固定长度 canvas 问题。标准 dLLM 需要先给一个固定长度 mask 区域；但代码 infilling 的真实长度不确定。DreamOn 增加长度控制状态，让模型可以动态扩张或收缩输出长度。
+
+\subsubsection{6. 第五条主线：多模态、VLA 与统一离散 token}
+
+\textbf{代表论文：} \href{https://arxiv.org/abs/2505.16933}{LLaDA-V}、\href{https://arxiv.org/abs/2508.20072}{Discrete Diffusion VLA}、\href{https://arxiv.org/abs/2602.21472}{Tri-Modal Masked Diffusion}、\href{https://arxiv.org/abs/2603.06577}{Omni-Diffusion}、\href{https://arxiv.org/abs/2604.20796}{LLaDA2.0-Uni}。
+
+这条线的共同想法是：\textbf{如果文本、图像、语音、动作都能变成离散 token，那么 masked diffusion 可以作为统一的生成与理解 backbone。}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{LLaDA-V}：把视觉 encoder 输出接进 LLaDA embedding space，验证纯 diffusion MLLM 的视觉指令微调。
+  \item \textbf{Tri-Modal Masked Diffusion}：系统研究 text、image-text、audio-text 三模态 masked diffusion 的设计空间。
+  \item \textbf{Omni-Diffusion}：any-to-any multimodal language model，用统一 mask-based discrete diffusion 捕获离散多模态 token 的联合分布。
+  \item \textbf{LLaDA2.0-Uni}：更接近统一理解与生成产品形态，包含 semantic discrete tokenizer、MoE dLLM backbone 和 diffusion decoder，支持图像生成、编辑、理解与 interleaved generation/reasoning。
+  \item \textbf{Discrete Diffusion VLA}：把 robot action chunk 离散化，在 VLM 主干里直接做 action token denoising，避免外挂连续 diffusion head。
+\end{itemize}
+
+\begin{summarybox}
+多模态 discrete diffusion 的关键不是“是否 diffusion”，而是“是否有一个足够语义化、足够可压缩、可重建的离散 tokenizer”。这会决定图像/语音/action token 是否能和文本 token 在同一个 dLLM backbone 中共存。
+\end{summarybox}
+
+\subsubsection{7. 第六条主线：离散图像生成与 UDM 后训练}
+
+\textbf{代表论文：} \href{https://arxiv.org/abs/2604.18518}{UDM-GRPO}。
+
+UDM-GRPO 很适合与你现在学习的图像编辑/后训练主线连接。它的两个关键 insight：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{final clean sample as action}：不要把每个 timestep 的 noisy prediction 当成 RL action；最终干净样本更稳定、更直接对应 reward。
+  \item \textbf{forward trajectory reconstruction}：采样得到最终图像后，再用 forward diffusion 重新构造训练状态，让 RL 训练更贴近预训练分布。
+\end{enumerate}
+
+这和 Flow-GRPO / DDPO 的连续扩散后训练形成对照：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 连续扩散常见 action 是每步噪声预测、velocity 或 SDE transition。
+  \item UDM-GRPO 选择把最终 clean sample 作为 action，避免中间离散 token 预测熵太高导致优化不稳。
+\end{itemize}
+
+\subsubsection{8. 建议学习顺序}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{先读总览：} \href{https://arxiv.org/abs/2506.13759}{Discrete Diffusion in Large Language and Multimodal Models: A Survey}。目标是建立术语表：dLLM、dMLLM、masked diffusion、block diffusion、remasking、confidence-based decoding。
+  \item \textbf{补前置基线：} \href{https://arxiv.org/abs/2502.09992}{LLaDA} 和 \href{https://arxiv.org/abs/2406.07524}{MDLM}。虽然 LLaDA 原文略早于近一年窗口，但它是 LLaDA-V、VRPO、DCoLT、D2F 的共同底座。
+  \item \textbf{看规模化：} Dream 7B、LLaDA2.0、Scaling Behavior、Scaling Beyond。目标是理解 diffusion LLM 是否真的能 scale。
+  \item \textbf{看推理加速：} D2F、FS-DFM、d3LLM、Soft-Masked、MetaState。目标是理解 dLLM 如何接近或超过 AR 推理效率。
+  \item \textbf{看后训练：} DCoLT、VRPO、DiffuCoder、UDM-GRPO。目标是明确 action、trajectory、reward 在 diffusion 中如何定义。
+  \item \textbf{看多模态统一：} LLaDA-V、Omni-Diffusion、LLaDA2.0-Uni、Discrete Diffusion VLA。目标是理解“统一离散 token + diffusion backbone”的潜力与瓶颈。
+\end{enumerate}
+
+\subsubsection{9. 需要深挖的问题清单}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{理论问题：} masked diffusion 的 likelihood bound 和 MLM loss 到底差在哪里？
+  \item \textbf{采样问题：} confidence-based unmask、random remask、secondary remasking、soft mask、persistent memory 之间是什么关系？
+  \item \textbf{规模问题：} uniform-state diffusion 为什么可能在 scaling 上比 masked diffusion 更好？
+  \item \textbf{后训练问题：} diffusion trajectory 上的 PPO/GRPO ratio 应该如何定义，old policy 存什么？
+  \item \textbf{多模态问题：} 图像/语音/action 的离散 tokenizer 是否会成为统一 dMLLM 的主要瓶颈？
+  \item \textbf{系统问题：} dLLM 的 KV cache、block parallelism 和 serving scheduler 应如何设计？
+\end{itemize}
+
+\subsubsection{10. 下一步拆单篇笔记}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{第一篇：} LLaDA / MDLM 基础机制对比。
+  \item \textbf{第二篇：} Dream 7B 与 LLaDA2.0 的规模化路线。
+  \item \textbf{第三篇：} D2F、FS-DFM、d3LLM 的加速路线对比。
+  \item \textbf{第四篇：} DCoLT、VRPO、UDM-GRPO 的后训练定义。
+  \item \textbf{第五篇：} Omni-Diffusion 与 LLaDA2.0-Uni 的统一多模态路线。
+\end{itemize}

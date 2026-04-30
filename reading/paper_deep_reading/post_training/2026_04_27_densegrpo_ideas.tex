@@ -1,0 +1,440 @@
+% ============================================================
+% Idea pool: DenseGRPO improvement directions
+% ============================================================
+
+\section{Idea 池：DenseGRPO 之后怎么改}
+
+\begin{conceptbox}
+\textbf{核心判断：} DenseGRPO 最大的有效增益来自 \key{计算每一步的 improvement}，而不是把 terminal reward 全局平等分配给所有 denoising steps。后续改进的主线应该是：保留 step-wise / chunk-wise reward gain 的信用分配优势，同时把 ODE readout、VAE decode 和 reward scoring 的成本压下来。
+\end{conceptbox}
+
+\subsection{0. 总目标}
+
+DenseGRPO 的关键 reward 是：
+
+\[
+\Delta R_t = R_{t-1} - R_t
+\]
+
+它比直接使用 terminal reward 更合理，因为它回答的是：
+
+\[
+\text{当前 denoising step 到底让结果变好了多少？}
+\]
+
+但完整 \(n=t\) ODE readout 的代价接近：
+
+\[
+T + (T-1) + \cdots + 1 = \frac{T(T+1)}{2}
+\]
+
+所以未来 idea 的主问题不是“dense reward 有没有用”，而是：
+
+\begin{quote}
+如何低成本、足够准确地估计 \(\Delta R_t\)？
+\end{quote}
+
+\subsection{1. 可排列组合的设计轴}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{奖励粒度：} step-wise、chunk-wise、selected timestep、region-wise、component-wise。
+  \item \textbf{readout 方式：} full ODE、truncated ODE、subsampled ODE、latent proxy、learned reward predictor。
+  \item \textbf{分配方式：} 相邻差分、区间差分、加权插值、uncertainty-aware 分配。
+  \item \textbf{适用任务：} text-to-image、image editing、video generation、video editing。
+  \item \textbf{训练策略：} 先校准再训练、训练中动态校准、少量 full readout 蒸馏 proxy。
+\end{enumerate}
+
+\subsection{2. Idea A：Sparse Readout Dense Reward}
+
+\textbf{想法：} 不对每个 timestep 都做 ODE readout，只选择少量关键 timesteps：
+
+\[
+T = \tau_K > \tau_{K-1} > \cdots > \tau_1 > \tau_0 = 0
+\]
+
+只计算这些点的 latent reward：
+
+\[
+R_{\tau_K}, R_{\tau_{K-1}}, \ldots, R_{\tau_0}
+\]
+
+然后用区间 reward gain：
+
+\[
+\Delta R_{[\tau_j,\tau_{j-1}]}
+= R_{\tau_{j-1}} - R_{\tau_j}
+\]
+
+给这个区间内的 steps 分配 advantage。
+
+\begin{summarybox}
+\textbf{价值：} 成本从对所有 timesteps 做 full readout，变成只对 \(K\) 个关键点做 readout。对视频模型尤其重要，因为视频单步 forward 和 reward evaluation 都很贵。
+\end{summarybox}
+
+\textbf{可尝试选择策略：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 固定采样：early / mid / late 均匀选点。
+  \item 非均匀采样：早期 layout steps 多选，后期 refinement steps 少选。
+  \item 动态采样：只在 reward variance 大、trajectory 分叉明显、或者模型不确定性高的 timestep 做 readout。
+\end{itemize}
+
+\subsection{3. Idea B：Chunk-level Improvement Reward}
+
+\begin{conceptbox}
+\textbf{当前最值得优先推进的主线：}
+
+\[
+\text{Chunk-GRPO 的 chunk unit}
+\quad + \quad
+\text{DenseGRPO 的 reward gain}
+\]
+
+也就是：用 Chunk-GRPO 的 temporal-dynamic-guided chunks 决定 readout 边界，再用 DenseGRPO 的 ODE-based reward gain 计算 chunk-level improvement。
+\end{conceptbox}
+
+\subsubsection{3.1 核心想法}
+
+\textbf{想法：} 不估计每一个 step 的贡献，而是估计一个 chunk 的边际贡献。设 denoising 被切成 \(K\) 个 chunks：
+
+\[
+T=\tau_K>\tau_{K-1}>\cdots>\tau_1>\tau_0=0
+\]
+
+第 \(j\) 个 chunk 对应从 \(\tau_j\) 到 \(\tau_{j-1}\) 的 denoising 区间：
+
+\[
+\mathrm{ch}_j=(\tau_j,\tau_{j-1}]
+\]
+
+只在 chunk boundary 上做 ODE readout：
+
+\[
+\hat{x}_{0|\tau_j}
+=
+\mathrm{ODE}(x_{\tau_j},c;\tau_j\rightarrow 0)
+\]
+
+然后用 reward model 打分：
+
+\[
+R_{\tau_j}
+=
+R(\mathrm{Decode}(\hat{x}_{0|\tau_j}),c)
+\]
+
+chunk-level improvement 定义为：
+
+\[
+\Delta R_{\mathrm{ch}_j}
+=
+R_{\tau_{j-1}}-R_{\tau_j}
+\]
+
+\textbf{解释：} \(R_{\tau_j}\) 表示“从当前 boundary latent 继续 ODE 到最终图后，能拿到多少 reward”。如果经过 chunk \(\mathrm{ch}_j\) 之后，boundary 从 \(\tau_j\) 变成更接近 clean 的 \(\tau_{j-1}\)，那么 \(R_{\tau_{j-1}}-R_{\tau_j}\) 就是在问：
+
+\begin{quote}
+这个 chunk 的 denoising 到底让最终可读出的结果提升了多少？
+\end{quote}
+
+这比 Chunk-GRPO 原始的 terminal \(A_i\) 更细，因为不同 chunks 可以拿到不同的 improvement；也比 DenseGRPO 每个 step 都 readout 更便宜。
+
+\begin{warnbox}
+\textbf{关键 tradeoff：} chunk 太大，会退化回 trajectory-level reward；chunk 太小，又回到 DenseGRPO 的高成本问题。真正要调的是 chunk size 与 reward accuracy 的平衡。
+\end{warnbox}
+
+\subsubsection{3.2 怎么接到 GRPO 目标里}
+
+对同一个 prompt 采样 \(G\) 条 trajectories。第 \(i\) 条轨迹、第 \(j\) 个 chunk 的 improvement 是：
+
+\[
+\Delta R^i_{\mathrm{ch}_j}
+=
+R^i_{\tau_{j-1}}-R^i_{\tau_j}
+\]
+
+可以在 group 内归一化成 chunk-specific advantage：
+
+\[
+A^i_{\mathrm{ch}_j}
+=
+\frac{
+\Delta R^i_{\mathrm{ch}_j}
+-
+\frac{1}{G}\sum_{g=1}^{G}\Delta R^g_{\mathrm{ch}_j}
+}{
+\mathrm{std}_{g}\left(\Delta R^g_{\mathrm{ch}_j}\right)+\epsilon
+}
+\]
+
+然后不再让整个 trajectory 的所有 steps 共用同一个 \(A_i\)，而是让 chunk 内的 steps 共用这个 chunk 的 \(A^i_{\mathrm{ch}_j}\)。
+
+如果沿用 Chunk-GRPO 的 chunk-level ratio：
+
+\[
+r^i_j(\theta)
+=
+\left(
+\prod_{t\in \mathrm{ch}_j}
+\frac{
+p_\theta(x^i_{t-1}|x^i_t,c)
+}{
+p_{\mathrm{old}}(x^i_{t-1}|x^i_t,c)
+}
+\right)^{1/cs_j}
+\]
+
+那么目标可以写成：
+
+\[
+J(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{GK}
+\sum_{i=1}^{G}
+\sum_{j=1}^{K}
+\min
+\left(
+r^i_j(\theta)A^i_{\mathrm{ch}_j},
+\mathrm{clip}(r^i_j(\theta),1-\epsilon,1+\epsilon)A^i_{\mathrm{ch}_j}
+\right)
+\right]
+\]
+
+\begin{summarybox}
+\textbf{关键变化：} Chunk-GRPO 主要改变 policy ratio 的粒度，但 advantage 仍然来自 terminal reward。这个 idea 进一步把 advantage 也改成 chunk-specific reward gain，因此它才是真正的 chunk-level credit assignment。
+\end{summarybox}
+
+\subsubsection{3.3 计算复杂度为什么更合理}
+
+DenseGRPO 如果对每个 timestep \(t\) 都做 full ODE readout，readout 成本大致是：
+
+\[
+1+2+\cdots+T
+=
+O(T^2)
+\]
+
+而 chunk-level improvement 只在 \(K+1\) 个 boundary 上 readout：
+
+\[
+R_{\tau_K},R_{\tau_{K-1}},\ldots,R_{\tau_0}
+\]
+
+因此成本更接近：
+
+\[
+O(K\cdot C_{\mathrm{readout}})
+\]
+
+其中 \(C_{\mathrm{readout}}\) 是单个 boundary 做 ODE readout、decode、reward scoring 的平均成本，并且 \(K\ll T\)。
+
+\begin{summarybox}
+\textbf{收益：} 它保留 DenseGRPO “reward improvement 不该全局平分” 的核心收益，但避免每个 step 都 full ODE readout。对视频模型尤其重要，因为视频的 readout、decode 和 reward evaluation 都比图像更贵。
+\end{summarybox}
+
+\subsubsection{3.4 最小可做版本}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{先固定 chunks：} 直接使用 Chunk-GRPO 的 chunk 划分，或者用 uniform chunks 做 baseline。
+  \item \textbf{每个 boundary 做 readout：} 对 \(\tau_K,\tau_{K-1},\ldots,\tau_0\) 得到 \(R_{\tau_j}\)。
+  \item \textbf{相邻 boundary 做差：} 得到 \(\Delta R_{\mathrm{ch}_j}=R_{\tau_{j-1}}-R_{\tau_j}\)。
+  \item \textbf{group 内归一化：} 得到 \(A^i_{\mathrm{ch}_j}\)。
+  \item \textbf{用 chunk-level ratio 更新：} 直接接 Chunk-GRPO 的几何平均 ratio。
+\end{enumerate}
+
+\textbf{第一版实验不需要太复杂。} 先证明同等 GPU hours 下，chunk-level improvement 比 terminal advantage 更有效；再比较它和 DenseGRPO full step-wise readout 的 cost-quality tradeoff。
+
+\subsubsection{3.5 可以继续排列组合的扩展}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Temporal-dynamic boundary：} 用 Chunk-GRPO 的 \(L1_{rel}\) 变化来决定 boundary，而不是均匀切。
+  \item \textbf{Adaptive boundary：} 如果某个区间的 \(\Delta R\) variance 很高，就继续细分；如果长期接近 0，就合并。
+  \item \textbf{Truncated readout：} boundary 上也不一定 full ODE，可以用少步 ODE，再用少量 full ODE 校正。
+  \item \textbf{Component-wise chunk gain：} 对图像编辑或视频任务，把 reward 拆成 edit、preserve、identity、motion、aesthetic 等 component。
+  \item \textbf{Hybrid terminal + chunk gain：} 当 chunk gain 噪声大时，用 terminal advantage 做保底：
+  \[
+  A^i_{\mathrm{ch}_j}
+  =
+  \lambda_j \widehat{\Delta R^i_{\mathrm{ch}_j}}
+  +(1-\lambda_j)\widehat{R^i_{\mathrm{terminal}}}
+  \]
+\end{itemize}
+
+\subsubsection{3.6 关键 ablation}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Advantage 来源：} terminal \(A_i\) vs. chunk-level \(A_{\mathrm{ch}_j}\)。
+  \item \textbf{Chunk 划分：} uniform chunks vs. temporal-dynamic-guided chunks。
+  \item \textbf{Chunk 数量：} \(K=2,4,8\)，观察 reward accuracy 与训练成本。
+  \item \textbf{Readout 精度：} full ODE boundary readout vs. truncated ODE boundary readout。
+  \item \textbf{更新粒度：} step-level ratio + chunk advantage vs. chunk-level ratio + chunk advantage。
+\end{itemize}
+
+\subsubsection{3.7 风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{早期 boundary readout 可能很 noisy：} 高噪声 latent 读出的 \(R_{\tau_j}\) 可能不稳定。
+  \item \textbf{\(\Delta R_{\mathrm{ch}_j}\) 可能有负值：} 某个 chunk 可能短期降低 reward，但为后续结构打基础。
+  \item \textbf{Reward model 可能只看最终偏好：} 它未必能可靠评价中间 latent 的 ODE readout 结果。
+  \item \textbf{Chunk 切分错了会误导训练：} 如果 boundary 没对齐真实生成阶段，chunk gain 仍然会混合多个因果阶段。
+\end{itemize}
+
+\textbf{缓解思路：} 对 \(\Delta R_{\mathrm{ch}_j}\) 做 clipping / whitening；用 terminal reward 混合保底；对早期 chunks 降低权重；用少量 dense readout 检查 chunk gain 与真实 step-wise gain 的相关性。
+
+\textbf{适合场景：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 视频生成：一个 chunk 可以对应 motion planning、object consistency、texture refinement 等阶段。
+  \item 图像编辑：一个 chunk 可以对应结构保持、目标区域修改、细节修复等阶段。
+  \item 多目标 reward：不同 chunk 可以绑定不同 reward component。
+\end{itemize}
+
+\subsection{4. Idea C：Truncated ODE Readout + 校正}
+
+\textbf{想法：} 每个 \(x_t\) 不完整 ODE 到 \(x_0\)，而是只走固定 \(k\) 步：
+
+\[
+\hat{x}_{t,0}^{(k)} = \mathrm{ODE}_k(x_t, c)
+\]
+
+然后用这个近似 clean prediction 打 reward。
+
+\[
+\hat{R}_t^{(k)} = R(\hat{x}_{t,0}^{(k)}, c)
+\]
+
+问题是 \(k\) 太小会偏离 reward model 的训练分布。可以考虑加一个校正项：
+
+\[
+\tilde{R}_t
+= \hat{R}_t^{(k)} + b_\phi(x_t,t,c)
+\]
+
+其中 \(b_\phi\) 用少量 full ODE readout 数据拟合 truncated readout 的偏差。
+
+\begin{summarybox}
+\textbf{价值：} 保持 \(O(Tk)\) 的线性成本，同时用校正项尽量接近 full readout 的排序或差分。
+\end{summarybox}
+
+\subsection{5. Idea D：Latent Reward Proxy 蒸馏}
+
+\textbf{想法：} 用 DenseGRPO 的 full ODE readout 作为 teacher，只在少量数据上生成监督信号：
+
+\[
+(x_t,t,c) \rightarrow R_t
+\]
+
+训练一个轻量 latent reward predictor：
+
+\[
+\hat{R}_\phi(x_t,t,c)
+\]
+
+在线 RL 时不再频繁 ODE decode，而是直接预测：
+
+\[
+\Delta \hat{R}_t
+= \hat{R}_\phi(x_{t-1},t-1,c) - \hat{R}_\phi(x_t,t,c)
+\]
+
+\textbf{关键评估：} 不一定要求 \(\hat{R}_\phi\) 的绝对值非常准，更重要的是：
+
+\[
+\mathrm{rank}(\Delta \hat{R}_t)
+\approx
+\mathrm{rank}(\Delta R_t)
+\]
+
+也就是 group 内相对排序要准，因为 GRPO 主要依赖 group-relative advantage。
+
+\subsection{6. Idea E：Adaptive Readout}
+
+\textbf{想法：} 不是所有 timesteps 都同等重要。只在值得花算力的位置做更准确的 readout。
+
+\textbf{触发条件可以包括：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item group 内 reward variance 高，说明该 timestep 对结果区分度大。
+  \item truncated readout 和 proxy prediction 分歧大，说明估计不可靠。
+  \item KL 或 policy ratio 在某些 timestep 异常，说明 policy 正在强烈改变该阶段。
+  \item 视频里 motion / identity / temporal consistency reward 变化剧烈。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{价值：} 把 full ODE readout 当成昂贵的查询资源，只花在高信息量 timestep 上。
+\end{summarybox}
+
+\subsection{7. Idea F：面向图像编辑的 Component-wise Improvement}
+
+图像编辑不能只看最终图的一个总分。更合理的是把 reward 拆成多个 component：
+
+\[
+R = \lambda_{\mathrm{edit}}R_{\mathrm{edit}}
++ \lambda_{\mathrm{preserve}}R_{\mathrm{preserve}}
++ \lambda_{\mathrm{id}}R_{\mathrm{id}}
++ \lambda_{\mathrm{aesthetic}}R_{\mathrm{aesthetic}}
+\]
+
+然后分别计算每个 component 的 improvement：
+
+\[
+\Delta R_t^{(m)}
+= R_{t-1}^{(m)} - R_t^{(m)}
+\]
+
+\textbf{原因：} 某一步可能提升 edit success，但破坏 identity 或 background。只看总 reward 会掩盖这种冲突。
+
+\textbf{可进一步结合 region：}
+
+\[
+\Delta R_{t,\mathrm{target}}
+\quad \text{vs.} \quad
+\Delta R_{t,\mathrm{non-target}}
+\]
+
+这样可以判断哪一步真正修改了目标区域，哪一步破坏了不该动的区域。
+
+\subsection{8. Idea G：Hybrid Terminal + Dense Reward}
+
+\textbf{想法：} 不完全抛弃 terminal reward，而是把 dense improvement 和 terminal reward 混合：
+
+\[
+A_t
+= \alpha_t \cdot \widehat{\Delta R_t}
++ (1-\alpha_t)\cdot \widehat{R(x_0)}
+\]
+
+\textbf{直觉：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 早期 timestep 可能更需要 dense credit assignment。
+  \item 后期 timestep 可能 terminal reward 已经足够稳定。
+  \item 当 dense reward proxy 不可靠时，terminal reward 可以提供保底信号。
+\end{itemize}
+
+\subsection{9. 我当前认为最值得优先做的组合}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Sparse Readout + Chunk-level Improvement：} 最直接降低成本，也最容易和现有 GRPO 框架接上。
+  \item \textbf{Truncated ODE + Rank Correction：} 保留 per-step signal，但用少量 full readout 校准排序。
+  \item \textbf{Component-wise Improvement for Editing：} 如果目标转向图像编辑，这是最有任务辨识度的方向。
+  \item \textbf{Adaptive Readout for Video：} 视频成本太高，不适合全 timestep readout，必须选择性花算力。
+\end{enumerate}
+
+\subsection{10. 实验应该怎么证明}
+
+后续如果写成方法，实验不要只比最终 reward，还要显式报告 cost-quality tradeoff：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 同等 GPU hours 下的 reward / human preference / task success。
+  \item 同等最终效果下的训练时间和 forward calls。
+  \item dense reward 与 full ODE reward 的 group ranking correlation。
+  \item 不同 timestep / chunk 的 advantage 分布是否更稳定。
+  \item 对视频任务额外看 temporal consistency、identity drift、motion correctness。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{论文切入点：} DenseGRPO 已经证明“step-wise improvement reward 有用”。更好的新工作应该强调“低成本估计 step-wise improvement reward”，而不是简单重复 full ODE dense reward。
+\end{warnbox}

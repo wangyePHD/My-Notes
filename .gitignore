@@ -23,7 +23,9 @@ env/
 *.run.xml
 *.synctex.gz
 *.toc
+*.xdv
 *.pdf
+!assets/figures/**/*.pdf
 _minted-*/
 build/
 out/

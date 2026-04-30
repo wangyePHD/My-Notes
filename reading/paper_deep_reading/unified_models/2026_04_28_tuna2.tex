@@ -1,0 +1,413 @@
+% ============================================================
+% Paper deep reading: Tuna-2
+% ============================================================
+
+\section{论文精读：Tuna-2}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2604.24763}{Tuna-2: Pixel Embeddings Beat Vision Encoders for Multimodal Understanding and Generation}\\
+\textbf{作者/机构：} Zhiheng Liu, Weiming Ren, Xiaoke Huang, Shoufa Chen, Tianhong Li, Mengzhao Chen, Yatai Ji, Sen He, Jonas Schult, Belinda Zeng, Tao Xiang, Wenhu Chen, Ping Luo, Luke Zettlemoyer, Yuren Cong；Meta AI / The University of Hong Kong / University of Waterloo\\
+\textbf{时间：} arXiv v1, 2026-04-27；阅读日期：2026-04-28\\
+\textbf{方向标签：} Unified Multimodal Model、Pixel Embedding、Encoder-Free、Pixel-space Flow Matching、Image Understanding / Generation / Editing\\
+\textbf{项目页 / 代码：} \href{https://tuna-ai.org/tuna-2/}{tuna-ai.org/tuna-2} · \href{https://github.com/facebookresearch/tuna-2}{facebookresearch/tuna-2}
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+Tuna-2 的核心不是又做一个 unified multimodal model，而是直接挑战当前统一理解与生成模型里的默认假设：\textbf{图像一定要先经过 VAE、SigLIP/CLIP 或其它 pretrained vision encoder 才能进入统一模型}。作者把视觉侧压到最简：图片只经过 patch embedding，后续理解和生成都交给同一个 LLM decoder + pixel-space flow head。
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇值得精读，因为它把 unified model 的争论从“用哪种视觉编码器”推进到“是否还需要视觉编码器”。但结论不能简单读成 encoder 已经过时。更准确地说：在足够大规模 end-to-end pretraining 下，encoder-free pixel-space UMM 可以在理解侧超过 encoder-based variant；生成和编辑侧目前仍能从 representation encoder 的语义先验中受益。
+\end{summarybox}
+
+\subsection{1. 它在统一理解生成版图里的位置}
+
+你已有的 BAGEL / BLIP3o / Transfusion / Janus 这条主线，核心矛盾都是：
+
+\[
+\text{理解需要语义表示} \quad \text{vs.} \quad \text{生成需要可重建表示}
+\]
+
+常见解法有三类：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{解耦表示：} 理解走 CLIP/SigLIP，生成走 VAE/VQ，代表 Janus 一类。
+  \item \textbf{统一 latent / tokenizer：} 尝试训练一个同时适合理解与生成的连续或离散视觉表示。
+  \item \textbf{LLM + diffusion/flow hybrid：} 文本和理解由 LLM 处理，图像生成由 diffusion/flow head 处理，代表 Transfusion、BAGEL、BLIP3o 的不同变体。
+\end{itemize}
+
+Tuna-2 的切入点更激进：\textbf{不要专门的视觉编码器，也不要 VAE latent，直接在 pixel patch 上做统一建模。}
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth} p{0.33\linewidth} p{0.34\linewidth}}
+\toprule
+\textbf{模型} & \textbf{视觉表示} & \textbf{关键取舍}\\
+\midrule
+Tuna & VAE encoder + representation encoder & 统一表示，但仍依赖两个视觉编码模块。\\
+Tuna-R & representation encoder + pixel-space generation & 去掉 VAE，但保留 SigLIP 2 语义先验。\\
+Tuna-2 & patch embedding / pixel embeddings & 去掉 VAE 和 representation encoder，把视觉建模压力全部交给统一 transformer。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{tuna2/tuna2_fig1_architecture.pdf}
+  \caption{Tuna-2 的架构演进图。阅读这张图时重点看两次“删模块”：Tuna-R 去掉 VAE，把生成从 latent space 推到 pixel space；Tuna-2 再去掉 representation encoder，只保留 patch embedding。这个设计让论文的问题变得很干净：视觉侧先验越少，统一 transformer 是否还能自己学出理解和生成所需的表示？图源：arXiv source。}
+\end{figure}
+
+\subsection{2. 论文真正要回答的问题}
+
+\textbf{问题不是：} pixel-space generation 能不能做。这个方向已有 PixelFlow / DiP / PixelDiT / JiT 等工作。
+
+\textbf{问题也不是：} encoder-free VLM 能不能做。Fuyu、Chameleon、Mono-InternVL、NEO 等已经探索过。
+
+\textbf{Tuna-2 真正问的是：}
+
+\begin{intubox}
+能不能把 encoder-free visual understanding 和 pixel-space visual generation 合到一个 native UMM 里，并且在同一个训练框架下证明：不用 pretrained vision encoder 也能同时做好理解、生成和编辑？
+\end{intubox}
+
+这个问题重要，因为当前统一理解与生成模型经常把视觉编码器当成先验基础设施。Tuna-2 如果成立，说明统一模型的 scaling path 可以更接近语言模型：输入侧尽量简单，表示能力从大规模端到端训练中长出来。
+
+\subsection{3. 方法拆解}
+
+\subsubsection{3.1 架构：从 Tuna 到 Tuna-R 再到 Tuna-2}
+
+作者不是直接宣称 encoder-free 最好，而是做了一个受控阶梯：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Tuna：} 图片先经过 VAE encoder，再经过 representation encoder，形成统一视觉表示；LLM decoder 负责图文建模；语言输出走 LM head，图像生成走 flow matching head。
+  \item \textbf{Tuna-R：} 去掉 VAE，只保留 representation encoder。理解类似常规 LMM；生成改成 pixel-space flow matching。
+  \item \textbf{Tuna-2：} 连 representation encoder 也去掉，只用简单 patch embedding 把原始图片变成视觉 token，再交给 LLM decoder。
+\end{enumerate}
+
+Tuna-2 的结构可以简化成：
+
+\[
+\begin{aligned}
+\text{Image Pixels}
+&\rightarrow \text{Patchify Layer}
+\rightarrow \text{LLM Decoder} \\
+&\rightarrow
+\begin{cases}
+\text{Language Head} & \text{理解/文本输出}\\
+\text{Unpatchify + Flow Head} & \text{图像生成/编辑}
+\end{cases}
+\end{aligned}
+\]
+
+这和 BAGEL 的差异很明显：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item BAGEL 仍有 SigLIP 理解侧和 VAE latent 生成侧；Tuna-2 把两者都拿掉。
+  \item BAGEL 用 MoT 把理解/生成参数分路；Tuna-2 更像单一 decoder 承担视觉语言表示学习。
+  \item BAGEL 的生成发生在 VAE latent / Flow Matching 空间；Tuna-2 的 flow matching 发生在 pixel space。
+\end{itemize}
+
+\subsubsection{3.2 Pixel-space Flow Matching}
+
+去掉 VAE 后，不能再沿用 latent diffusion / latent flow 的老路径。Tuna-2 借鉴 JiT 的 x-prediction + v-loss 范式，直接在像素空间构造 rectified flow。
+
+给定 clean image \(x_1\)、高斯噪声 \(x_0 \sim \mathcal{N}(0,I)\)、时间 \(t \in [0,1]\)，构造：
+
+\[
+x_t = t x_1 + (1-t)x_0
+\]
+
+模型直接预测 clean image：
+
+\[
+x_\theta = \pi_\theta(x_t, c, t)
+\]
+
+其中 \(c\) 是条件信号：T2I 时是文本，编辑时是文本 + 图像。虽然模型输出是 \(x_\theta\)，训练目标仍转成 velocity：
+
+\[
+v_\theta = \frac{x_\theta - x_t}{1-t}, \qquad v = x_1 - x_0
+\]
+
+\[
+\mathcal{L}_{\mathrm{flow}} =
+\mathbb{E}_{t,c,x_1,x_0}\left[\|v_\theta - v\|_2^2\right]
+\]
+
+这里容易误读的一点是：\textbf{加噪发生在完整图像 \(x_1\) 上，而不是只发生在某些 patch 上}。更具体地说，生成侧可以按下面的顺序理解：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 先在 pixel space 对全图采样噪声，得到完整 noisy image \(x_t\)。
+  \item 再把 \(x_t\) patchify 成 noisy visual tokens。
+  \item 如果启用 masking-based feature learning，就在 token 输入层随机挑一部分 noisy visual tokens，用 learnable mask token 替换，得到送入 LLM decoder 的 masked visual input。
+  \item 模型预测 clean image patches，经 unpatchify 回到图像空间，或在 patch tensor 上做等价计算。
+  \item flow matching loss 仍然使用原始全图的 \(x_t,x_1,x_0\) 来构造 \(v_\theta\) 和 \(v\)，并对 masked 与 unmasked regions 一起回归。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{关键区分：} noisy visual token 来自 rectified flow 的连续噪声路径；learnable mask token 只是 patch/token 级输入遮挡正则。Tuna-2 不是同时训练一条“加噪 flow”和一条“mask flow”，而是在同一个 pixel-space flow matching 目标上加入 masked prediction 难度。
+\end{intubox}
+
+推理时用 Euler solver，根据 velocity 从 noisier image 逐步走向 denoised image。
+
+\textbf{关键理解：} Tuna-2 不是把图片压到低维 latent 再生成，而是把高维 pixel denoising 的难题直接交给大模型。它的代价是训练更难、token/计算压力更大；收益是低层细节没有被 VAE 或 representation encoder 提前丢掉。
+
+\subsubsection{3.3 Masking-based Feature Learning}
+
+作者认为 pixel space 冗余更高，模型容易学 shortcut，而不是学真正对理解和生成都有用的视觉线索。因此引入 masking-based visual feature learning：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 随机选择一部分 image patches。
+  \item 用 learnable mask token 替换这些视觉 token。
+  \item generation examples 中，模型基于部分可见的 noisy visual tokens 和 mask tokens，仍要预测完整 clean image patches；loss 覆盖 masked 和 unmasked regions。
+  \item understanding examples 中，模型要基于被遮挡的视觉输入预测文本答案。
+\end{itemize}
+
+\begin{intubox}
+这一步可以理解成：对生成任务，它让 denoising 问题更难；对理解任务，它迫使模型不要只依赖局部显著纹理，而要在部分观测下建立更稳的视觉语义。
+\end{intubox}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.96\linewidth]{tuna2/tuna2_fig3_masking.pdf}
+  \caption{Masking-based feature learning。左侧是生成样本：在带噪视觉 token 和 learnable mask token 条件下预测完整 clean image；右侧是理解样本：遮挡一部分视觉 token 后继续预测新的文本 token。我的读法是，这不是单纯的 MAE trick，而是给 encoder-free pixel embedding 补一个“被迫建模全局语义”的正则。图源：arXiv source。}
+\end{figure}
+
+论文的 ablation 显示 masking 对 Tuna-2 的提升比 Tuna-R 更明显。作者的解释是 Tuna-R 的 SigLIP 2 encoder 本身已经带有类似 masked prediction 的预训练先验，而 Tuna-2 需要在端到端训练中自己学出来。
+
+\subsubsection{3.4 两阶段训练}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Stage 1 full model pretraining：} 联合训练 image captioning 和 text-to-image generation，目标是建立 flow matching head 的初始化，并让 pixel-space visual input 适配统一理解/生成。
+  \item \textbf{Stage 2 SFT：} 用 image instruction-following、image editing、高质量图像生成数据做全模型低学习率微调，提升编辑、指令跟随和生成质量。
+\end{itemize}
+
+具体训练配方：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item LLM decoder：Qwen2.5-7B-Instruct。
+  \item Stage 1：550M in-house image-text pairs，其中 70\% image captioning、30\% text-to-image；另有 Nemotron text-only data，占总预训练数据 20\%。
+  \item Stage 1 训练：300k steps，64 nodes，AdamW，learning rate \(1 \times 10^{-4}\)，每 GPU sequence length pad 到 16k tokens。
+  \item Stage 2：13M FineVision 对话样本、约 2M OmniEdit 图像编辑样本，以及高质量图像生成数据。
+  \item Stage 2 训练：50k steps，AdamW，learning rate \(2 \times 10^{-5}\)。
+  \item Tuna-R 额外有 connector alignment stage：3k steps，learning rate \(5 \times 10^{-4}\)。
+\end{itemize}
+
+\subsection{4. 主要实验结论}
+
+\subsubsection{4.1 图像理解：Tuna-2 强于 Tuna-R 的地方最多}
+
+Table 1 的关键信息是：Tuna-2 在 7B native UMM 中表现很强，尤其在 pixel-centric benchmarks 上优势明显。
+
+\begin{center}
+\begin{tabular}{p{0.25\linewidth} p{0.18\linewidth} p{0.18\linewidth} p{0.28\linewidth}}
+\toprule
+\textbf{Benchmark} & \textbf{Tuna-R} & \textbf{Tuna-2} & \textbf{变化}\\
+\midrule
+GQA & 63.5 & 65.0 & Tuna-2 更好\\
+MMVet & 46.7 & 51.7 & 明显更好\\
+MMVP & 74.7 & 77.3 & 更好\\
+SEED-Bench2+ & 58.4 & 61.1 & 更好\\
+OCRBench & 78.3 & 79.7 & 更好\\
+V* & 57.6 & 59.2 & 更好\\
+CountBench & 77.8 & 81.7 & 明显更好\\
+VisuLogic & 26.2 & 28.8 & 更好\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不是所有理解指标都赢：RealWorldQA、MMMU 上 Tuna-R 略高，ChartQA 持平。但总体上，Tuna-2 说明 encoder-free pixel embedding 在大规模训练后并不弱，尤其适合低层细节、计数、小目标、视觉逻辑等 fine-grained perception。
+
+\subsubsection{4.2 图像生成：Tuna-2 竞争力强，但不是最强}
+
+在 GenEval / DPG-Bench：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Tuna：GenEval overall 0.90，DPG overall 86.76。
+  \item Tuna-R：GenEval overall 0.88，DPG overall 86.35。
+  \item Tuna-2：GenEval overall 0.87，DPG overall 86.54。
+\end{itemize}
+
+所以生成侧结论要谨慎：Tuna-2 可以接近强 unified models，但并没有全面超过 Tuna / Tuna-R。论文自己的分析也承认 representation encoder 的语义先验对 generation 仍有帮助。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\linewidth,height=0.68\textheight,keepaspectratio]{tuna2/tuna2_fig2_generation_samples.pdf}
+  \caption{Tuna-2 的文生图与图像编辑样例。它的意义主要是定性证明 encoder-free 路线不等于“只能理解、不能生成”：没有 VAE 和视觉表征 encoder，模型仍能生成高保真图片并做指令编辑。但这张图只能支持能力展示，不能单独推出 Tuna-2 在生成侧全面优于 Tuna/Tuna-R；定量表里 Tuna-2 的生成优势并不如理解侧稳定。图源：arXiv source。}
+\end{figure}
+
+不过 LLM-judge evaluation 给了另一个角度：在 1.5K prompts、每 prompt 4 张图的评测中，Tuna-2 在 diversity 上被 GPT-5.4 和 Claude Opus 4.7 明显偏好；quality 上和 Tuna-R 接近，高于 Tuna。这说明 encoder-free 设计可能减少某些视觉先验带来的模式收缩，让输出多样性更强。
+
+\subsubsection{4.3 图像编辑：强，但仍落后于 Tuna / Tuna-R}
+
+ImgEdit 总分：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Tuna：4.31。
+  \item Tuna-R：4.18。
+  \item Tuna-2：4.09。
+  \item GPT-Image：4.20。
+  \item BAGEL：3.20，OmniGen2：3.44。
+\end{itemize}
+
+Tuna-2 超过早期 unified editing baselines，但和 Tuna / Tuna-R 有差距。这很合理：编辑既需要低层保真，也需要对原图语义和局部区域的稳健理解；pretrained representation encoder 仍可能提供更强的编辑先验。
+
+\subsubsection{4.4 图像重建：pixel-space unified representation 不是空话}
+
+作者做了轻量 reconstruction finetuning，在 ImageNet validation 上比较 visual tokenizers。Tuna-2 的结果：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Tuna-R：rFID 0.12，PSNR 32.22，SSIM 0.93。
+  \item Tuna-2：rFID 0.15，PSNR 32.80，SSIM 0.93。
+  \item FLUX.1 VAE：rFID 0.06，PSNR 33.65，SSIM 0.93。
+\end{itemize}
+
+这说明 Tuna-2 的 pixel representation 在 reconstruction 上接近强 VAE，但还没有超过专用 VAE。它证明的是“统一模型中的 pixel embedding 可用”，不是“专用 tokenizer 已经不需要”。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{tuna2/tuna2_fig4_reconstruction.pdf}
+  \caption{不同 visual tokenizer 的重建质性对比。Tuna-2 的重建已经很接近 Tuna-R，说明直接 patch/pixel embedding 可以保留足够多的低层细节；但 FLUX.1 VAE 仍然更像专门为重建优化的 tokenizer。因此这张图更适合读成“pixel-space UMM 可行”，而不是“专用 VAE 已经失去价值”。图源：arXiv source。}
+\end{figure}
+
+\subsection{5. Ablation 与训练动态}
+
+\subsubsection{5.1 数据配比：generation objective 对数据比例更敏感}
+
+作者比较了 generation-to-understanding 采样比例 \(xg yu\)。结论：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 提高某一类数据比例，会降低对应任务的训练 loss。
+  \item flow matching 的 MSE 对比例变化更敏感；language CE 变化相对小。
+  \item 论文最终采用 \(7:3\) 的 generation-to-understanding ratio。
+\end{itemize}
+
+\textbf{读法：} 统一训练不是简单把理解数据和生成数据混在一起。生成目标对数据量和采样比例更脆弱，训练 recipe 会显著影响最终结论。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.98\linewidth]{tuna2/tuna2_fig5_training_loss.png}
+  \caption{不同 understanding-generation 数据配比下的训练 loss。左侧 generation MSE 对采样比例更敏感，右侧 language CE 相对平滑；这解释了为什么 Tuna-2 的训练 recipe 不能只按理解任务配数据。对统一模型来说，generation objective 往往更吃数据比例和训练稳定性。图源：arXiv source。}
+\end{figure}
+
+\subsubsection{5.2 Masking 对 Tuna-2 很关键}
+
+小模型 ablation 中，Tuna-2 加 masking 后：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth} p{0.19\linewidth} p{0.19\linewidth} p{0.20\linewidth}}
+\toprule
+\textbf{指标} & \textbf{w/o Masking} & \textbf{w/ Masking} & \textbf{变化}\\
+\midrule
+OCRBench & 55.4 & 56.8 & +1.4\\
+MMVP & 52.3 & 55.7 & +3.4\\
+CountBench & 53.4 & 57.6 & +4.2\\
+GenEval & 47.6 & 48.2 & +0.6\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+论文在最终训练的后 40\% 阶段使用 masking-based feature learning。这个设计很值得记：不是从一开始就遮挡，而是在模型已有基础多模态知识后，用 masking 强化视觉表示。
+
+\subsubsection{5.3 Tuna-R vs Tuna-2：scale 之后角色反转}
+
+训练曲线给出的判断：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 早期 Tuna-R 理解更强，因为 SigLIP 2 representation encoder 提供语义先验。
+  \item 随着预训练 token 规模增大，Tuna-2 追上并超过 Tuna-R。
+  \item 生成侧 Tuna-R 基本全程略强，说明 representation encoder 的语义先验仍然帮助 generation。
+  \item SFT 后两者生成差距接近消失。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.98\linewidth]{tuna2/tuna2_fig6_scaling_curves.png}
+  \caption{Tuna-R 与 Tuna-2 随训练 token 增长的 accuracy 曲线。最关键的现象是：Tuna-R 早期受益于 SigLIP 2 语义先验，起步更快；Tuna-2 随 scale 增大追上并在理解侧反超。生成侧 Tuna-R 仍略稳，说明 representation encoder 的语义先验对 generation/editing 仍有价值。图源：arXiv source。}
+\end{figure}
+
+\begin{warnbox}
+\textbf{不要过度解读：} Tuna-2 不是在低数据、低算力下胜过 encoder-based model。它的优势依赖大规模 end-to-end vision pretraining。小数据场景下，pretrained encoder 仍然可能是更稳的工程选择。
+\end{warnbox}
+
+\subsection{6. Attention 可视化的意义}
+
+论文用 attention map 比较 Tuna、Tuna-R、Tuna-2 和 LLaVA-OneVision、Qwen2.5-VL、Penguin-VL 等模型。重点案例包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 问“shining”时，Tuna-2 更准确关注发光区域。
+  \item 问“purple object”时，Tuna-2 更聚焦目标物体。
+  \item “cat cafe”语言先验和图像中真实动物冲突时，Tuna-2 更少被文本先验误导。
+  \item football 场景中，问题真实目标是 glass cup，而图中 football 是显著干扰物，Tuna-2 更能定位问题语义对应的物体。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.98\linewidth]{tuna2/tuna2_fig7_attention.pdf}
+  \caption{Attention map 可视化。Tuna-2 在这些案例里更容易把注意力放到问题真正指向的图像区域，而不是被显著物体或文本先验带偏。它给论文主张提供了直观证据：encoder-free pixel embedding 可能保留更多细粒度视觉线索，帮助 grounding；但 attention map 仍是定性分析，不能替代 localization benchmark。图源：arXiv source。}
+\end{figure}
+
+这些可视化支撑了作者的解释：encoder-free pixel embedding 可能保留了更多低层视觉细节，使模型在细粒度 grounding 上更强。不过 attention map 只能作为定性证据，不能替代系统性 localization benchmark。
+
+\subsection{7. 与 BAGEL / Janus / BLIP3o 的关键区别}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.16\linewidth} p{0.24\linewidth} p{0.21\linewidth} p{0.20\linewidth}}
+\toprule
+\textbf{模型} & \textbf{理解表示} & \textbf{生成表示} & \textbf{统一方式}\\
+\midrule
+Janus / Janus-Pro & semantic encoder & VQ/VAE-like generation representation & 解耦编码，避免理解/生成冲突。\\
+BAGEL & SigLIP visual features & VAE latent + Flow Matching & MoT 分路，attention 交互。\\
+BLIP3o & vision encoder / LLM condition & diffusion / flow decoder & LLM 条件 + 独立生成头。\\
+Tuna & VAE + representation encoder & 统一 continuous visual representation & 仍依赖视觉编码模块。\\
+Tuna-2 & patch embedding & pixel-space flow matching & encoder-free 单 transformer + flow head。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Tuna-2 给这个领域增加了一条清晰路线：
+
+\[
+\text{representation engineering} \rightarrow \text{end-to-end pixel-space scaling}
+\]
+
+但这条路线的门槛是数据和算力。它不像 Janus 那样模块化，也不像 BAGEL 那样通过结构分路减轻任务冲突，而是把冲突交给大规模训练解决。
+
+\subsection{8. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{数据不可复现：} Stage 1 使用 550M in-house image-text pairs，核心结论高度依赖私有数据和训练规模。
+  \item \textbf{算力门槛高：} 300k steps、64 nodes、16k tokens/GPU，不是普通实验室容易复现的路线。
+  \item \textbf{生成侧没有全面胜出：} Tuna-2 在 GenEval、ImgEdit 上仍略低于 Tuna / Tuna-R。
+  \item \textbf{只覆盖图像：} 虽然统一模型长期会走向视频、音频、any-to-any，但 Tuna-2 当前主实验是 image understanding / T2I / image editing。
+  \item \textbf{LLM judge 评价有主观性：} quality/diversity 的模型裁判结果有参考价值，但需要和人评、自动指标、更多 prompt 分布交叉验证。
+  \item \textbf{pixel token 成本：} 直接 pixel-space 建模通常会带来更高序列长度和训练成本，论文没有把效率问题作为主要贡献来解决。
+\end{itemize}
+
+\subsection{9. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{受控模型阶梯：} Tuna \(\rightarrow\) Tuna-R \(\rightarrow\) Tuna-2 是很好的实验设计。后续比较架构时，不要只做最终模型对比，要构造“逐步去掉模块”的路径。
+  \item \textbf{pixel-centric benchmark：} V*、CountBench、VisuLogic 很适合检验统一模型是否真的保留细粒度视觉信息。
+  \item \textbf{训练动态分析：} 早期 encoder-based 更快、后期 encoder-free 更强这个现象很重要。未来看模型时要问“比较发生在训练哪个阶段”。
+  \item \textbf{masking 作为后期表示增强：} 不是从一开始强行 MAE，而是在最终 40\% pretraining 引入 masking，这个 schedule 值得借鉴。
+  \item \textbf{生成/理解分开读：} Tuna-2 的理解侧胜利比生成侧更强。统一模型不能只看一个综合分。
+\end{itemize}
+
+\subsection{10. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Tuna-2 的 patch size、视觉 token 数、不同分辨率下的 token budget 和 attention 成本，需要进一步从代码/config 里核对。
+  \item pixel-space flow head 的具体参数规模、是否共享 transformer 层、unpatchify 细节，需要看官方实现。
+  \item 如果把 Tuna-2 接上 RL 后训练，例如 visual reward / GenEval reward / editing reward，pixel-space trajectory 的 credit assignment 会不会比 latent-space 更难？
+  \item 视频版 Tuna-2 是否可行：pixel-space video token 会非常贵，可能必须结合 patch compression、streaming attention 或 learned downsampling。
+  \item 与 BAGEL 的真正公平对比需要控制参数量、数据量、训练 compute；当前表里 BAGEL 是 14B，Tuna-2 是 7B，不能直接下“谁更强”的结论。
+\end{itemize}
+
+\subsection{11. 后续阅读顺序}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{先读 Tuna 原文：} 理解 VAE + representation encoder 的统一表示设计，再看 Tuna-2 去模块化的动机。
+  \item \textbf{再读 JiT / PixelFlow：} 补齐 pixel-space flow matching 为什么可行。
+  \item \textbf{对照 BAGEL：} 重点比较 MoT 分路 vs encoder-free 单 transformer，二者对任务冲突的处理完全不同。
+  \item \textbf{看官方代码：} 核对 patch embedding、masking schedule、flow head、resolution bucket 和 inference 参数。
+\end{itemize}

@@ -1,0 +1,328 @@
+% ============================================================
+% Paper deep reading: Wan-Image
+% ============================================================
+
+\section{论文精读：Wan-Image}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2604.19858}{Wan-Image: Pushing the Boundaries of Generative Visual Intelligence}\\
+\textbf{作者/机构：} Wan Team, Alibaba Group\\
+\textbf{时间：} arXiv v2, 2026-04-23；报告日期：2026-04-27；阅读日期：2026-04-29\\
+\textbf{方向标签：} Image Generation、Image Editing、MLLM Planner、DiT Visualizer、4-channel VAE、Cascade RL、4K Refiner\\
+\textbf{模型卡：} Wan2.7-Image；\href{https://create.wan.video/generate/image/generate?model=wan2.7-pro}{create.wan.video}
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+Wan-Image 不是一篇“提出单个新模块”的论文，而是一份完整的工业级图像生成系统报告。它的目标不是证明某个纯架构假设，而是把图像模型从 casual image synthesizer 推向 professional productivity tool：复杂文字、身份保持、多图编辑、连续图组、透明 alpha、极端长宽比和 4K 输出都被当成一等能力来设计。
+
+\begin{summarybox}
+\textbf{我的判断：} Wan-Image 的核心价值在于系统工程路线：强 MLLM Planner 负责理解、路由和 prompt planning，DiT Visualizer 负责高保真生成，4-channel VAE 解决文字/透明图层/高频细节，Prompt Enhancer 和 Image Refiner 把用户意图与最终生产质量再拉一遍，Cascade RL 负责偏好和设计质量对齐。这篇不适合只读成“又一个 DiT”，而应该读成“专业视觉生产模型需要哪些基础设施”。
+\end{summarybox}
+
+\subsection{1. 它想解决什么问题}
+
+论文开场的判断很直接：当前图像生成模型已经能做高审美图片，但还经常卡在生产工作流中的硬约束：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{复杂 typography：} 长文本、多行排版、海报和信息图中的文字仍容易错字、粘连或布局不稳。
+  \item \textbf{严格 controllability：} 真实设计任务要求空间、逻辑、颜色、风格、身份和局部编辑都可控。
+  \item \textbf{identity preservation：} 多参考主体、多图编辑、图组生成中，人物和物体身份不能漂移。
+  \item \textbf{生产格式：} 电商、游戏、设计素材需要透明 alpha、极端长宽比和 2K--4K 质量，而不是单张 1K 美图。
+\end{itemize}
+
+因此 Wan-Image 的问题定义不是“如何提升文生图平均美感”，而是：
+
+\begin{intubox}
+如何把 MLLM 的语义理解、任务规划能力，与 DiT 的高质量像素合成能力，组合成一个面向专业生产的统一视觉生成系统？
+\end{intubox}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\linewidth]{wan_image/wan_image_fig1_eval_radar.pdf}
+  \caption{Wan-Image 的综合人评雷达图。论文用 T2I/general editing 的 Win Score，以及 interactive editing/image series 的 Pass Rate 来展示能力覆盖。读这张图时要注意：Wan-Image 的卖点不是单项 benchmark，而是专业任务面上的覆盖，包括文字、身份、编辑、图组和设计场景。图源：arXiv source。}
+\end{figure}
+
+\subsection{2. 系统总览：Planner + Visualizer}
+
+Wan-Image 的整体结构可以简化成：
+
+\[
+\begin{aligned}
+\text{User Intent}
+&\rightarrow \text{MLLM Planner}
+\rightarrow \text{Prompt / Plan}\\
+&\rightarrow \text{DiT Visualizer}
+\rightarrow \text{Image Refiner}
+\end{aligned}
+\]
+
+其中 Planner 与 Visualizer 不是简单串两个黑盒。论文称其采用 unified Transformer architecture：理解分支是 decoder-only Transformer，生成分支是 Rectified Flow 下训练的 DiT；二者在统一框架里对齐表示，并在训练上采用 decoupled strategy：先训练理解分支，再用理解分支初始化生成分支的 attention weights，新引入模块随机初始化。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{wan_image/wan_image_fig3_framework.pdf}
+  \caption{Wan-Image 架构。重点看三层耦合：MLLM Planner 负责理解、推理和任务路由；DiT Visualizer 负责生成；VAE token、ViT token 和 text token 通过结构化 attention 组织。它不是 Tuna-2 那类 encoder-free 设计，而是更偏工业系统的 MLLM + ViT + VAE + DiT 组合。图源：arXiv source。}
+\end{figure}
+
+\subsubsection{2.1 Attention 与 token 组织}
+
+论文里有几个关键设计：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{文本、ViT token、VAE token 之间用结构化 attention mask：} 文本侧保持 auto-regressive 生成，视觉 token 内部使用 bidirectional attention。
+  \item \textbf{图组生成时，多个图片的视觉 token 之间也启用 bidirectional attention：} 这服务于 image series 的身份一致性和风格连贯性。
+  \item \textbf{编辑任务里输入图像的 clean VAE tokens 作为条件输入：} clean tokens 的 timestep 显式设为 0，类似 teacher-forcing 的确定性条件；noised VAE tokens 则走生成分支。
+  \item \textbf{位置编码分流：} 理解分支使用 MRoPE，生成分支使用 3D-RoPE，把 \(T,H,W\) 三个维度分开编码，并在 text/image segments 之间加固定 temporal offset 作为语义边界。
+\end{itemize}
+
+这里的重点是：Wan-Image 并不追求“把所有东西压成一个最纯的 token stream”。它更像把每种生产能力所需的 inductive bias 都保留下来，再通过统一 Transformer 和训练流程让它们协同。
+
+\subsection{3. 4-channel VAE：为什么它还需要 VAE}
+
+这篇和 Tuna-2 的立场几乎相反。Tuna-2 问的是“能否去掉 VAE 和 vision encoder”；Wan-Image 则认为，在生产级图像系统里，VAE 的质量直接决定生成上限，尤其是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 小字号文字、密集排版、文档区域；
+  \item 复杂纹理、细边界和高频局部结构；
+  \item 透明 PNG、半透明边缘、图层素材和电商资产。
+\end{itemize}
+
+Wan-Image 提出 high-fidelity four-channel VAE，同时建模 RGB 和 alpha。结构上先做 \(2\times2\) patchify，再经过 \(8\times8\) spatial downsampling，总压缩率是 \(16\times16\)，latent dim 为 48。训练上采用三阶段：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \(256\times256\) 低分辨率训练，先稳定透明内容和基本结构。
+  \item mixed-resolution 训练，增强多尺度泛化。
+  \item 加入 4-channel GAN discriminator，提升锐度、透明边界和整体一致性。
+\end{enumerate}
+
+此外它还加入 semantic distillation，让 latent 不只保重建像素，也携带更强语义信息。论文报告的重建结果：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.36\linewidth} p{0.20\linewidth} p{0.16\linewidth} p{0.16\linewidth}}
+\toprule
+\textbf{设置} & \textbf{PSNR} & \textbf{SSIM} & \textbf{LPIPS}\\
+\midrule
+RGB, 512p, 5K images & 35.429 & 0.958 & 0.010\\
+RGBA, 1080p, 500 images & 38.274 & 0.970 & 0.018\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+\textbf{和 Tuna-2 的区别：} Tuna-2 去掉 VAE 是为了验证 pixel-space unified modeling 的可行性；Wan-Image 保留并强化 VAE，是因为专业生产要可控、高清、可编辑、可透明合成。二者回答的问题不同，不能简单说谁路线更先进。
+\end{warnbox}
+
+\subsection{4. 数据引擎：真正的护城河}
+
+Wan-Image 把数据系统写得很重。数据覆盖理解和生成两大部分。
+
+\subsubsection{4.1 理解数据}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{General understanding data：} 文本和图文 QA，过滤、平衡、用 LLM/MLLM 重写低质量答案，并构造带 \texttt{<think>} 的 reasoning supervision。
+  \item \textbf{Text-proxy data：} 为 interleaved generation 构造密集视觉 prompt。每个要生成的图片位置用 \texttt{<BOI>} 标记，视觉描述放在 \texttt{<imagine>} 与 \texttt{</imagine>} 内。
+  \item \textbf{User-aligned query set：} 用 MLLM 按任务类型、难度、是否需要数值/逻辑推理、是否纯 VQA 等属性标注真实用户 query，再按规则采样，提升实用性。
+\end{itemize}
+
+\subsubsection{4.2 生成数据}
+
+生成任务覆盖：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item T2I：支持长文本渲染和最高 1:8 的极端长宽比。
+  \item I2I：编辑、参考生成、多图条件，最多支持 9 张输入图。
+  \item T2S / TI2S：一次生成最多 12 张图，强调视觉一致性和逻辑进展。
+\end{itemize}
+
+数据获取不是普通 web scrape，而是 multi-modal retrieval + annotation + cleaning 的闭环：支持 image-to-image、多图检索、text-to-image、图文混合和 batch retrieval，并用 cluster-based diversity re-ranking 控制多样性。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.88\linewidth]{wan_image/wan_image_fig2_data_taxonomy.pdf}
+  \caption{Wan-Image 的 structured data taxonomy。它先把图片路由到 photorealistic、non-photorealistic、text-centric、charts、multi-image compositions 五类，再按类别挂载不同属性维度。这个设计服务于两个目标：减少数据分布偏斜，并让模型学会专业任务需要的细粒度约束。图源：arXiv source。}
+\end{figure}
+
+\subsubsection{4.3 Annotation 与过滤}
+
+论文的数据过滤 operator 包括五类：image feature extraction、aesthetic quality、AI-generated content detection、low-level information、overall image quality。具体例子包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item compression artifact ratio：用理论未压缩大小和实际文件大小的比例判断过压缩。
+  \item edge pixel variance：过滤大面积纯色背景和有效信息低的图片。
+  \item JPEG bits-per-pixel：作为结构复杂度 proxy，过滤低信息密度样本。
+  \item artificiality score：过滤明显 AI 生成或不真实图。
+  \item watermark / greasy texture detection：提升数据可用性和真实感。
+\end{itemize}
+
+caption 也分三层：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item raw captions：保留网页 alt-text、tag、标题等噪声弱监督。
+  \item natural language captions：用 MLLM 生成多粒度自然语言描述。
+  \item structured JSON captions：按类别填 25 个左右属性维度，再由 MLLM 重写成细节丰富的自然语言。
+\end{itemize}
+
+\subsection{5. Prompt Enhancer 与 Image Refiner}
+
+\subsubsection{5.1 Prompt Enhancer}
+
+Prompt Enhancer 是 Wan-Image 很工程化但很关键的一层。它不是单纯扩写 prompt，而是把用户意图翻译成更适合生成模型执行的设计 brief。
+
+PE 有两个版本：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Non-CoT：} 基于 Qwen3-VL-2B，输出约 400--600 tokens，面向低延迟，推理约 1 秒。
+  \item \textbf{CoT：} 基于 Qwen3-VL-30B-A3B，输出约 1500--2000 tokens，显式做设计推理、元素扩展和空间布局规划。
+\end{itemize}
+
+它覆盖 T2I、I2I、T2S、TI2S。对 reference-guided I2I/TI2S，PE 输出 common 和 difference 两个字段：common 描述应保持不变的主体、身份或风格，difference 描述要修改的部分。这个拆分很重要，因为真实编辑任务的难点往往不是“改什么”，而是“什么绝对不能改”。
+
+PE 的训练是 SFT + RL，RL 阶段使用 GRPO，reward 评估 intent fidelity、descriptive richness、linguistic accuracy。论文还提到 prompt rewriting 不是所有任务都强制开启，而是对文字渲染、海报、信息图、UI、storyboard、技术图解、逻辑推理等复杂类别选择性启用。
+
+\subsubsection{5.2 Image Refiner}
+
+Image Refiner 用在 DiT 输出之后，目标是把输出推到 2K--4K，并修复局部缺陷。它有两种模式：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{repair mode：} 输入生成图和详细 prompt，修复错字、噪声、局部 artifact。
+  \item \textbf{high-fidelity mode：} 用在 identity preservation，尽量减少结构和身份漂移。
+\end{itemize}
+
+训练时用 blur、noise、lossy compression，以及 diffusion forward-noising/denoising 构造退化输入；之后再用 distillation 和 RL 优化效率与质量。
+
+\subsection{6. 训练流程}
+
+Wan-Image 的训练分为理解、生成、RL、distillation 四段。
+
+\subsubsection{6.1 理解训练}
+
+理解部分从 Qwen-VL base model 初始化，三阶段：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Understanding CT：} 46K steps，0.1T tokens，混合图文理解和纯文本数据，保留语言推理能力。
+  \item \textbf{Understanding \& Multi-task SFT：} 10K steps，0.033T tokens，用 understanding data 和 text-proxy data 联合训练，让模型能把用户输入转成生成指导。
+  \item \textbf{On-policy multi-teacher distillation：} 0.4K steps，面向真实用户 query，用不同 teacher 迁移不同输入类别的处理能力。
+\end{itemize}
+
+\subsubsection{6.2 生成训练}
+
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{0.13\linewidth} p{0.13\linewidth} p{0.15\linewidth} p{0.20\linewidth} p{0.24\linewidth}}
+\toprule
+\textbf{阶段} & \textbf{Steps} & \textbf{Tokens} & \textbf{Resolution} & \textbf{Ratio}\\
+\midrule
+PT & 713K & 13.27T & 192 / 320 / 640 & 7:3, T2I/I2I\\
+CT & 223K & 8.85T & 512--2048 & 7:2:0.5:0.5\\
+SFT & 13K & 0.62T & 512--2048 & curated mix\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+读法很清楚：PT 先靠大规模低中分辨率数据学通用生成；CT 把分辨率拉到 512--2048，并加入 T2S/TI2S，比例为 T2I:I2I:T2S:TI2S = 7:2:0.5:0.5；SFT 用更少但更干净的数据提升审美、细节和指令遵循。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\linewidth]{wan_image/wan_image_fig5_training_stages.pdf}
+  \caption{PT、CT、SFT 阶段输出对比。论文想表达的是训练阶段的职责分工：PT 学基本生成，CT 补高分辨率和复杂条件，SFT 强化美学和局部细节。图源：arXiv source。}
+\end{figure}
+
+\subsubsection{6.3 Cascade RL}
+
+RL 阶段是这篇和你后训练专区连接最强的部分。Wan-Image 构造 domain-wise preference data，确保 RL prompts 与 SFT prompts 互斥，避免记忆式高 reward。reward model 不是只看 held-out validation，而是额外构造更广泛的 reward benchmark 来降低 preference overfitting。
+
+Cascade RL 组合了：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item DPO；
+  \item ReFL；
+  \item DenseGRPO；
+  \item in-house ReFMA，即 reinforcement learning with flow matching anchors。
+\end{itemize}
+
+ReFMA 的作用是用 anchor-based control 在不同 noise levels 之间平衡优化目标，同时使用 reward model 的梯度信号指导 policy optimization。论文报告 Cascade RL 相比 SFT baseline 在不同场景下 Win Score 提升约 15\%--50\%，主要改善 photorealism、structural correctness、text rendering、aesthetic quality，以及 I2I 的一致性与和谐度。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\linewidth]{wan_image/wan_image_fig4_rl_framework.pdf}
+  \caption{Cascade RL 框架和相对 SFT baseline 的提升。这里值得和 DenseGRPO / Flow-GRPO 主线对照：Wan-Image 并没有只押一个 RL 算法，而是把 DPO、ReFL、DenseGRPO、ReFMA 作为级联偏好对齐工具箱。图源：arXiv source。}
+\end{figure}
+
+\subsubsection{6.4 Distillation}
+
+最后做 step distillation，目标是降低 NFE 和交互延迟。论文采用 multi-stage progressive distillation，结合 trajectory distillation 和 distribution matching distillation，声称在保持生成 fidelity 的同时带来超过 \(8\times\) 的 speedup。这里的关键是生产约束：如果不能快，4K 和交互编辑的体验会很难落地。
+
+\subsection{7. 结果怎么读}
+
+论文报告的核心结果包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{人评：} 整体超过 Seedream 5.0 Lite 和 GPT Image 1.5，在困难任务上接近 Nano Banana Pro。
+  \item \textbf{交互编辑和图组生成：} pass rate 大约 80\%，强调真实工作流可用性。
+  \item \textbf{理解能力：} Ours Thinking 在 7 个 image understanding benchmark 的平均分为 76.3，高于很多 unified models；text understanding 平均也高于其 instruct mode。
+  \item \textbf{VAE：} RGB/RGBA 重建指标优于或接近强 baseline，尤其强调 \(16\times16\) 高压缩下的细节与 alpha。
+  \item \textbf{RL：} Cascade RL 对 SFT baseline 有 15\%--50\% Win Score 提升。
+\end{itemize}
+
+但要谨慎：这篇没有给出完全可复现的开放训练配方，也没有把所有模块做严格公开 ablation。很多结论来自系统级人评和质性展示，适合判断产品能力和工程方向，不适合直接当作单一算法的严格因果证明。
+
+\subsection{8. 与 Tuna-2 / BAGEL 的关系}
+
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{0.15\linewidth} p{0.25\linewidth} p{0.23\linewidth} p{0.25\linewidth}}
+\toprule
+\textbf{模型} & \textbf{视觉表示} & \textbf{生成路径} & \textbf{核心取舍}\\
+\midrule
+Tuna-2 & pixel embeddings；无 VAE/ViT & pixel-space flow & 架构假设更激进，证明 encoder-free scaling；生成侧未必最强。\\
+BAGEL & SigLIP + VAE latent & Flow Matching + MoT & 理解/生成分路，强调 native unified。\\
+Wan-Image & ViT + VAE + MLLM Planner & DiT + Refiner & 工业系统路线，保留并强化视觉先验，服务专业生产约束。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Wan-Image 说明一个很现实的点：即使 encoder-free/pixel-space 是很有研究价值的方向，生产级图像系统仍可能选择强 VAE、强 ViT、强 MLLM、强 refiner 的组合。因为业务目标不是架构纯度，而是文字、身份、透明图层、编辑和 4K 交付的稳定性。
+
+\subsection{9. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{不可复现：} 数据规模、过滤器、reward model、teacher model 和私有标注流程都高度闭源。
+  \item \textbf{系统归因困难：} 最终质量来自 PE、Planner、VAE、DiT、Refiner、RL、distillation 多模块叠加，很难知道单个模块贡献。
+  \item \textbf{人评标准不透明：} Win Score 和 Pass Rate 有参考意义，但任务分布、标注一致性和失败样例覆盖仍需更细披露。
+  \item \textbf{PE 可能改变用户意图：} prompt rewriting 提升美学和细节，但也可能把原始需求过度设计化。
+  \item \textbf{RL 可能强化审美模式：} Cascade RL 会提升人类偏好分数，但也可能收缩风格多样性或偏向 reward model 的偏好。
+  \item \textbf{4K 质量部分依赖 refiner：} 需要区分 base generation capability 和 post-refinement capability。
+\end{itemize}
+
+\subsection{10. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{生产级指标先行：} 文字、身份、alpha、图组、局部编辑、极端比例，比普通 aesthetic prompt 更能暴露模型短板。
+  \item \textbf{common/difference 编辑表示：} 对 reference editing 很实用，明确“保留什么”和“修改什么”。
+  \item \textbf{数据 taxonomy + structured JSON caption：} 对图像生成训练比单纯自然语言 caption 更可控，尤其适合长尾任务。
+  \item \textbf{RL 不是单算法：} 可以把 DPO、ReFL、DenseGRPO、flow-matching anchor 类方法按领域级联，而不是期待一个 reward objective 解决所有偏好。
+  \item \textbf{VAE 仍有战略价值：} 如果目标是透明图层、小字、文档和 4K，专用 VAE 的工程价值很高。
+\end{itemize}
+
+\subsection{11. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item ReFMA 的具体 objective、anchor 设计和与 DenseGRPO 的衔接，论文没有完全展开，需要等技术细节或代码。
+  \item unified Transformer 中 dedicated experts 的参数共享边界、attention 共享方式和推理时调度细节，需要进一步核对。
+  \item Prompt Enhancer 的选择性触发规则是否会导致用户意图漂移，最好看更多实际案例。
+  \item Refiner 对身份保持和文字修复的失败模式还不清楚，尤其是是否会在高分辨率增强时改动关键内容。
+  \item 与 Nano Banana Pro、GPT Image 1.5、Seedream 的公平对比需要更透明的 prompt 集和人评协议。
+\end{itemize}
+
+\subsection{12. 后续阅读顺序}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{先对照 Wan2.2 / Wan video：} 看 Wan 系列的 VAE、DiT 和视频生成技术如何迁移到 image。
+  \item \textbf{再读 DenseGRPO / Flow-GRPO / ReFL：} 补齐 Cascade RL 背后的偏好对齐工具。
+  \item \textbf{对照 Tuna-2：} 前者看 encoder-free pixel scaling；后者看 VAE、ViT、MLLM 的生产系统栈。
+  \item \textbf{对照 BAGEL：} 比较 native unified multimodal architecture 与 Wan-Image 的 planner-visualizer 工程路线。
+\end{itemize}

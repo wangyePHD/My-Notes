@@ -1,0 +1,544 @@
+% ============================================================
+% Paper deep reading: TempFlow-GRPO
+% ============================================================
+
+\section{论文精读：TempFlow-GRPO}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2508.04324}{TempFlow-GRPO: When Timing Matters for GRPO in Flow Models}\\
+\textbf{简称：} TempFlow-GRPO。\\
+\textbf{版本：} arXiv 2508.04324v4，submitted on 2025-08-06，last revised on 2025-10-15；OpenReview 为 ICLR 2026 Poster。\\
+\textbf{方向标签：} Flow Matching、GRPO、Temporal Credit Assignment、Trajectory Branching、Noise-aware Weighting。\\
+\textbf{阅读日期：} 2026-04-27。\\
+\textbf{前置：} 已读 DenseGRPO 和 Chunk-GRPO，当前关心“step-level reward 是否必要、chunk 是否只是平滑 credit、如何避免 A+B 式组合”。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+TempFlow-GRPO 最值得关注的点不是“又一个 Flow-GRPO variant”，而是它提出了一种构造 step-level process reward 的新方式：
+
+\[
+\begin{aligned}
+&\text{不是直接给中间 latent 打分}\\
+&\rightarrow\quad
+\text{在某个 timestep 做 controlled branching，}\\
+&\hspace{2.2em}\text{再用最终 reward 反推该 step 的贡献}
+\end{aligned}
+\]
+
+它的核心动作是：
+
+\[
+\begin{aligned}
+\text{ODE 到 } x_k
+&\rightarrow
+\text{只在 } k \text{ 做一次 SDE 探索}\\
+&\rightarrow
+\text{ODE 到 } x_0
+\rightarrow
+\text{用最终 reward 归因给 } k
+\end{aligned}
+\]
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇比 Chunk-GRPO 更直接地回答了我们刚才的问题：\key{每个 step 的 reward 可以不靠中间 reward model，而靠 controlled intervention + final reward 构造出来。} DenseGRPO 是“从中间 latent 垂直 readout”；TempFlow-GRPO 是“在指定时刻水平分叉探索，再把最终差异归因给分叉点”。
+\end{summarybox}
+
+\subsection{1. 它要解决什么}
+
+Flow-GRPO / Dance-GRPO 的基本问题是：
+
+\[
+\hat{A}_t^i
+=
+\frac{
+R(x_0^i,c)-\mathrm{mean}(\{R(x_0^g,c)\}_{g=1}^G)
+}{
+\mathrm{std}(\{R(x_0^g,c)\}_{g=1}^G)
+}
+\]
+
+这里 \(\hat{A}_t^i\) 实际上没有真正的 \(t\)-specific 信息。它虽然写成 \(\hat{A}_t^i\)，但 reward 来自最终 \(x_0\)，所以整条 trajectory 的所有 timesteps 基本共用同一个 terminal advantage。
+
+TempFlow-GRPO 指出这有两个问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{sparse terminal reward：} 只知道最终结果好坏，不知道哪个 timestep 的探索带来提升。
+  \item \textbf{temporal uniformity：} 所有 timesteps 被等权优化，但生成过程里不同时间点的探索能力不同。
+\end{enumerate}
+
+作者先做了一个关键观察：只在某一个 denoising step 上引入 SDE stochasticity，其余地方都用 ODE，最后看 PickScore 的 reward std。结果显示 early steps 的 reward variance 最大，late steps 接近 0。
+
+\begin{center}
+  \includegraphics[width=0.46\linewidth]{tempflowgrpo/fig2_left_reward_variance.png}
+  \hfill
+  \includegraphics[width=0.46\linewidth]{tempflowgrpo/fig2_right_branching.png}
+
+  {\small \textbf{图 1：} TempFlow-GRPO 的动机。左图：只在单个 timestep 注入 SDE 噪声后，reward variance 在 early steps 最大。右图：从确定性 ODE 轨迹上分叉出 stochastic branch，并把最终 reward 差异归因给分叉点。图源：arXiv HTML。}
+\end{center}
+
+\begin{summarybox}
+\textbf{这张图很重要：} 它把“不同 step 贡献不同”从直觉变成了一个可实验测量的问题。早期 step 的随机扰动会显著改变最终 reward，说明早期确实承担结构性探索；后期 step 的扰动影响小，更像细节 refinement。
+\end{summarybox}
+
+\subsection{2. 方法一：Trajectory Branching}
+
+\subsubsection{2.1 为什么不直接训练 process reward model}
+
+传统 process reward 的想法是直接评价中间状态 \(x_t\)。但在 diffusion / flow 模型里，中间 latent 或 partially-denoised image 很难被 reward model 稳定理解：
+
+\[
+x_t \quad \text{semantic ambiguous}
+\]
+
+所以 TempFlow-GRPO 换了一个角度：不评价 \(x_t\) 本身，而是做一个 intervention：
+
+\[
+\text{如果只在 } t=k \text{ 这个点探索，最终 reward 会怎么变？}
+\]
+
+这就把问题从“中间状态评分”变成“受控分叉后的最终结果评分”。
+
+\subsubsection{2.2 Branching 的定义}
+
+先从初始噪声 \(x_T\) 出发，用 ODE 确定性走到指定 timestep \(k\)：
+
+\[
+x_T \xrightarrow{\mathrm{ODE}} x_k
+\]
+
+然后只在 \(k\) 这个点引入一次 SDE stochasticity：
+
+\[
+x_{k-1}
+=
+\mathrm{SDE}(x_k,\epsilon)
+\]
+
+最后从 \(x_{k-1}\) 到 \(x_0\) 全部用 ODE 确定性完成：
+
+\[
+x_0
+=
+\mathrm{ODE}^{k-1}(x_{k-1})
+\]
+
+所以第 \(i\) 个 branch 的最终可评分样本是：
+
+\[
+\tilde{x}_{0,k}^i
+=
+\mathrm{ODE}^{k-1}
+\left(
+\mathrm{SDE}(x_k^i,\epsilon^i)
+\right)
+\]
+
+对应 reward 是：
+
+\[
+R_k^i
+=
+R(\tilde{x}_{0,k}^i,c)
+=
+R\left(
+\mathrm{ODE}^{k-1}
+\left(
+\mathrm{SDE}(x_k^i,\epsilon^i)
+\right),
+c
+\right)
+\]
+
+然后用同一个 \(k\) 下多个 branches 的 reward 做 group normalization：
+
+\[
+\hat{A}_k^i
+=
+\frac{
+R_k^i-\mathrm{mean}(\{R_k^g\}_{g=1}^{G})
+}{
+\mathrm{std}(\{R_k^g\}_{g=1}^{G})+\epsilon
+}
+\]
+
+\begin{summarybox}
+\textbf{关键理解：} 这个 \(\hat{A}_k^i\) 不是 DenseGRPO 的 \(\Delta R_k=R_{k-1}-R_k\)。它衡量的是：在相同 \(x_k\) 附近，不同 stochastic branch 最终会产生怎样的 reward 差异。因此它更像 \key{branch-level counterfactual advantage}。
+\end{summarybox}
+
+\subsubsection{2.3 为什么它能做 credit localization}
+
+因为除了 \(k\) 这个点之外，其余路径都被 ODE 固定住了。也就是说，在同一个 initial noise 和 prompt 下，如果多个 branches 最后 reward 不同，差异主要来自：
+
+\[
+\epsilon_k
+\quad \text{at branching timestep } k
+\]
+
+这就是它所谓的 credit localization：
+
+\[
+\text{reward variation}
+\quad \Rightarrow \quad
+\text{branching action at } k
+\]
+
+这和 DenseGRPO 有本质区别：
+
+\[
+\text{DenseGRPO：}
+\quad
+x_k \xrightarrow{\mathrm{ODE\ readout}} \hat{x}_0
+\quad
+\text{给 } x_k \text{ 打分}
+\]
+
+\[
+\text{TempFlow-GRPO：}
+\quad
+x_k \xrightarrow{\mathrm{SDE\ branch}} x_{k-1}
+\xrightarrow{\mathrm{ODE}} \hat{x}_0
+\quad
+\text{给 branch action 打分}
+\]
+
+\begin{warnbox}
+\textbf{需要注意：} 它不是证明“第 \(k\) 步独立决定最终 reward”。它只是通过控制变量，让 stochastic difference 只发生在 \(k\)。后续 ODE 仍然会放大、修正或过滤这个差异，所以它更准确的说法是：\key{把探索差异定位到 branching point}，而不是完全因果地分解整条 denoising 链。
+\end{warnbox}
+
+\begin{center}
+  \includegraphics[width=0.90\linewidth]{tempflowgrpo/fig5_framework.png}
+
+  {\small \textbf{图 2：} TempFlow-GRPO 框架图。核心是 ODE-SDE-ODE 的分叉采样：在指定 timestep 注入 stochasticity，之后用最终 reward 形成该 timestep 的 process signal。图源：arXiv HTML。}
+\end{center}
+
+\subsection{3. 方法二：Noise-Aware Policy Weighting}
+
+Trajectory branching 解决的是：
+
+\[
+\text{每个 timestep 的 advantage 怎么来？}
+\]
+
+Noise-aware weighting 解决的是：
+
+\[
+\text{每个 timestep 的更新强度应该一样吗？}
+\]
+
+答案是不应该一样。SDE sampler 在不同 timestep 的噪声注入幅度不同：
+
+\[
+\sigma_t\sqrt{\Delta t}
+\]
+
+早期噪声大，探索空间大；后期噪声小，主要是细节 refinement。作者观察到 reward std 和 noise level 强相关，所以用 noise level 作为 exploration capacity 的 proxy。
+
+修改后的 policy loss 是：
+
+\[
+\mathcal{J}_{\text{policy}}(\theta)
+=
+\frac{1}{G}
+\sum_{i=1}^{G}
+\frac{1}{T}
+\sum_{t=0}^{T-1}
+\mathrm{Norm}(\sigma_t\sqrt{\Delta t})
+\min
+\left(
+r_t^i(\theta)\hat{A}_t^i,
+\mathrm{clip}(r_t^i(\theta),1-\epsilon,1+\epsilon)\hat{A}_t^i
+\right)
+\]
+
+这里的 \(\mathrm{Norm}(\sigma_t\sqrt{\Delta t})\) 会被归一化，使所有 timestep 权重均值为 1。这样总 loss scale 不变，但不同时间点的相对优化强度改变。
+
+\begin{center}
+  \includegraphics[width=0.46\linewidth]{tempflowgrpo/fig6_noise_reward_correlation.png}
+  \hfill
+  \includegraphics[width=0.46\linewidth]{tempflowgrpo/fig6_scale_term.png}
+
+  {\small \textbf{图 3：} 左：noise level 和 reward std 的相关性。右：标准 GRPO 的 scale term 与 noise-aware reweighting 后的 scale term 对比。图源：arXiv HTML。}
+\end{center}
+
+\subsubsection{3.1 理论推导在说明什么}
+
+论文从 policy gradient 写起：
+
+\[
+\nabla_\theta \mathcal{J}(\theta)
+=
+\sum_{k=0}^{T-1}
+\mathbb{E}
+\left[
+\nabla_\theta
+\log p_\theta(x_{k-1}|x_k)
+\hat{A}_k
+\right]
+\]
+
+标准形式下，推导出的 timestep scale term 近似为：
+
+\[
+\sqrt{\frac{\Delta k(1-k)}{k}}
+\]
+
+加入 noise-aware reweighting 后，scale term 变成：
+
+\[
+\Delta k
+\]
+
+作者的解释是：标准 GRPO 的梯度贡献和真实 exploration capacity 不匹配，会让低噪声 refinement steps 在优化里占不合理的比重；noise-aware weighting 后，各 timestep 的梯度贡献更接近均衡。
+
+\begin{summarybox}
+\textbf{这里的重点不是“早期一定更大越好”。} 更准确地说，TempFlow-GRPO 想让优化强度匹配每个 timestep 的探索空间。早期有结构性探索，不能被低估；后期是细节修复，不能被过度扰动。
+\end{summarybox}
+
+\subsection{4. 方法三：Seed Group}
+
+Trajectory branching 要比较不同 branches 的 reward。如果这些 branches 的初始噪声也不同，那 reward 差异会混入 initial noise 的影响，不能干净地归因到 branching point。
+
+所以作者提出 seed group：
+
+\[
+\text{same prompt}
+\quad + \quad
+\text{same initial noise}
+\quad + \quad
+\text{different branch noise at } k
+\]
+
+这样 group 内 reward variance 更接近来自指定 timestep 的 exploration，而不是来自不同 \(x_T\) 的初始化差异。
+
+实验配置里总 group size 保持为 24，默认是：
+
+\[
+4\ \text{initial seeds}
+\times
+6\ \text{branches}
+=
+24
+\]
+
+\begin{summarybox}
+\textbf{这点对我们很有启发：} 如果要研究 credit assignment，group 的构造本身就是方法的一部分。不是随便采 \(G\) 条 trajectory，而是要控制住 prompt、initial noise、branching point，才能让 reward 差异有可解释性。
+\end{summarybox}
+
+\subsection{5. 实验结果}
+
+\subsubsection{5.1 GenEval}
+
+在 GenEval 上，论文报告：
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+方法 & step & overall & 备注 \\
+\midrule
+SD3.5-M base & - & 0.63 & base flow model \\
+Flow-GRPO & 3800 & 0.88 & 同步数对比 \\
+Flow-GRPO & 5600 & 0.95 & 更长训练 \\
+TempFlow-GRPO & 3800 & 0.97 & 最优 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+论文还说 TempFlow-GRPO 约 2000 steps 就达到 0.95，而 Flow-GRPO 需要约 5600 steps。
+
+\subsubsection{5.2 PickScore 和 FLUX}
+
+在 PickScore benchmark 上：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 相比原始 Flow-GRPO，TempFlow-GRPO 大约提升 1.7\%。
+  \item 相比改进后的 Flow-GRPO Prompt baseline，大约提升 1.0\%。
+  \item 只需 100--200 training steps 就能达到 Flow-GRPO 的水平，300--400 steps 达到 Flow-GRPO Prompt 的水平。
+\end{itemize}
+
+在 FLUX.1-dev + HPSv3 上：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 约 80 steps 达到 Flow-GRPO 300 steps 的性能。
+  \item Appendix 报告 300 steps 后相比 Flow-GRPO 约有 0.3 的性能提升。
+  \item KL loss 更低、更稳定。
+\end{itemize}
+
+\subsubsection{5.3 和 DanceGRPO 的比较}
+
+Appendix 里还和 DanceGRPO 做了比较。论文报告：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item DanceGRPO 300 iterations 后 HPSv2 约 37.2。
+  \item TempFlow-GRPO 280 iterations 达到 38.5。
+  \item TempFlow-GRPO 约 150 iterations 就匹配 DanceGRPO 300 iterations 的最终效果，相当于约 \(2\times\) convergence speedup。
+\end{itemize}
+
+\subsubsection{5.4 Ablation}
+
+\begin{center}
+  \includegraphics[width=0.31\linewidth]{tempflowgrpo/fig9_branch_ablation.png}
+  \hfill
+  \includegraphics[width=0.31\linewidth]{tempflowgrpo/fig9_pickscore_ablation.png}
+  \hfill
+  \includegraphics[width=0.31\linewidth]{tempflowgrpo/fig9_geneval_ablation.png}
+
+  {\small \textbf{图 4：} TempFlow-GRPO 的 ablation。左：不同 seed/branch 组合。中/右：trajectory branch、noise-aware weighting、seed group 的贡献。图源：arXiv HTML。}
+\end{center}
+
+几个关键结论：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 在总 group size 固定为 24 时，比较了 \(2\times 12\)、\(4\times 6\)、\(6\times 4\)。
+  \item 更多 initial noises 有利于 early training 的快速提升。
+  \item 更多 branches 在训练后期更好，因为同一个 branching point 下的探索比较更充分。
+  \item 最终默认选择 \(4\times 6\)，平衡 initial diversity 和 branch comparison。
+  \item 在 GenEval 上，noise-aware policy reweighting 从 0.82 提升到 0.92；trajectory branch 约带来 5\% gain；seed group 约带来 2\% gain。
+\end{itemize}
+
+\subsection{6. 成本问题}
+
+TempFlow-GRPO 并不是免费午餐。由于每个 timestep 要做 \(K\)-branch exploration，采样成本高于 Flow-GRPO。论文在 Appendix A.6 里给了一个估计：
+
+\[
+K=10
+\quad \Rightarrow \quad
+\text{average branch factor}
+\approx
+\frac{9+\cdots+1}{10}
+=
+4.5
+\]
+
+也就是说，单个样本的采样过程可能比 Flow-GRPO 更贵。但论文认为它整体训练效率更高，因为 convergence 更快；在高分辨率任务上达到 Flow-GRPO 最终性能只需要约 33\%--50\% 的训练时间。
+
+\begin{center}
+  \includegraphics[width=0.46\linewidth]{tempflowgrpo/fig14_training_time_geneval.png}
+  \hfill
+  \includegraphics[width=0.46\linewidth]{tempflowgrpo/fig14_training_time_pickscore.png}
+
+  {\small \textbf{图 5：} 训练时间对比。TempFlow-GRPO 单次采样更贵，但由于收敛更快，达到同等性能的 wall-clock time 更低。图源：arXiv HTML。}
+\end{center}
+
+\begin{warnbox}
+\textbf{我的看法：} 这里的成本叙事要谨慎。TempFlow-GRPO 的优势是 \key{sample efficiency / convergence speed}，不是单步计算便宜。对图像任务这个 tradeoff 可能成立；但如果迁移到视频模型，多 branch 采样、decode、reward evaluation 的成本会被放大，需要重新评估。
+\end{warnbox}
+
+\subsection{7. 和 DenseGRPO / Chunk-GRPO 的关系}
+
+\begin{center}
+{\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{0.20\linewidth}p{0.25\linewidth}p{0.22\linewidth}p{0.22\linewidth}}
+\toprule
+方法 & reward / advantage & 更新粒度 & 核心代价 \\
+\midrule
+DenseGRPO & 对每个 \(x_t\) ODE readout，计算 \(\Delta R_t\) & step-level & full ODE readout 接近 \(O(T^2)\) \\
+Chunk-GRPO & 主要仍用 terminal \(A_i\) & chunk-level ratio & credit 仍不是真正 chunk-specific \\
+TempFlow-GRPO & ODE-SDE-ODE branch 后用最终 reward 得到 \(\hat{A}_k\) & step-level with temporal weighting & 多 branch exploration 成本高 \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+三篇论文其实给了三种不同的 credit assignment 路径：
+
+\[
+\text{DenseGRPO：}
+\quad
+\text{readout-based local improvement}
+\]
+
+\[
+\text{Chunk-GRPO：}
+\quad
+\text{chunk-level optimization granularity}
+\]
+
+\[
+\text{TempFlow-GRPO：}
+\quad
+\text{branching-based counterfactual advantage}
+\]
+
+\begin{summarybox}
+\textbf{新的认识：} step-level reward 不一定只能来自 \(\Delta R_t=R_{t-1}-R_t\)。还可以通过 controlled branching 构造：固定其他路径，只在一个 timestep 注入探索，再用最终 reward 差异反推该 timestep 的 advantage。
+\end{summarybox}
+
+\subsection{8. 局限与疑问}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{它不是 DenseGRPO 式 improvement。} TempFlow-GRPO 的 \(R_k^i\) 是 branch outcome reward，不是相邻状态差分 \(R_{k-1}-R_k\)。因此它回答的是“在 \(k\) 探索会导致什么最终结果”，不是“从 \(x_k\) 到 \(x_{k-1}\) 本身让 reward 提升了多少”。
+  \item \textbf{credit localization 依赖 controlled setup。} 如果初始 noise、prompt、ODE remainder 没控制好，reward 差异就不再只来自 branch noise。
+  \item \textbf{多 branch 成本可能很高。} 对视频生成尤其明显，因为每个 branch 都可能意味着完整后续 ODE、VAE decode 和 reward scoring。
+  \item \textbf{noise-aware weighting 是 proxy。} noise level 和 reward variance 相关，但不等于真实 semantic importance。某些任务里 late-stage detail 或 identity preservation 也可能很关键。
+  \item \textbf{仍然依赖 outcome reward model。} 如果最终 reward model 本身偏了，branch advantage 也会跟着偏。
+\end{enumerate}
+
+\subsection{9. 对我们后续思考的启发}
+
+这篇读完之后，我们可以把当前问题改得更深一点：
+
+\[
+\text{credit assignment 的单位是什么？}
+\]
+
+现在不只是 step vs chunk，还多了一个维度：
+
+\[
+\text{credit signal 是 readout difference，还是 controlled branching difference？}
+\]
+
+也就是说，未来方法不一定只是：
+
+\[
+\text{Chunk-GRPO} + \text{DenseGRPO}
+\]
+
+更有意思的方向可能是：
+
+\[
+\text{temporal segment}
+\quad + \quad
+\text{controlled branching}
+\quad + \quad
+\text{low-cost readout}
+\]
+
+例如，对一个 segment \([\tau_j,\tau_{j-1}]\)，不是机械做 DenseGRPO 式 boundary readout，也不是简单用 terminal reward，而是做 segment-level intervention：
+
+\[
+x_{\tau_j}
+\xrightarrow{\mathrm{SDE\ segment}}
+x_{\tau_{j-1}}
+\xrightarrow{\mathrm{ODE}}
+\hat{x}_0
+\xrightarrow{R}
+R_{\mathrm{seg}_j}
+\]
+
+然后同一个 segment 下比较多个 branches：
+
+\[
+\hat{A}_{\mathrm{seg}_j}^i
+=
+\frac{
+R_{\mathrm{seg}_j}^i-\mathrm{mean}(\{R_{\mathrm{seg}_j}^g\})
+}{
+\mathrm{std}(\{R_{\mathrm{seg}_j}^g\})+\epsilon
+}
+\]
+
+这会比“Chunk-GRPO + DenseGRPO”更自然，因为它把新问题定义成：
+
+\begin{quote}
+如何在合适的 temporal resolution 上构造可归因的 counterfactual reward signal？
+\end{quote}
+
+\begin{summarybox}
+\textbf{读完要记住的三句话：}
+
+1. TempFlow-GRPO 证明 step-level credit 不一定要靠中间 reward model，可以靠 controlled branching + final reward 构造。\\
+2. 它把探索和评价分开：指定 timestep 用 SDE 探索，其余路径用 ODE 固定，再用 outcome reward 评价。\\
+3. 它进一步说明 temporal credit assignment 的关键不是“越细越好”，而是要同时考虑 \key{归因可解释性、探索能力、更新强度和计算成本}。
+\end{summarybox}

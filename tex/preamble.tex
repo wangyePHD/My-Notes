@@ -1,5 +1,5 @@
 % ========== 基础包 ==========
-\usepackage[UTF8]{ctex}               % 中文支持
+\usepackage[UTF8,fontset=fandol]{ctex}% 中文支持；使用 TeX Live 自带字体，避免依赖系统 STHeiti
 \usepackage[margin=2.5cm]{geometry}   % 页边距
 \usepackage{amsmath, amssymb}         % 数学公式
 \usepackage{xcolor}                   % 颜色
@@ -48,6 +48,7 @@
 
 % ========== 页眉页脚 ==========
 \pagestyle{fancy}
+\setlength{\headheight}{24.1pt}
 \fancyhf{}
 \fancyhead[L]{\small\textcolor{textgray}{\leftmark}}
 \fancyhead[R]{\small\textcolor{textgray}{KillerWang 的学习笔记}}

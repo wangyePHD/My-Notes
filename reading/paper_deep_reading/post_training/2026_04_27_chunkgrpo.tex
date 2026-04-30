@@ -1,0 +1,586 @@
+% ============================================================
+% Paper deep reading: Chunk-GRPO
+% ============================================================
+
+\section{论文精读：Chunk-GRPO}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2510.21583}{Sample By Step, Optimize By Chunk: Chunk-Level GRPO For Text-to-Image Generation}\\
+\textbf{简称：} Chunk-GRPO。\\
+\textbf{版本：} arXiv 2510.21583v1，submitted on 2025-10-24。\\
+\textbf{方向标签：} Flow Matching、Text-to-Image、GRPO、Chunk-level Optimization、Credit Assignment。\\
+\textbf{阅读日期：} 2026-04-27。\\
+\textbf{前置：} 已理解 Flow-GRPO 的 step-level GRPO objective，以及 DenseGRPO 为什么要用 step-wise reward gain。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+Chunk-GRPO 的核心不是“重新设计 reward”，而是把 GRPO 的优化粒度从 \textbf{step-level} 改成 \textbf{chunk-level}：
+
+\[
+\text{sample by step}
+\quad \rightarrow \quad
+\text{optimize by chunk}
+\]
+
+它要解决的问题是：单个 denoising step 太细，整条 trajectory 又太粗；更合理的优化单位可能是一段连续 timesteps，也就是 chunk。
+
+\begin{summarybox}
+\textbf{我的判断：} Chunk-GRPO 是 DenseGRPO 后最应该读的一篇，因为它正好回应 DenseGRPO 的工程痛点：full step-wise ODE readout 太贵。Chunk-GRPO 提供了一个低成本方向：不逐步估计 reward gain，而是把生成过程切成若干阶段，在 chunk 级别平滑 policy update。
+\end{summarybox}
+
+\begin{warnbox}
+\textbf{先把边界说清楚：} Chunk-GRPO 并没有像 DenseGRPO 那样真的计算每个 chunk 的 reward improvement。它主要仍然使用整条 trajectory 的 terminal advantage \(A_i\)，改的是 policy ratio 和优化粒度。因此它缓解 credit assignment，但没有彻底解决“哪个 chunk 真正带来 reward improvement”的问题。
+\end{warnbox}
+
+\begin{center}
+  \includegraphics[width=\linewidth]{chunkgrpo/fig1_qualitative_results.jpg}
+
+  {\small \textbf{图 1：} Chunk-GRPO 的质性结果。论文用这些样例说明 chunk-level optimization 可以改善结构、光照和细节质量。图源：arXiv HTML。}
+\end{center}
+
+\subsection{1. 它接在 DenseGRPO 后面读的原因}
+
+DenseGRPO 的关键贡献是：
+
+\[
+\Delta R_t = R_{t-1} - R_t
+\]
+
+这比把 terminal reward 平均分给所有 steps 更合理。但问题是，如果每个 \(x_t\) 都完整 ODE readout 到 clean image，成本接近：
+
+\[
+T + (T-1) + \cdots + 1
+= \frac{T(T+1)}{2}
+\]
+
+Chunk-GRPO 的思路不是继续追求每一步都准，而是换一个问题：
+
+\begin{quote}
+如果 step 太细、trajectory 太粗，那么能不能找一个中间时间尺度？
+\end{quote}
+
+这个中间尺度就是 chunk：
+
+\[
+x_T \rightarrow \cdots \rightarrow x_0
+\quad \Rightarrow \quad
+\mathrm{ch}_1,\mathrm{ch}_2,\ldots,\mathrm{ch}_K
+\]
+
+所以它和 DenseGRPO 的关系可以这样理解：
+
+\[
+\text{DenseGRPO：每一步的 reward gain}
+\]
+
+\[
+\text{Chunk-GRPO：每一段的 policy update unit}
+\]
+
+\subsection{2. Flow-GRPO 的问题：step-level 更新太细}
+
+Flow-GRPO / Dance-GRPO 这类方法通常对同一个 prompt 采样一组 trajectories，然后用最终 reward 得到 group relative advantage：
+
+\[
+A_i
+=
+\frac{
+R(x_0^i,c)-\mathrm{mean}\{R(x_0^j,c)\}_{j=1}^{G}
+}{
+\mathrm{std}\{R(x_0^j,c)\}_{j=1}^{G}
+}
+\]
+
+然后每个 step 都拿同一个 \(A_i\) 做更新：
+
+\[
+\sum_{t=1}^{T}
+\min
+\left(
+r_t^i(\theta)A_i,\;
+\mathrm{clip}(r_t^i(\theta),1-\epsilon,1+\epsilon)A_i
+\right)
+\]
+
+问题是：最终图像 reward 高，不代表这条 trajectory 的每个中间 step 都比别的 trajectory 好。
+
+\begin{center}
+  \includegraphics[width=0.72\linewidth]{chunkgrpo/fig2_motivation.png}
+
+  {\small \textbf{图 2：} Chunk-GRPO 的动机图。Trajectory 1 最终 reward 更高，但其中某个中间 timestep 可能比 Trajectory 2 更差；标准 GRPO 仍会把正 advantage 平等分给所有 steps。图源：arXiv HTML。}
+\end{center}
+
+\textbf{这和 DenseGRPO 的问题意识一致：} terminal reward 的全局平均分配是不合理的。区别在于，DenseGRPO 尝试重新估计每步 reward；Chunk-GRPO 则尝试改变优化单位。
+
+\subsection{3. 方法一：Chunk-level policy ratio}
+
+给定一条生成 trajectory：
+
+\[
+(x_T,x_{T-1},\ldots,x_1,x_0)^i
+\]
+
+Chunk-GRPO 把它切成 \(K\) 个 chunk：
+
+\[
+\{\mathrm{ch}_1,\mathrm{ch}_2,\ldots,\mathrm{ch}_K\}^i
+\]
+
+其中第 \(j\) 个 chunk 的长度是 \(cs_j\)，所有 chunk size 加起来覆盖 denoising trajectory：
+
+\[
+\sum_{j=1}^{K} cs_j = T
+\]
+
+在实验里，论文使用 \(T=17\) 个 sampling steps，并采用：
+
+\[
+\{cs_j\}_{j=1}^{4}=[2,3,4,7]
+\]
+
+这里实际只覆盖 16 个 transitions，因为论文跟随 Dance-GRPO 忽略最后一个不引入 stochasticity 的 timestep。
+
+\subsubsection{3.1 从 step ratio 到 chunk ratio}
+
+标准 step-level GRPO 的 ratio 是：
+
+\[
+r_t^i(\theta)
+=
+\frac{
+p_\theta(x_{t-1}^i|x_t^i,c)
+}{
+p_{\mathrm{old}}(x_{t-1}^i|x_t^i,c)
+}
+\]
+
+Chunk-GRPO 把一个 chunk 内所有 step 的 likelihood ratio 合起来，定义 chunk-level ratio：
+
+\[
+r_j^i(\theta)
+=
+\left(
+\prod_{t\in \mathrm{ch}_j}
+\frac{
+p_\theta(x_{t-1}^i|x_t^i,c)
+}{
+p_{\mathrm{old}}(x_{t-1}^i|x_t^i,c)
+}
+\right)^{1/cs_j}
+\]
+
+这个 \(1/cs_j\) 很关键。它相当于几何平均，而不是简单乘积。否则 chunk 越长，ratio 的尺度越容易爆。
+
+\textbf{几何平均的定义：} 对 \(n\) 个正数 \(a_1,a_2,\ldots,a_n\)，它们的几何平均定义为：
+
+\[
+\mathrm{GM}(a_1,\ldots,a_n)
+=
+\left(
+\prod_{k=1}^{n} a_k
+\right)^{1/n}
+\]
+
+等价地，也可以写成 log-space 的平均：
+
+\[
+\mathrm{GM}(a_1,\ldots,a_n)
+=
+\exp
+\left(
+\frac{1}{n}
+\sum_{k=1}^{n}\log a_k
+\right)
+\]
+
+所以几何平均不是把所有数简单乘起来，而是先得到总的乘法变化，再除以长度 \(n\)，还原成“平均每一个元素贡献了多少倍的乘法变化”。如果所有 \(a_k=r\)，那么 \(\mathrm{GM}=r\)，而简单乘积会变成 \(r^n\)。
+
+更具体地说，chunk 内每一步都有一个 ratio：
+
+\[
+r_t^i(\theta)
+=
+\frac{
+p_\theta(x_{t-1}^i|x_t^i,c)
+}{
+p_{\mathrm{old}}(x_{t-1}^i|x_t^i,c)
+}
+\]
+
+如果直接把它们相乘：
+
+\[
+\prod_{t\in \mathrm{ch}_j} r_t^i(\theta)
+\]
+
+得到的是整个 chunk trajectory likelihood 的 ratio。这在数学上没错，但有一个工程问题：\textbf{chunk 越长，乘积越容易偏离 1}。例如如果每一步 ratio 都只是轻微变大，\(r_t=1.05\)，那么：
+
+\[
+1.05^2=1.10,\quad
+1.05^{10}=1.63,\quad
+1.05^{20}=2.65
+\]
+
+同样的单步变化，因为 chunk 长度不同，会被放大成完全不同的 ratio 尺度。这样 PPO/GRPO 的 clipping 会更频繁触发，长 chunk 和短 chunk 也不再可比。
+
+因此论文用：
+
+\[
+\left(
+\prod_{t\in \mathrm{ch}_j}r_t^i(\theta)
+\right)^{1/cs_j}
+=
+\exp
+\left(
+\frac{1}{cs_j}
+\sum_{t\in \mathrm{ch}_j}
+\log r_t^i(\theta)
+\right)
+\]
+
+这就是几何平均。它等价于先对 chunk 内每一步的 \(\log\)-ratio 求平均，再 exponentiate 回 ratio 空间。
+
+\begin{summarybox}
+\textbf{直觉：} 简单乘积衡量的是“整个 chunk 的联合概率变了多少”；几何平均衡量的是“chunk 内平均每一步的概率变了多少”。Chunk-GRPO 需要后者，因为它要把不同长度的 chunks 放进同一个 PPO/GRPO clipping 框架里比较。
+\end{summarybox}
+
+\textbf{一个更直观的例子：} 如果两个 chunks 的每一步平均变化都差不多，那么它们应该有差不多的 policy ratio，而不应该因为一个 chunk 长度是 2、另一个长度是 10，就让后者天然更容易被 clip。\(1/cs_j\) 的作用就是做长度归一化。
+
+\subsubsection{3.2 Chunk-level objective}
+
+Chunk-GRPO 的目标变成：
+
+\[
+J(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{GK}
+\sum_{i=1}^{G}
+\sum_{j=1}^{K}
+\min
+\left(
+r_j^i(\theta)A_i,\;
+\mathrm{clip}(r_j^i(\theta),1-\epsilon,1+\epsilon)A_i
+\right)
+-\beta D_{\mathrm{KL}}(\pi_\theta||\pi_{\mathrm{ref}})
+\right]
+\]
+
+注意这里仍然是 \(A_i\)，不是 \(A_{i,j}\)。
+
+\begin{warnbox}
+\textbf{关键判断：} Chunk-GRPO 的 chunk-level objective 没有给每个 chunk 计算独立 reward 或 independent advantage。它把多个 step 的 ratio 合成一个 chunk ratio，从而让一个 chunk 内的 transition 作为整体被优化。这个改动主要带来 smoother gradient 和更合理的时间粒度，但不是 DenseGRPO 那种显式 reward gain。
+\end{warnbox}
+
+\subsection{4. 为什么同样用 terminal advantage 还能有用}
+
+这点容易误解：如果 Chunk-GRPO 仍然用 \(A_i\)，为什么它还能改善 credit assignment？
+
+我的理解是，它缓解的不是“reward 从哪里来”，而是“policy update 以什么单位发生”。
+
+\[
+\text{step-level：每个 transition 单独吃同一个 } A_i
+\]
+
+\[
+\text{chunk-level：一段 transitions 共同吃同一个 } A_i
+\]
+
+当单个 step 的局部质量和最终 reward 不一致时，step-level 会把噪声直接打到每个 transition 上；chunk-level 会把相邻 steps 合成一个单位，等价于在时间维度上做 smoothing。
+
+所以 Chunk-GRPO 的收益更像是：
+
+\[
+\text{减少 step-wise noisy credit}
+\quad
+\neq
+\quad
+\text{得到真正 chunk-wise reward}
+\]
+
+这也是它和 DenseGRPO 最大的区别。
+
+\subsection{5. 方法二：用 temporal dynamics 决定 chunk}
+
+如果只是随便切 chunk，效果不一定好。论文先做了固定 chunk size 的实验，发现不同 chunk size 的性能差异明显。
+
+\begin{center}
+  \includegraphics[width=0.58\linewidth]{chunkgrpo/fig5_chunk_size_ablation.png}
+
+  {\small \textbf{图 5：} 不同 chunk size 的性能不同，说明 chunk 不是随便切就行。TD 表示 temporal dynamics guided chunking。图源：arXiv HTML。}
+\end{center}
+
+论文认为 flow matching 的 denoising trajectory 有明显的 temporal dynamics：不同时间步的 latent change 不一样。它用相邻 latent 的相对 \(L1\) 距离来刻画：
+
+\[
+L1_{\mathrm{rel}}(x,t)
+=
+\frac{\|x_t-x_{t-1}\|_1}{\|x_t\|_1}
+\]
+
+直觉是：
+
+\[
+L1_{\mathrm{rel}} \text{ 大}
+\Rightarrow
+\text{latent 变化快，通常是高噪声 / 结构阶段}
+\]
+
+\[
+L1_{\mathrm{rel}} \text{ 小}
+\Rightarrow
+\text{latent 变化慢，通常是后期稳定 refinement}
+\]
+
+\begin{center}
+  \includegraphics[width=\linewidth]{chunkgrpo/fig3_temporal_dynamics.png}
+
+  {\small \textbf{图 3：} flow matching 的 relative \(L1\) dynamics。论文观察到这种动态模式对 prompt 相对稳定，但随 timestep 明显变化，因此可以用它指导 chunk 边界。图源：arXiv HTML。}
+\end{center}
+
+论文的原则是：
+
+\[
+\text{dynamics 相似的 timesteps 放进同一个 chunk}
+\]
+
+\[
+\text{dynamics 差异大的 timesteps 分到不同 chunk}
+\]
+
+最终默认设置是 4 个 chunk：
+
+\[
+[2,3,4,7]
+\]
+
+它不是严格证明出的最优切分，而是基于 relative \(L1\) 曲线、二阶变化和训练前后 dynamics 观察得到的工程选择。
+
+\begin{center}
+  \includegraphics[width=0.66\linewidth]{chunkgrpo/fig10_l1_before_after_dancegrpo.png}
+
+  {\small \textbf{图 10：} Dance-GRPO 训练前后 relative \(L1\) dynamics 的变化。论文据此说明 RL 主要改变后半段 timesteps，并把最后一个 chunk 设置得更长。图源：arXiv HTML。}
+\end{center}
+
+\subsection{6. 方法三：Weighted Sampling}
+
+论文还提出一个 optional weighted sampling strategy。它不是每次更新所有 chunks，而是像 Dance-GRPO 一样只选一部分 chunks，例如 fraction \(0.5\)。区别是 Chunk-GRPO 不做 uniform sampling，而是按 chunk 的平均 relative \(L1\) 给采样权重：
+
+\[
+w(\mathrm{ch}_j)
+=
+\frac{
+\frac{1}{cs_j}\sum_{t\in \mathrm{ch}_j}L1_{\mathrm{rel}}(x,t)
+}{
+\frac{1}{T}\sum_{t=1}^{T}L1_{\mathrm{rel}}(x,t)
+}
+\]
+
+这个公式会偏向高噪声 / 高变化 chunk。
+
+\begin{summarybox}
+\textbf{直觉：} 高噪声阶段通常决定结构、构图和大尺度语义，所以更值得优化；低噪声阶段更多是 refinement，优化信号可能小一些。
+\end{summarybox}
+
+但是它也有明显风险：高噪声阶段一旦过度优化，容易改变整体结构，甚至导致语义崩塌。
+
+\begin{center}
+  \includegraphics[width=\linewidth]{chunkgrpo/fig9_weighted_sampling_failure.jpg}
+
+  {\small \textbf{图 9：} weighted sampling 的失败例子。论文指出它可能在高噪声区域错误改变图像结构，导致语义元素缺失。图源：arXiv HTML。}
+\end{center}
+
+\subsection{7. 整体框架}
+
+Chunk-GRPO 的流程可以概括为：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 用 SDE 采样生成 trajectory。
+  \item 计算 relative \(L1\) dynamics。
+  \item 根据 dynamics 预设 chunk boundaries。
+  \item 把 step-level ratio 合成 chunk-level ratio。
+  \item 用 terminal group relative advantage \(A_i\) 做 chunk-level GRPO update。
+  \item 可选：按 \(w(\mathrm{ch}_j)\) 采样更重要的 chunks。
+\end{enumerate}
+
+\begin{center}
+  \includegraphics[width=\linewidth]{chunkgrpo/fig4_framework.png}
+
+  {\small \textbf{图 4：} Chunk-GRPO 框架。核心是 temporal-dynamic-guided chunking、chunk-level importance ratio，以及可选 weighted sampling。图源：arXiv HTML。}
+\end{center}
+
+\subsection{8. 实验结果怎么读}
+
+\subsubsection{8.1 主实验}
+
+实验设置：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Base model：FLUX.1 Dev。
+  \item Baseline：Dance-GRPO。
+  \item 训练 reward model：HPSv3。
+  \item 数据：HPDv2.1。
+  \item 评估：HPSv3、ImageReward、WISE、GenEval。
+  \item 默认 chunk：\(T=17\)，\([2,3,4,7]\)。
+\end{itemize}
+
+偏好对齐结果：
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{HPSv3} & \textbf{ImageReward} \\
+\midrule
+FLUX & 13.804 & 1.086 \\
+Dance-GRPO & 15.080 & 1.141 \\
+Chunk-GRPO w/o ws & 15.236 & 1.147 \\
+Chunk-GRPO w/ ws & 15.373 & 1.149 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里可以看到：weighted sampling 对 preference metrics 有正收益。
+
+但在 WISE 上，Chunk-GRPO w/o ws overall 是 0.76，Dance-GRPO 是 0.75，Chunk-GRPO w/ ws 反而降到 0.73。这说明 weighted sampling 的偏好提升可能以结构或语义稳定性为代价。
+
+\subsubsection{8.2 Chunk setting 消融}
+
+论文对不同 chunk size 做了消融。关键结果是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 固定 chunk size 通常能略优于 step-level Dance-GRPO。
+  \item 不同 chunk size 表现差异明显。
+  \item temporal-dynamics-guided chunking \([2,3,4,7]\) 最好，HPSv3 达到 15.236。
+\end{itemize}
+
+\[
+\text{chunk size matters}
+\quad \Rightarrow \quad
+\text{不能随便把 steps 平均切块}
+\]
+
+\subsubsection{8.3 只训练特定 chunk}
+
+论文还只训练某一个 chunk，观察哪个 chunk 贡献大。
+
+\begin{center}
+  \includegraphics[width=0.66\linewidth]{chunkgrpo/fig6_specific_chunk.png}
+
+  {\small \textbf{图 6：} 单独训练不同 chunks。高噪声 chunk 收益更大，但后期也更不稳定。图源：arXiv HTML。}
+\end{center}
+
+结论是：早期高噪声 chunks 带来更大提升，但训练后期容易不稳定。这正是 weighted sampling 的动机，也是它失败风险的来源。
+
+\subsubsection{8.4 不同 reward model 和 GenEval}
+
+论文还换了 reward model，例如 PickScore、CLIP。Chunk-GRPO 仍然优于 Dance-GRPO。
+
+GenEval overall：
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+\textbf{Model} & \textbf{GenEval Overall} \\
+\midrule
+FLUX & 0.66 \\
+Dance-GRPO & 0.67 \\
+Chunk-GRPO w/o ws & 0.69 \\
+Chunk-GRPO w/ ws & 0.67 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里再次说明：\textbf{w/o weighted sampling 更稳}。Weighted sampling 会追求偏好分数，但可能损害 instruction following。
+
+\subsection{9. 和 DenseGRPO 的本质区别}
+
+\begin{center}
+{\small
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+\toprule
+\textbf{维度} & \textbf{DenseGRPO} & \textbf{Chunk-GRPO} \\
+\midrule
+核心动作 & 计算中间 latent 的 reward gain & 改变 policy optimization 粒度 \\
+信用粒度 & step-wise & chunk-wise update unit \\
+advantage & \(\Delta R_t=R_{t-1}-R_t\) & 主要仍用 terminal \(A_i\) \\
+成本 & ODE readout + decode + reward scoring，贵 & 几乎不额外打 reward，便宜 \\
+解决程度 & 更接近真实 step contribution & 平滑 step-level noisy attribution \\
+主要风险 & 成本高、reward model bias 被细粒度传播 & chunk boundary 固定、chunk 内仍可能被 terminal advantage 误导 \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+所以我会把两者关系总结成：
+
+\[
+\text{DenseGRPO = 更准但更贵}
+\]
+
+\[
+\text{Chunk-GRPO = 更便宜但更粗}
+\]
+
+它们不是互相替代，而是可以组合。
+
+\subsection{10. 对我们后续 idea 的启发}
+
+读完 DenseGRPO 和 Chunk-GRPO 后，最自然的改进方向是：
+
+\[
+\text{Chunk-GRPO 的 chunk unit}
+\quad + \quad
+\text{DenseGRPO 的 reward gain}
+\]
+
+也就是不要每个 step 都 ODE readout，而是在 chunk boundary 上做 sparse readout：
+
+\[
+R_{\tau_K},R_{\tau_{K-1}},\ldots,R_{\tau_0}
+\]
+
+然后定义 chunk-level improvement：
+
+\[
+\Delta R_{\mathrm{ch}_j}
+=
+R_{\tau_{j-1}} - R_{\tau_j}
+\]
+
+这样成本从 DenseGRPO 的：
+
+\[
+O(T^2)
+\]
+
+变成更接近：
+
+\[
+O(K\cdot \text{readout cost})
+\]
+
+其中 \(K \ll T\)。
+
+\begin{summarybox}
+\textbf{最值得做的组合：} 用 Chunk-GRPO 的 temporal-dynamic-guided chunks 决定 readout 边界，再用 DenseGRPO 的 ODE-based reward gain 计算 chunk-level improvement。这样既保留“reward improvement 不该全局平分”的核心收益，又避免每个 step 都 full ODE readout。
+\end{summarybox}
+
+\subsection{11. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{没有真正 chunk-specific reward：} Chunk-GRPO 主要仍用 terminal \(A_i\)，所以不同 chunk 没有独立 reward gain。
+  \item \textbf{chunk boundary 固定：} 论文默认 \([2,3,4,7]\)，训练过程中不动态变化。论文自己也把 adaptive chunking 列为未来方向。
+  \item \textbf{weighted sampling 有偏好-语义 tradeoff：} 它提升 HPSv3 / ImageReward，但可能降低 WISE / GenEval，甚至造成结构崩塌。
+  \item \textbf{对视频还不够：} 视频里的 temporal consistency、motion、identity 可能需要不同 chunk reward，而不是只按 latent \(L1\) 切分。
+  \item \textbf{对图像编辑还缺 region-awareness：} 编辑任务不能只按 denoising time 切，还要区分目标区域和非目标区域。
+\end{itemize}
+
+\subsection{12. 读完要记住的三句话}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Chunk-GRPO 的核心是 \textbf{优化粒度}：step 太细、trajectory 太粗，chunk 是折中。
+  \item 它的 chunk-level ratio 是 step ratios 的几何平均，能平滑 step-level noisy updates。
+  \item 它还没有真正解决 chunk-wise reward assignment；最有价值的下一步是把 DenseGRPO 的 reward gain 搬到 chunk boundary 上。
+\end{enumerate}

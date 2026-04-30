@@ -1,0 +1,380 @@
+% ============================================================
+% Mainline summary: Flow-GRPO credit assignment
+% ============================================================
+
+\section{主线总结：Flow-GRPO 信用分配四篇阶段总结}
+
+\begin{conceptbox}
+\textbf{覆盖论文：} DenseGRPO、Chunk-GRPO、TempFlow-GRPO、PCPO。\\
+\textbf{总结日期：} 2026-04-28。\\
+\textbf{当前判断：} 这四篇构成一个比较清晰的主线：\textbf{Flow-GRPO 后训练的 credit assignment 不能只看 terminal reward，也不能只看 advantage；policy ratio / logprob scale 本身也会改变每个 step 的实际更新强度。}
+\end{conceptbox}
+
+\subsection{0. 最核心的一句话}
+
+标准 Flow-GRPO 的问题可以压缩成一个式子：
+
+\[
+\text{实际每个 step 的更新强度}
+\approx
+\underbrace{\text{advantage / credit}}_{\text{reward side}}
+\times
+\underbrace{\text{policy ratio / logprob scale}}_{\text{policy side}}.
+\]
+
+更具体地，PPO / GRPO 的 step-level objective 里有：
+
+\[
+\min
+\left(
+\rho_t^i A_i,\,
+\mathrm{clip}(\rho_t^i,1-\epsilon,1+\epsilon)A_i
+\right).
+\]
+
+所以不能只问：
+
+\[
+A_i \text{ 应该怎么分给每个 timestep？}
+\]
+
+还要问：
+
+\[
+\rho_t^i \text{ 本身是不是已经在放大或压小某些 timestep？}
+\]
+
+\begin{summarybox}
+\textbf{阶段性结论：} 好的 Flow-GRPO 后训练，需要同时校准 \textbf{advantage side} 和 \textbf{ratio side}。前者决定“奖励应该分给谁”，后者决定“同样的奖励乘到 objective 里以后，实际更新强度会不会偏”。
+\end{summarybox}
+
+\subsection{1. 第一类问题：advantage 分布不平衡}
+
+标准 Flow-GRPO / DanceGRPO 的做法是：同一个 prompt 采样 \(G\) 条 trajectories，最终每条 trajectory 得到一个 terminal reward，再归一化成 trajectory-level advantage：
+
+\[
+A_i
+=
+\frac{
+R(x_0^i,c)-\mathrm{mean}_{j}R(x_0^j,c)
+}{
+\mathrm{std}_{j}R(x_0^j,c)+\epsilon
+}.
+\]
+
+然后每个 denoising step 都拿同一个 \(A_i\)：
+
+\[
+\sum_{t=1}^{T}
+\min
+\left(
+\rho_t^i A_i,\,
+\mathrm{clip}(\rho_t^i,1-\epsilon,1+\epsilon)A_i
+\right).
+\]
+
+这等价于默认：
+
+\[
+\text{一条 trajectory 最终好}
+\Rightarrow
+\text{这条 trajectory 的每个 step 都好。}
+\]
+
+这个假设太强。因为最终 reward 高，不代表所有中间 steps 都贡献了正收益；最终 reward 低，也不代表所有中间 steps 都应该被惩罚。
+
+\begin{warnbox}
+\textbf{这就是 advantage 分布不平衡：} terminal advantage 被全局广播到所有 timesteps，导致真正有贡献的 step 和没贡献的 step 拿到同一个训练信号。它不是 reward model 不准的问题，而是 reward credit 的时间分配太粗。
+\end{warnbox}
+
+\subsection{2. DenseGRPO：最直接地修 advantage side}
+
+DenseGRPO 的核心想法是把 terminal reward 拆成 step-wise reward gain：
+
+\[
+\Delta R_t
+=
+R_{t-1}-R_t.
+\]
+
+这里的 \(R_t\) 不是直接给 noisy latent 打分，而是从中间 latent \(x_t\) 出发，用 ODE denoising readout 到 clean image，再 decode、再用 reward model 打分。
+
+所以 DenseGRPO 本质上在问：
+
+\[
+\text{经过第 \(t\) 个 denoising transition 后，最终可读出的 reward 提升了多少？}
+\]
+
+这比 terminal advantage 更合理，因为它更接近：
+
+\[
+A_i
+\quad \rightarrow \quad
+A_t^i.
+\]
+
+\begin{summarybox}
+\textbf{DenseGRPO 的价值：} 它是四篇里对 advantage side 修得最直接的一篇。它试图估计每个 step 的 actual improvement，而不是把最终 reward 平均分配给所有 steps。
+\end{summarybox}
+
+但 DenseGRPO 的问题也很清楚：
+
+\[
+T+(T-1)+\cdots+1
+=
+\frac{T(T+1)}{2}.
+\]
+
+如果每个中间 latent 都要完整 ODE readout 到 clean image，成本接近 \(O(T^2)\)。所以 DenseGRPO 的核心收益很硬，工程成本也很硬。
+
+\subsection{3. Chunk-GRPO：不直接修 reward，而是修优化粒度}
+
+Chunk-GRPO 的判断是：单个 step 太细，整条 trajectory 太粗，所以可以用 chunk 作为中间粒度。
+
+它把 denoising trajectory 切成：
+
+\[
+\mathrm{ch}_1,\mathrm{ch}_2,\ldots,\mathrm{ch}_K.
+\]
+
+然后把 step-level ratio 合成 chunk-level ratio：
+
+\[
+r_j^i(\theta)
+=
+\left(
+\prod_{t\in \mathrm{ch}_j}
+\frac{
+p_\theta(x_{t-1}^i|x_t^i,c)
+}{
+p_{\mathrm{old}}(x_{t-1}^i|x_t^i,c)
+}
+\right)^{1/cs_j}.
+\]
+
+其中 \(1/cs_j\) 是几何平均，防止 chunk 越长 ratio 尺度越容易爆。
+
+Chunk-GRPO 没有像 DenseGRPO 那样真正计算 chunk reward improvement。它更多是在说：
+
+\[
+\text{更新单位不一定要是单 step，也不应该是整条 trajectory。}
+\]
+
+\begin{summarybox}
+\textbf{Chunk-GRPO 的价值：} 它让 credit 分配更平滑，减少 step-level 噪声，也提供了一个很实用的工程方向：如果 DenseGRPO 的 step-wise readout 太贵，可以尝试 chunk-level improvement。
+\end{summarybox}
+
+它的局限是：如果仍然用同一个 terminal \(A_i\)，那它只是缓解了 credit assignment，没有彻底解决“哪个 chunk 真正带来 reward improvement”的问题。
+
+\subsection{4. TempFlow-GRPO：用 branch 做局部反事实}
+
+TempFlow-GRPO 试图回答的是另一个问题：
+
+\[
+\text{某个 timestep 的选择，是否真的导致了最终结果差异？}
+\]
+
+它用 trajectory branching 的方式，在某个时刻 \(t\) 产生分支，然后观察不同 branch 的后续结果。直觉上，这比单纯看一条 trajectory 更接近反事实：
+
+\[
+\text{如果在同一个前缀状态下，换一个 branch，最终 reward 会怎样？}
+\]
+
+所以 TempFlow-GRPO 的 credit localization 不是 DenseGRPO 那种 step-wise reward gain，而是 branch-level counterfactual。
+
+\begin{summarybox}
+\textbf{TempFlow-GRPO 的价值：} 它提醒我们，credit 不只是 timestep 的问题，也和局部探索有关。一个 step 的重要性，最好通过“同一位置不同 branch 的后果差异”来判断。
+\end{summarybox}
+
+但它也有两个问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item branch 怎么设计会影响 credit 结论。
+  \item 分支越多，成本越高；分支太少，反事实又不够充分。
+\end{enumerate}
+
+\subsection{5. PCPO：ratio side 也会影响 credit}
+
+前面三篇主要都在处理 advantage side：
+
+\[
+A_i
+\rightarrow
+A_t^i
+\quad \text{or} \quad
+A_{\mathrm{chunk}}^i
+\quad \text{or} \quad
+A_{\mathrm{branch}}^i.
+\]
+
+PCPO 的关键提醒是：即使 advantage 先不变，policy ratio 本身也不是中性的。
+
+Flow-GRPO 里每一步都有：
+
+\[
+\rho_t^i(\theta)
+=
+\frac{
+p_\theta(x_{t-1}^i|x_t^i,c)
+}{
+p_{\theta_{\mathrm{old}}}(x_{t-1}^i|x_t^i,c)
+}.
+\]
+
+PCPO 展开 Flow SDE 的 log-ratio 后指出，不同 timestep 的 log-ratio scale 会受到 step size、SDE variance、timestep position 等因素影响。也就是说，即使用同一个 \(A_i\)，不同 timestep 的实际更新强度也可能不一样。
+
+可以把它理解成：
+
+\[
+\rho_t^i A_i
+\quad
+\text{里面的}
+\quad
+\rho_t^i
+\quad
+\text{已经带了一个隐式 timestep weight。}
+\]
+
+\begin{warnbox}
+\textbf{PCPO 的关键意义：} credit assignment 不只发生在 \(A\) 里，也发生在 \(\rho\) 里。只修 advantage side，不看 ratio side，可能仍然会让某些 steps 被 objective 数学形式过度放大或压小。
+\end{warnbox}
+
+所以 PCPO 把我们的主线从：
+
+\[
+\text{如何分配 reward？}
+\]
+
+推进到：
+
+\[
+\text{如何校准每个 step 的实际 policy update 强度？}
+\]
+
+\subsection{6. 四篇放在一起看}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llll}
+\toprule
+\textbf{论文} & \textbf{修哪一侧} & \textbf{核心机制} & \textbf{主要局限}\\
+\midrule
+DenseGRPO & advantage side & step-wise reward gain \(\Delta R_t\) & ODE readout 成本高，接近 \(O(T^2)\)\\
+Chunk-GRPO & advantage side / 粒度 & chunk-level ratio 和 chunk-level update & 多数情况下仍依赖 terminal advantage\\
+TempFlow-GRPO & advantage side / 探索 & branch-level counterfactual credit & branch 设计和额外采样成本复杂\\
+PCPO & ratio side & 校准 Flow SDE ratio 的 hidden timestep weight & 不直接提供 step-wise reward gain\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+这张表的重点不是“谁最好”，而是它们在拆同一个目标的不同部分：
+
+\[
+\textbf{让每个 timestep 的实际更新强度更接近它对最终质量的真实贡献。}
+\]
+
+\subsection{7. 当前形成的统一视角}
+
+我们现在可以把 Flow-GRPO 的每个 step 更新写成更完整的概念式：
+
+\[
+\Delta \theta_t
+\propto
+\underbrace{
+\nabla_\theta \log p_\theta(x_{t-1}|x_t,c)
+}_{\text{policy gradient direction}}
+\cdot
+\underbrace{
+A_t
+}_{\text{advantage credit}}
+\cdot
+\underbrace{
+w_{\rho}(t)
+}_{\text{ratio / SDE scale}}
+.
+\]
+
+标准 Flow-GRPO 的问题是：
+
+\[
+A_t
+\approx
+A_{\mathrm{terminal}},
+\qquad
+w_{\rho}(t)
+\text{ 没有显式校准。}
+\]
+
+这就导致两类失真：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Advantage 侧失真：} 该 step 不一定真的贡献了 reward，但它拿到了同一个 \(A_i\)。
+  \item \textbf{Ratio 侧失真：} 该 step 就算拿到了合理 \(A_t\)，它的 logprob / ratio scale 也可能让实际更新偏大或偏小。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{最重要的阶段结论：}
+\[
+\boxed{
+\text{Flow-GRPO 的 credit assignment = advantage side + ratio side。}
+}
+\]
+DenseGRPO、Chunk-GRPO、TempFlow-GRPO 主要让我们看到 advantage 分布不平衡；PCPO 让我们看到 policy ratio 本身也会影响 credit。
+\end{summarybox}
+
+\subsection{8. 对 OTCA 的定位}
+
+OTCA 可以暂时降级为旁支启发，而不是这条主线里的关键节点。
+
+它有一个有用提醒：
+
+\[
+\text{多 reward objective 也会影响 advantage 怎么组织。}
+\]
+
+也就是除了问：
+
+\[
+\text{which timestep?}
+\]
+
+还可以问：
+
+\[
+\text{which objective?}
+\]
+
+但 OTCA 自己的实现没有前四篇那么硬：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item TCD 的 latent similarity gain 只是 proxy，不是真正 causal reward gain。
+  \item MOCA 主要是在 advantage scalar 上做融合，不是真正的 gradient-space MOO。
+  \item 主公式里的 \(c_k^i\) 没有 \(t\)，所以“timestep-aware objective mixture”这个说法需要保留。
+\end{itemize}
+
+所以后续可以借 OTCA 的 when + what 框架，但不要直接照搬它的 TCD / MOCA。
+
+\subsection{9. 后续读论文时的抓手}
+
+之后继续读这条主线的论文，可以先问五个问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 它是在修 \textbf{advantage side}，还是在修 \textbf{ratio side}？
+  \item 如果修 advantage，它是 step、chunk、branch，还是 objective-level credit？
+  \item 它的 credit 是 causal / counterfactual，还是 proxy / heuristic？
+  \item 它有没有解决计算成本，还是只是把 credit 算得更密？
+  \item 它是否考虑了 Flow SDE ratio 的 timestep scale，还是默认 ratio 是中性的？
+\end{enumerate}
+
+\begin{intubox}
+\textbf{一个更高标准的目标：} 最理想的后续方法，应该同时做到：
+\[
+\begin{aligned}
+&\text{低成本估计 temporal reward contribution}\\
+&\quad +\ \text{校准 ratio-side timestep scale}\\
+&\quad +\ \text{在多 reward 场景下避免 objective 冲突。}
+\end{aligned}
+\]
+现在四篇论文各自解决了一部分，但还没有一篇把三件事都做干净。
+\end{intubox}

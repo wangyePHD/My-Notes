@@ -23,7 +23,10 @@
 ├── bib/
 │   └── references.bib        # 参考文献库
 ├── reading/
-│   └── arxiv_weekly/         # arXiv 论文速读，已转为 LaTeX 并接入 main.tex
+│   ├── arxiv_daily_papers/   # arXiv & Hugging Face Daily Papers 每日论文雷达专区
+│   ├── paper_deep_reading/   # 论文精读专区：单篇论文结构化拆解
+│   ├── surveys/              # Survey 专区：专题综述、论文地图、学习路线
+│   └── arxiv_weekly/         # 历史 arXiv 论文速读，已转为 LaTeX
 ├── scripts/                  # 辅助脚本
 └── latexmkrc                 # 本地使用 XeLaTeX 编译
 ```
@@ -70,15 +73,49 @@ round_02_reward_model.tex
 \input{Notes/00_learning_system/study_sessions/post_training_2026_04_24/round_02_reward_model}
 ```
 
-## 新增一篇 arXiv 速读
+## 新增一篇 arXiv / Daily Papers 笔记
 
-推荐直接写成 `.tex`，放在：
+每日筛选和总览统一放在：
+
+```text
+reading/arxiv_daily_papers/
+```
+
+推荐命名为：
+
+```text
+daily_YYYY_MM_DD.tex
+```
+
+然后在专区入口里加入：
+
+```tex
+\input{reading/arxiv_daily_papers/daily_YYYY_MM_DD}
+```
+
+专区入口文件是：
+
+```text
+reading/arxiv_daily_papers/index.tex
+```
+
+单篇深读可以命名为：
+
+```text
+paper_short_name_YYYY_MM_DD.tex
+```
+
+历史周报仍保留在：
 
 ```text
 reading/arxiv_weekly/
 ```
 
-然后在 `Notes/index.tex` 的 `arXiv 论文速读` 部分加入对应 `\input`。
+可复制模板：
+
+```text
+reading/arxiv_daily_papers/daily_template.tex
+```
 
 如果先写成 Markdown，可以运行转换脚本：
 
@@ -87,6 +124,70 @@ python3 scripts/convert_arxiv_md_to_tex.py
 ```
 
 脚本会把 `reading/arxiv_weekly/*.md` 转成同名 `.tex`，并删除原 `.md`。
+
+## 新增一篇论文精读笔记
+
+单篇论文精读统一放在：
+
+```text
+reading/paper_deep_reading/
+```
+
+推荐命名为：
+
+```text
+YYYY_MM_DD_short_name.tex
+```
+
+然后在专区入口里加入：
+
+```tex
+\input{reading/paper_deep_reading/YYYY_MM_DD_short_name}
+```
+
+专区入口文件是：
+
+```text
+reading/paper_deep_reading/index.tex
+```
+
+可复制模板：
+
+```text
+reading/paper_deep_reading/paper_template.tex
+```
+
+## 新增一个 Survey 专题
+
+专题综述统一放在：
+
+```text
+reading/surveys/
+```
+
+每个专题单独建目录，例如：
+
+```text
+reading/surveys/discrete_diffusion/
+```
+
+专题入口文件是：
+
+```text
+reading/surveys/discrete_diffusion/index.tex
+```
+
+然后在 Survey 总入口里加入：
+
+```tex
+\input{reading/surveys/discrete_diffusion/index}
+```
+
+Survey 总入口文件是：
+
+```text
+reading/surveys/index.tex
+```
 
 ## 编译约定
 

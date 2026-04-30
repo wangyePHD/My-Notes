@@ -1,0 +1,423 @@
+% Paper deep reading: PCPO
+% Source: https://arxiv.org/html/2509.25774v3
+
+\section{论文精读：PCPO}
+
+\textbf{论文：} \href{https://arxiv.org/abs/2509.25774}{PCPO: Proportionate Credit Policy Optimization for Aligning Image Generation Models}\\
+\textbf{简称：} PCPO。\\
+\textbf{版本：} arXiv v3，2025-09-30 提交，2026-02-24 更新，ICLR 2026。\\
+\textbf{代码：} \href{https://github.com/jaylee2000/pcpo/}{github.com/jaylee2000/pcpo}\\
+\textbf{阅读口径：} 本笔记只从 \textbf{Flow Matching / Flow-GRPO SDE} 视角讲 PCPO，不走论文前半部分的其他 sampler 入口。
+
+\begin{conceptbox}
+\textbf{一句话总结：} PCPO 在 flow matching 里的关键发现是：Flow-GRPO / DanceGRPO 的 SDE policy ratio 展开后，会自带一个 timestep weight \(w(t_i)\)。这个 weight 不是我们设计出来的 credit，而是由 SDE variance、timestep interval 和 sampler 结构隐式产生的。PCPO 要做的是把这个 native weight 校准成和积分区间 \(\Delta t_i\) 成比例，避免某些 flow steps 被 objective 侧过度放大。
+\end{conceptbox}
+
+\subsection{0. 它为什么还在这条主线里}
+
+我们现在看的主线是：
+
+\[
+\textbf{连续 flow 的信用分配}
+\]
+
+核心问题是：
+
+\begin{align*}
+&\text{terminal reward 太粗，}\\
+&\text{不能说明哪个 timestep / chunk / branch / objective 真正导致好结果。}
+\end{align*}
+
+前面三篇分别处理了不同层面：
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{DenseGRPO：} 从 reward 侧做 step-wise reward gain，问每一步到底让最终 reward 提升了多少。
+  \item \textbf{Chunk-GRPO：} 从时间粒度侧做 chunk-level ratio，问 step 太细、trajectory 太粗时怎么更新更稳。
+  \item \textbf{TempFlow-GRPO：} 从 branch 侧做 ODE-SDE-ODE，对某个 timestep 做反事实探索。
+\end{itemize}
+
+PCPO 接在这里，问的是另一个更底层的问题：
+
+\begin{summarybox}
+即使我们暂时还用同一个 terminal advantage \(A\)，Flow-GRPO 的 \(\log \rho_{t_i}\) 本身是否已经在不公平地放大某些 timestep？\\
+PCPO 的回答是：是的。因此 credit assignment 不只发生在 reward 侧，也发生在 objective / ratio 侧。
+\end{summarybox}
+
+\subsection{1. Flow Matching 里为什么要先变成 SDE}
+
+Flow Matching 模型原本通常按 ODE 采样：
+
+\[
+\frac{d x_t}{dt}=u_\theta(x_t,t,c).
+\]
+
+这个 ODE 是 deterministic 的。如果完全 deterministic，就没有常规 policy gradient 需要的 step transition probability：
+
+\[
+p_\theta(x_{t_{i-1}}\mid x_{t_i},c).
+\]
+
+所以 Flow-GRPO / DanceGRPO 的基本操作是：把 ODE 改写成一个有相同边缘分布的 reverse SDE：
+
+\[
+d x_t
+=
+\left(
+u_t
+-
+\frac{1}{2}\sigma_t^2
+\nabla \log p_t(x_t)
+\right)dt
++
+\sigma_t d w .
+\]
+
+离散化后，每一步可以理解成一个 Gaussian policy：
+
+\[
+x_{t_{i-1}}
+\sim
+p_\theta^{(i)}
+\left(
+x_{t_{i-1}}\mid x_{t_i},c
+\right).
+\]
+
+这样才可以对每一步写 policy ratio：
+
+\[
+\rho_{t_i}(\theta)
+=
+\frac{
+p_\theta^{(i)}(x_{t_{i-1}}\mid x_{t_i},c)
+}{
+p_{\theta_{\mathrm{old}}}^{(i)}(x_{t_{i-1}}\mid x_{t_i},c)
+}.
+\]
+
+\begin{intubox}
+\textbf{直觉：} Flow-GRPO 的第一步不是“怎么分 reward”，而是“怎么让 flow transition 变成一个可采样、可算 logprob 的随机策略”。PCPO 研究的就是这个 step-level ratio 里有没有隐藏的不公平权重。
+\end{intubox}
+
+\subsection{2. 标准 Flow-GRPO 的问题不只在 advantage}
+
+简化的 per-step clipped objective 可以写成：
+
+\[
+\sum_i
+\min
+\left(
+\rho_{t_i} A,\,
+\mathrm{clip}(\rho_{t_i},1-\epsilon,1+\epsilon) A
+\right).
+\]
+
+这里最容易被我们盯上的问题是：
+
+\[
+A \text{ 是 terminal reward 得到的 trajectory-level advantage。}
+\]
+
+DenseGRPO、Chunk-GRPO、TempFlow-GRPO 都是在不同方式上修这个问题。PCPO 进一步指出，还有一个更隐蔽的问题：
+
+\[
+\rho_{t_i} \text{ 自己也不一定公平。}
+\]
+
+也就是说，即使两个 timestep 拿到同一个 \(A\)，它们的 \(\log\rho_{t_i}\) 也可能因为 SDE schedule 的不同而产生完全不同的梯度尺度。
+
+\subsection{3. Flow 版本 log-ratio 里藏着什么}
+
+PCPO 对 Flow Matching SDE 推导出的 step log-ratio 可以写成：
+
+\[
+\log\rho_{t_i}
+=
+-
+\left[
+w_{\mathrm{native}}(t_i)
+\left(
+u_\theta - u_{\mathrm{old}}
+\right)
+\cdot
+\epsilon_{\mathrm{old}}^{(t_i)}
++
+\frac{1}{2}
+\left\|
+w_{\mathrm{native}}(t_i)
+\left(
+u_\theta - u_{\mathrm{old}}
+\right)
+\right\|^2
+\right].
+\]
+
+其中 flow SDE 自带的 native weight 是：
+
+\[
+w_{\mathrm{native}}(t_i)
+=
+\frac{\sqrt{\Delta t_i}}{\sigma_{t_i}}
+\left(
+1+
+\frac{(1-t_i)\sigma_{t_i}^2}{2t_i}
+\right).
+\]
+
+这个式子是 PCPO 在 flow 视角下最重要的地方。它说明：
+
+\[
+\text{step } i \text{ 的更新强度}
+\quad
+\propto
+\quad
+w_{\mathrm{native}}(t_i).
+\]
+
+而 \(w_{\mathrm{native}}(t_i)\) 由三个东西共同决定：
+
+\begin{itemize}[leftmargin=2em]
+  \item \(\Delta t_i\)：这个 flow step 覆盖的积分区间长度。
+  \item \(\sigma_{t_i}\)：SDE 注入随机性的强度。
+  \item \(t_i\)：flow trajectory 上的位置，以及对应的 schedule 修正项。
+\end{itemize}
+
+\begin{warnbox}
+这就解释了为什么 PCPO 不能只被理解成“又一个 timestep weighting trick”。它指出的是：Flow-GRPO 的 policy ratio 数学形式本身已经内置了一个 timestep credit 分配器。问题在于，这个分配器不一定和我们想要的 temporal credit 一致。
+\end{warnbox}
+
+\subsection{4. 什么叫 proportionate credit}
+
+PCPO 的原则是：
+
+\[
+\text{credit should be proportional to integration interval.}
+\]
+
+在 flow trajectory 上，第 \(i\) 步覆盖的区间是 \(\Delta t_i\)。如果某一步代表更长的积分区间，它自然应该承担更多 trajectory update；如果某一步只是一个很短的区间，却被 SDE schedule 放大很多，那就是 disproportionate credit。
+
+所以 PCPO 希望目标权重变成：
+
+\[
+w_{\mathrm{target}}(t_i)
+=
+\zeta \Delta t_i,
+\]
+
+其中
+
+\[
+\zeta
+=
+\sum_{i=1}^{N}
+\frac{\sqrt{\Delta t_i}}{\sigma_{t_i}}
+\left(
+1+
+\frac{(1-t_i)\sigma_{t_i}^2}{2t_i}
+\right).
+\]
+
+一种直观理解是：
+
+\[
+\text{native: }
+w_{\mathrm{native}}(t_i)
+\quad
+\Longrightarrow
+\quad
+\text{PCPO: }
+w_{\mathrm{target}}(t_i)\propto \Delta t_i .
+\]
+
+\textbf{关键点：} PCPO 在 flow model 里不想大幅改 SDE variance schedule 或 timestep shifting，因为那会改变原本调好的 sampler。它采用的是 objective reweighting。可以把每个 step 的 loss 乘上：
+
+\[
+\omega_i
+=
+\frac{
+w_{\mathrm{target}}(t_i)
+}{
+w_{\mathrm{native}}(t_i)
+}.
+\]
+
+于是 flow 版本的 PCPO objective 可以理解成：
+
+\[
+\mathcal{L}_{\mathrm{PCPO\mbox{-}flow}}
+=
+\mathbb{E}
+\left[
+\sum_i
+\omega_i
+\max
+\left\{
+0,\,
+\xi|A|-A\log\rho_{t_i}
+\right\}
+\right].
+\]
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.82\linewidth]{pcpo/fig2_flow_sde_weights.png}
+  \caption{PCPO 的 Flow SDE 权重校准。图中只保留 DanceGRPO SDE 和 Flow-GRPO SDE 的 native weights 与 proportional weights 对比。图源：arXiv HTML，经本地裁剪。}
+\end{figure}
+
+\subsection{5. 它和 TempFlow-GRPO 的关键区别}
+
+TempFlow-GRPO 的直觉是：
+
+\[
+\text{某些 timestep 的 branch reward variance 大}
+\Rightarrow
+\text{这些 timestep 可能更该被优化。}
+\]
+
+PCPO 的直觉更底层：
+
+\[
+\text{当前 objective 到底已经放大了哪些 timestep？}
+\]
+
+所以二者关注点不同：
+
+\begin{center}
+\begin{tabular}{p{0.28\linewidth}p{0.62\linewidth}}
+\toprule
+\textbf{方法} & \textbf{它问的问题} \\
+\midrule
+TempFlow-GRPO & 如果只在 \(t_i\) 注入随机性，最终 reward 会怎样变？ \\
+PCPO & Flow SDE 的 \(\log\rho_{t_i}\) 是否已经把某些 \(t_i\) 的梯度放大过头？ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{summarybox}
+一个 timestep 有影响，不代表 objective 还应该继续放大它。\\
+PCPO 的价值在于提醒我们：temporal credit signal 和 temporal optimization weight 是两件事，需要分别校准。
+\end{summarybox}
+
+\subsection{6. 实验结果按 flow 口径怎么读}
+
+\subsubsection{6.1 DanceGRPO / FLUX 上的加速}
+
+论文在 DanceGRPO + FLUX 的 setting 上报告了明显的训练加速：
+
+\[
+\text{DanceGRPO FLUX + HPSv2.1 reward: } 41.2\% \text{ speedup.}
+\]
+
+这里的收益不是因为 PCPO 少采样，也不是因为少评估 reward，而是因为每次 policy update 的 timestep credit 更成比例，clipping fraction 更低，训练更稳。
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.96\linewidth]{pcpo/fig3_training_dynamics.png}
+  \caption{PCPO 的 training dynamics。注意这里只按 flow 主线阅读：重点看 DanceGRPO / FLUX 相关曲线中 PCPO 的 clipping 更低、更稳定。图源：arXiv HTML。}
+\end{figure}
+
+\subsubsection{6.2 Flow-GRPO / SD3.5-M 上的泛化}
+
+论文还把 PCPO 接到 SD3.5-M 的 Flow-GRPO setting 上，任务包括 OCR 和 PickScore，并带 KL penalty。结果显示 PCPO 相比原始 Flow-GRPO 有：
+
+\begin{itemize}[leftmargin=2em]
+  \item 更高 reward。
+  \item 更低 KL。
+  \item 更低 clipping fraction。
+\end{itemize}
+
+这说明 PCPO 不是只服务于某一个 SDE 实现，而是可以迁移到 Flow-GRPO 框架。
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.96\linewidth]{pcpo/fig5_flow_grpo_generalization.png}
+  \caption{PCPO 在 SD3.5-M + Flow-GRPO 设置上的泛化结果。PCPO 提高 reward，同时降低 KL 和 clipping。图源：arXiv HTML。}
+\end{figure}
+
+\subsubsection{6.3 不要把它误解成 high-noise heuristic}
+
+一个容易误解的点是：TempFlow-GRPO 发现高噪声阶段有更大 reward variance，那是不是直接放大 high-noise timesteps 就行？
+
+PCPO 的实验给出反例。对于 DanceGRPO SDE，native weights 本来就已经偏向某些 short high-noise intervals。如果继续按 high-noise heuristic 放大，最终反而不如 proportional weighting。
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.96\linewidth]{pcpo/fig7_heuristic_ablation.png}
+  \caption{PCPO 对简单 heuristic 的反驳：减少 timestep 或盲目强调 high-noise steps 都可能牺牲质量；proportional credit 更稳。图源：arXiv HTML。}
+\end{figure}
+
+\subsection{7. 和 DenseGRPO / Chunk-GRPO / TempFlow-GRPO 的关系}
+
+现在四篇可以放进一个更清楚的分层：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.26\linewidth}p{0.42\linewidth}}
+\toprule
+\textbf{层面} & \textbf{代表论文} & \textbf{解决什么} \\
+\midrule
+reward signal & DenseGRPO & 用 ODE readout 估计每步 reward improvement \\
+temporal unit & Chunk-GRPO & 把 step 合成 chunk，改变 update 粒度 \\
+branch credit & TempFlow-GRPO & 在某个 timestep branch，看最终 reward 差异 \\
+objective weight & PCPO & 校准 Flow SDE ratio 里隐藏的 timestep weight \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以 PCPO 不替代前三篇。它补的是另一个缺口：
+
+\[
+\text{即使你已经有了更好的 } A_i(t),
+\quad
+\text{objective 也可能用 } w_{\mathrm{native}}(t_i)
+\text{ 把它重新扭曲。}
+\]
+
+\subsection{8. 局限}
+
+\begin{warnbox}
+PCPO 解决的是 objective-side disproportionate credit，不是 reward-side sparse credit。它不会告诉你某个 flow step 真的让最终图像变好还是变差；它只是在防止 Flow SDE 的 native ratio weight 把某些 steps 过度放大。
+\end{warnbox}
+
+几个边界：
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{没有 step reward gain。} PCPO 不构造 \(\Delta R_t\)，所以不能替代 DenseGRPO。
+  \item \textbf{没有 branch intervention。} PCPO 不做 ODE-SDE-ODE counterfactual branch，所以不能替代 TempFlow-GRPO。
+  \item \textbf{没有改 temporal unit。} PCPO 仍然可以逐 step update，不像 Chunk-GRPO 那样把多个 step 合成 chunk ratio。
+  \item \textbf{依赖 proportionality 假设。} \(w_{\mathrm{target}}(t_i)\propto \Delta t_i\) 是一个强原则，但如果某个任务本身强烈 stage-specific，仅靠 \(\Delta t_i\) 可能不够。
+\end{itemize}
+
+\subsection{9. 对我们后续 idea 的启发}
+
+昨天我们觉得 ``Chunk-GRPO + DenseGRPO'' 有点 A+B。PCPO 给了更好的 framing：
+
+\[
+\text{temporal credit signal}
+\quad
+\neq
+\quad
+\text{temporal optimization weight}.
+\]
+
+一个更完整的问题应该是：
+
+\begin{summarybox}
+如何估计某个 flow segment 的 reward improvement，同时保证 Flow SDE objective 里的 native timestep weight 不会把这个 credit 再次扭曲？
+\end{summarybox}
+
+这就比简单拼模块更自然。真正的研究问题变成：
+
+\[
+\text{reward-side credit}
+\quad +
+\quad
+\text{objective-side credit calibration}.
+\]
+
+\subsection{10. 今天读 PCPO 时只抓三句话}
+
+\begin{enumerate}[leftmargin=2em]
+  \item PCPO 在 Flow Matching 里的核心观察是：SDE policy ratio 里有隐藏的 \(w_{\mathrm{native}}(t_i)\)。
+  \item PCPO 的核心原则是：\textbf{这个 weight 应该和 integration interval \(\Delta t_i\) 成比例}。
+  \item PCPO 对我们的启发是：\textbf{以后设计 step-wise / chunk-wise reward 时，还必须校准 Flow-GRPO objective 侧的 temporal weight}。
+\end{enumerate}

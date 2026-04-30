@@ -1,0 +1,668 @@
+% ============================================================
+% Paper deep reading: OTCA
+% Source: https://arxiv.org/html/2604.19234v2
+% ============================================================
+
+\section{论文精读：OTCA}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2604.19234}{Learning to Credit the Right Steps: Objective-aware Process Optimization for Visual Generation}\\
+\textbf{简称：} OTCA。\\
+\textbf{版本：} arXiv:2604.19234v2，2026-04-27。\\
+\textbf{方向标签：} Flow Matching、Visual GRPO、Credit Assignment、Multi-objective Reward、Image / Video Generation。\\
+\textbf{阅读日期：} 2026-04-28。\\
+\textbf{阅读口径：} 只放在我们当前的主线里读：\textbf{连续 flow / visual GRPO 的信用分配}。论文覆盖 image 和 video，术语里会说 denoising trajectory；这里统一理解成 Flow-SDE 采样轨迹上的 policy optimization。
+\end{conceptbox}
+
+\begin{summarybox}
+\textbf{一句话总结：} OTCA 把原本一个 trajectory-level advantage 拆成两个问题：\textbf{什么时候更新}和\textbf{更新哪个 reward objective}。核心公式是
+\[
+\tilde{A}_{t}^{i}
+=
+w_t^i
+\sum_{k=1}^{K} c_k^i A_k^i .
+\]
+其中 \(w_t^i\) 来自 TCD，负责 temporal credit；\(c_k^i\) 来自 MOCA，负责多目标 reward credit。它和我们前面几篇的关系是：DenseGRPO / TempFlow 更偏 reward gain 或 branch 反事实，PCPO 更偏 ratio 侧权重，OTCA 则进一步问 multi-reward setting 下 advantage 本身应该怎么组织。
+\end{summarybox}
+
+\begin{center}
+  \includegraphics[width=0.95\linewidth]{otca/fig1_framework_comparison.png}
+
+  {\small \textbf{图 1：} OTCA 和普通 GRPO 的区别。普通做法把多个 reward 压成一个 scalar，再广播给所有 timesteps；OTCA 试图同时做 timestep credit 和 objective credit。图源：arXiv HTML。}
+\end{center}
+
+\subsection{0. 它接在 PCPO 后面读的原因}
+
+我们这条主线一直在拆同一个问题：
+
+\[
+\text{terminal reward 太粗，不能说明哪个 timestep 真正导致好结果。}
+\]
+
+前四篇可以这样放：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lll}
+\toprule
+\textbf{论文} & \textbf{主要改动的位置} & \textbf{它问的问题}\\
+\midrule
+DenseGRPO & reward gain & 哪个 step 真的提升了最终 reward？\\
+Chunk-GRPO & optimization unit & step 太细、trajectory 太粗时，能不能按 chunk 更新？\\
+TempFlow-GRPO & branch / counterfactual & 某个时间点的分叉到底带来什么影响？\\
+PCPO & policy ratio / objective scale & ratio 数学形式是否隐式偏向某些 steps？\\
+OTCA & temporal credit + reward objective & 哪个 step 重要，以及这个 step 应该优化哪个目标？\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+所以 OTCA 不是在重复 DenseGRPO。它的切入点是 multi-reward visual generation：
+
+\[
+\begin{aligned}
+R
+&=
+\text{CLIP / text alignment}
++
+\text{aesthetic / visual quality}\\
+&\quad
++
+\text{motion / temporal consistency}
++
+\cdots
+\end{aligned}
+\]
+
+如果简单把它们加成一个 scalar，再把这个 scalar advantage 平均给所有 timesteps，就会同时犯两个错误：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 不知道 \textbf{哪个 timestep} 应该承担更大 credit。
+  \item 不知道 \textbf{哪个 reward objective} 在当前生成阶段更应该被强调。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{直觉：} 早期 denoising 可能更影响 layout / semantic structure，中后期可能更影响 texture / aesthetic / motion details。把所有目标都压成一个 \(A_i\)，再平等广播给所有 steps，其实是在假设“每个阶段都应该优化同一种东西”，这个假设很粗。
+\end{intubox}
+
+\subsection{1. 标准 GRPO 的问题：一个 advantage 管所有 steps}
+
+普通 visual GRPO 对同一个 prompt 采样 \(G\) 个样本，得到每个样本的 reward：
+
+\[
+r_1,r_2,\ldots,r_G .
+\]
+
+然后做 group-wise normalized advantage：
+
+\[
+A_i
+=
+\frac{
+r_i-\mathrm{mean}(r_1,r_2,\ldots,r_G)
+}{
+\mathrm{std}(r_1,r_2,\ldots,r_G)
+}.
+\]
+
+训练目标是：
+
+\[
+\mathcal{J}(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{G}\sum_{i=1}^{G}
+\frac{1}{T}\sum_{t=1}^{T}
+\min
+\left(
+\rho_t^i A_i,\,
+\mathrm{clip}(\rho_t^i,1-\epsilon,1+\epsilon)A_i
+\right)
+\right].
+\]
+
+这里的问题非常直接：
+
+\[
+A_i
+\quad
+\text{和}
+\quad
+t
+\quad
+\text{无关。}
+\]
+
+也就是说，一张图最后 reward 高，整条 trajectory 所有 steps 都被正向更新；一张图最后 reward 低，整条 trajectory 所有 steps 都被压低。OTCA 要把这个单一的 \(A_i\) 换成 timestep-specific effective advantage：
+
+\[
+A_i
+\quad \Longrightarrow \quad
+\tilde{A}_t^i .
+\]
+
+\subsection{2. OTCA 总公式：when 乘 what}
+
+OTCA 的核心公式是：
+
+\[
+\tilde{A}_{t}^{i}
+=
+w_t^i
+\cdot
+\sum_{k=1}^{K} c_k^i A_k^i .
+\]
+
+这个式子可以直接读成：
+
+\[
+\text{effective advantage}
+=
+\text{temporal importance}
+\times
+\text{objective mixture advantage}.
+\]
+
+各个符号含义是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \(i\)：同一个 prompt 下的第 \(i\) 条 sampled trajectory。
+  \item \(t\)：flow / denoising trajectory 上的某个 timestep。
+  \item \(k\)：第 \(k\) 个 reward objective，例如 CLIP-T、Aesthetic、HPS，或者 video 里的 visual / motion / text alignment。
+  \item \(A_k^i\)：第 \(i\) 个样本在第 \(k\) 个 reward objective 上的 group-normalized advantage。
+  \item \(w_t^i\)：第 \(t\) 个 step 对最终结果的相对贡献。
+  \item \(c_k^i\)：第 \(i\) 条 trajectory 上，不同 reward objectives 的融合权重。
+\end{itemize}
+
+\begin{center}
+  \includegraphics[width=0.92\linewidth]{otca/fig2_method_overview.png}
+
+  {\small \textbf{图 2：} OTCA 方法概览。TCD 产生 timestep 权重 \(w_t^i\)，MOCA 产生多目标权重 \(c_k^i\)，最后合成 \(\tilde{A}_t^i\)。图源：arXiv HTML。}
+\end{center}
+
+\begin{warnbox}
+\textbf{一个细节要注意：} 论文文字里常说 timestep-aware objective mixture，但主公式里的 MOCA 权重是 \(c_k^i\)，不是 \(c_{t,k}^i\)。也就是说，严格从公式看，OTCA 的 objective mixture 是 sample / trajectory conditioned；真正随 timestep 变化的是 \(w_t^i\)。它不是完全为每个 timestep 单独求一组 objective weights。
+\end{warnbox}
+
+\subsection{3. Flow-SDE 背景：为什么有 trajectory 可以做 credit}
+
+Flow matching 的确定性采样通常写成 ODE：
+
+\[
+\mathrm{d}\mathbf{z}_t
+=
+\mathbf{u}_t\,\mathrm{d}t .
+\]
+
+但 GRPO 需要 stochastic trajectory，才能把每一步看成 policy transition 并计算 ratio。因此论文沿用 prior work，把 ODE 换成 reverse-time SDE：
+
+\[
+\mathrm{d}\mathbf{z}_t
+=
+\left(
+\mathbf{u}_t
+-
+\frac{1}{2}\varepsilon_t^2
+\nabla_{\mathbf{z}_t}\log p_t(\mathbf{z}_t)
+\right)\mathrm{d}t
++
+\varepsilon_t\,\mathrm{d}\mathbf{w}.
+\]
+
+这样每个 step 都可以被理解为：
+
+\[
+\mathbf{a}_{t,i}
+\sim
+\pi_\theta(\cdot|\mathbf{s}_{t,i}),
+\]
+
+于是可以写：
+
+\[
+\rho_t^i
+=
+\frac{
+\pi_\theta(\mathbf{a}_{t,i}|\mathbf{s}_{t,i})
+}{
+\pi_{\theta_{\mathrm{old}}}(\mathbf{a}_{t,i}|\mathbf{s}_{t,i})
+}.
+\]
+
+\textbf{这一点和 PCPO 是同一个入口：} 都先把 flow ODE 放到 SDE / stochastic policy 的框架里，再谈 GRPO objective。区别是 PCPO 研究 \(\rho_t^i\) 本身的 hidden weight；OTCA 研究 \(\tilde{A}_t^i\) 应该怎么构造。
+
+\subsection{4. TCD：用 latent similarity 估计哪个 step 重要}
+
+TCD 全称是 Trajectory-Level Credit Decomposition。它负责估计：
+
+\[
+w_t^i
+=
+\text{第 \(i\) 条 trajectory 的第 \(t\) 个 step 应该拿多少 temporal credit。}
+\]
+
+它没有像 DenseGRPO 那样对每个 \(x_t\) 做 ODE readout 再打 reward，而是用一个更便宜的 latent proxy。
+
+\subsubsection{4.1 先看中间 latent 和 final latent 的相似度}
+
+对第 \(i\) 条 trajectory，记中间 latent 为 \(z_t^i\)，最终 latent 为 \(z_{\mathrm{final}}^i\)。TCD 计算它们的 cosine similarity：
+
+\[
+S_t^i
+=
+\frac{
+z_t^i \cdot z_{\mathrm{final}}^i
+}{
+\|z_t^i\|\,\|z_{\mathrm{final}}^i\|
+}.
+\]
+
+这个 \(S_t^i\) 的直觉是：
+
+\[
+\text{当前 latent 和最终结果方向越接近，说明它越像最终要生成的东西。}
+\]
+
+但论文不直接用 \(S_t^i\)，而是用相邻两步的变化量：
+
+\[
+\Delta S_t^i
+=
+S_t^i-S_{t+1}^i .
+\]
+
+注意这里的符号和时间方向有关。因为 denoising / flow trajectory 通常从 noisy 走向 clean，论文按它自己的 \(t\) 编号写成 \(S_t^i-S_{t+1}^i\)。我们读的时候只要抓住意思：
+
+\[
+\Delta S_t^i
+\approx
+\text{这个 transition 让 latent 朝 final latent 靠近了多少。}
+\]
+
+如果某一步让 latent 更明显地对齐最终状态，就认为它对最终结果更重要。
+
+\subsubsection{4.2 把 similarity gain 变成 temporal weight}
+
+OTCA 把负的贡献截掉，然后归一化：
+
+\[
+w_t^i
+=
+\frac{
+\max(0,\Delta S_t^i)+\epsilon
+}{
+\sum_{\tau}
+\left(
+\max(0,\Delta S_\tau^i)+\epsilon
+\right)
+}.
+\]
+
+这保证：
+
+\[
+w_t^i \ge 0,
+\qquad
+\sum_t w_t^i = 1.
+\]
+
+于是每条 trajectory 的 temporal credit 被重新分配到不同 timesteps：
+
+\[
+\text{重要 steps}
+\Rightarrow
+\text{更大的 }w_t^i,
+\qquad
+\text{不重要 steps}
+\Rightarrow
+\text{更小的 }w_t^i.
+\]
+
+\begin{intubox}
+\textbf{和 DenseGRPO 的区别：} DenseGRPO 的 \(\Delta R_t\) 更像真实 reward gain，但要 ODE readout 和 reward scoring，成本高。OTCA 的 \(\Delta S_t\) 是 latent proxy，不需要额外 reward model 调每个中间点，便宜很多，但因果性弱一些。
+\end{intubox}
+
+\begin{center}
+  \includegraphics[width=0.9\linewidth]{otca/fig6_tcd_proxy_validation.png}
+
+  {\small \textbf{图 3：} 论文在 appendix 里用 \(\Delta S_t^i\) 和真实 reward gain \(\Delta R_t^i\) 的趋势对比来支持 TCD。它们大体相关，但不是严格相等。图源：arXiv HTML。}
+\end{center}
+
+\subsection{5. MOCA：多目标 reward 不要粗暴相加}
+
+MOCA 全称是 Multi-Objective Credit Allocation。它负责估计：
+
+\[
+c_k^i
+=
+\text{第 \(i\) 条 trajectory 上第 \(k\) 个 reward objective 的权重。}
+\]
+
+假设我们有 \(K\) 个 reward objectives。对第 \(i\) 个样本，每个 objective 都可以得到一个 group-normalized advantage：
+
+\[
+\mathbf{A}^i
+=
+\left[
+A_1^i,A_2^i,\ldots,A_K^i
+\right].
+\]
+
+如果直接加权平均：
+
+\[
+A_{\mathrm{sum}}^i
+=
+\sum_{k=1}^{K}\alpha_k A_k^i,
+\]
+
+就有两个问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 不同 reward 可能冲突，比如 aesthetic 上升但 text alignment 下降。
+  \item 固定 \(\alpha_k\) 不知道当前样本和当前 trajectory 更需要哪个 objective。
+\end{enumerate}
+
+\subsubsection{5.1 从 gradient-space MOO 到 advantage-space MOO}
+
+标准 multi-objective optimization 可以在 gradient space 里做：
+
+\[
+\min_{\{c_k\}_{k=1}^{K}}
+\left\|
+\sum_{k=1}^{K}
+c_k
+\nabla_\theta \mathcal{L}_k(\theta)
+\right\|^2,
+\qquad
+\sum_{k=1}^{K}c_k=1,\quad c_k\ge 0.
+\]
+
+但对大视觉生成模型来说，为每个 objective 单独算 gradient 再解 MOO 太贵。OTCA 的观察是：对同一个 sample，在同一次 policy update 里，不同 objective 的梯度主要差在 scalar advantage \(A_k^i\)。于是把问题投影到 advantage space：
+
+\[
+\min_{\{c_k^i\}_{k=1}^{K}}
+\left\|
+\sum_{k=1}^{K}
+c_k^i A_k^i
+\right\|^2,
+\qquad
+\sum_{k=1}^{K}c_k^i=1,\quad c_k^i\ge 0.
+\]
+
+这就是 MOCA 的主体：不用真正存每个 objective 的梯度，而是在低维 advantage vector 上决定 reward mixture。
+
+\subsubsection{5.2 为什么还要 exploration bias}
+
+单纯 minimum-norm 有一个问题：它容易太保守。因为它倾向于找到一个让综合 advantage 接近 0 的组合，避免冲突，但也可能把真正高收益的方向抵消掉。
+
+所以 OTCA 构造了一个 trajectory-level exploration signal：
+
+\[
+q_i
+=
+\sum_{t=1}^{T} w_t^i \Delta S_t^i,
+\qquad
+e_i
+=
+\frac{
+|q_i|
+}{
+\mathrm{std}(\{q_j\}_{j=1}^{G})+\epsilon
+}.
+\]
+
+其中 \(q_i\) 表示这条 trajectory 的结构变化强度，\(e_i\) 表示它相对组内其他 samples 有多 distinctive。然后定义 exploration strength：
+
+\[
+\lambda_i
+=
+\frac{
+\max\left(0,\sum_{k=1}^{K} A_k^i\right)
+}{
+\left|\sum_{k=1}^{K} A_k^i\right|+\epsilon
+}
+\cdot
+\tanh(e_i).
+\]
+
+这个设计有两个门控：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 只有综合 advantage 为正时才鼓励探索，避免放大坏方向。
+  \item \(\tanh(e_i)\) 把探索强度压到有界范围，避免异常 trajectory 造成不稳定。
+\end{itemize}
+
+最终的 MOCA solver 变成：
+
+\[
+\min_{\{c_k^i\}}
+\left\|
+\sum_{k=1}^{K} c_k^i A_k^i
+\right\|^2
+-
+\lambda_i
+\sum_{k=1}^{K} c_k^i A_k^i,
+\qquad
+\sum_{k=1}^{K}c_k^i=1,\quad c_k^i\ge 0.
+\]
+
+前半项负责 conflict-aware fusion，后半项负责不要太保守。
+
+\subsection{6. 最终训练目标}
+
+OTCA 最后只是把原本的 \(A_i\) 换成 \(\tilde{A}_t^i\)：
+
+\[
+\mathcal{J}_{\mathrm{OTCA}}(\theta)
+=
+\mathbb{E}
+\left[
+\frac{1}{G}\sum_{i=1}^{G}
+\frac{1}{T}\sum_{t=1}^{T}
+\min
+\left(
+\rho_t^i \tilde{A}_t^i,\,
+\mathrm{clip}(\rho_t^i,1-\epsilon,1+\epsilon)\tilde{A}_t^i
+\right)
+\right].
+\]
+
+把 \(\tilde{A}_t^i\) 展开就是：
+
+\[
+\rho_t^i
+\left(
+w_t^i
+\sum_{k=1}^{K}c_k^i A_k^i
+\right).
+\]
+
+所以每个 step 的实际更新强度由三部分共同决定：
+
+\[
+\text{policy ratio}
+\times
+\text{temporal credit}
+\times
+\text{objective credit}.
+\]
+
+\begin{summarybox}
+\textbf{和 PCPO 的连接：} PCPO 提醒我们 \(\rho_t^i\) 里也有 timestep bias；OTCA 处理的是 \(\tilde{A}_t^i\) 的结构。更完整的 credit assignment 其实需要同时看 ratio 侧和 advantage 侧。
+\end{summarybox}
+
+\subsection{7. 实验怎么证明它有效}
+
+\subsubsection{7.1 Image generation}
+
+图像实验用 FLUX.1-dev。训练 reward 包括 CLIP-T、LAION-Aesthetic、HPSv2.1；同时用 PickScore 和 ImageReward 看泛化。
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{CLIP-T} & \textbf{Aesthetic} & \textbf{HPS} & \textbf{PickScore} & \textbf{ImageReward}\\
+\midrule
+Flux & 0.2682 & 6.2508 & 0.2986 & 22.66 & 1.1001\\
+DanceGRPO & 0.2619 & \textbf{6.8917} & 0.3018 & 22.70 & 1.0172\\
+VIPO & 0.2722 & 6.7813 & 0.3026 & 22.69 & 1.1128\\
+OTCA & \textbf{0.3071} & 6.6028 & \textbf{0.3225} & \textbf{22.97} & \textbf{1.1998}\\
+\bottomrule
+\end{tabular}
+}
+
+{\small \textbf{表 1：} 图像指标。OTCA 在 CLIP-T、HPS、PickScore、ImageReward 上最好；Aesthetic 是 DanceGRPO 更高。}
+\end{center}
+
+这里最值得注意的不是“每个指标都赢”，而是 \textbf{trade-off 更均衡}。DanceGRPO 的 aesthetic 很高，但 semantic / preference 指标不一定一起变好；OTCA 通过 MOCA 把多个 objective 更平衡地组织起来。
+
+\begin{center}
+  \includegraphics[width=0.95\linewidth]{otca/fig3_image_qualitative.png}
+
+  {\small \textbf{图 4：} 图像生成质性结果。OTCA 主要展示语义一致性、结构清晰度和局部细节上的提升。图源：arXiv HTML。}
+\end{center}
+
+\subsubsection{7.2 Video generation}
+
+视频实验用 Wan2.2-T2V-14B-480P，reward 来自 VideoAlign，包含 visual quality、motion quality、text alignment。
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Method} & \textbf{Color} & \textbf{Dynamic} & \textbf{Imaging} & \textbf{Multiple} & \textbf{Scene} & \textbf{Spatial} & \textbf{Subject}\\
+\midrule
+Wan2.2 & 89.79 & 70.83 & 68.34 & 63.79 & 35.90 & 80.54 & 93.78\\
+DanceGRPO & 90.35 & 71.45 & 67.93 & 64.85 & 35.18 & 83.25 & 93.76\\
+OTCA & \textbf{92.88} & \textbf{75.00} & \textbf{68.58} & \textbf{68.45} & \textbf{38.45} & \textbf{88.57} & \textbf{93.95}\\
+\bottomrule
+\end{tabular}
+}
+
+{\small \textbf{表 2：} VBench 细分指标。OTCA 在列出的 video 维度上都优于 Wan2.2 和 DanceGRPO。}
+\end{center}
+
+\begin{center}
+\resizebox{0.7\linewidth}{!}{
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Quality} & \textbf{Semantic} & \textbf{Total}\\
+\midrule
+Wan2.2 & 83.30 & 73.10 & 81.26\\
+DanceGRPO & 83.31 & 73.31 & 81.31\\
+OTCA & \textbf{83.72} & \textbf{75.19} & \textbf{82.01}\\
+\bottomrule
+\end{tabular}
+}
+
+{\small \textbf{表 3：} VBench 总分。提升主要体现在 semantic score。}
+\end{center}
+
+\begin{center}
+  \includegraphics[width=0.95\linewidth]{otca/fig4_video_qualitative.png}
+
+  {\small \textbf{图 5：} 视频生成质性结果。论文强调 OTCA 改善物理合理性、运动演化和语义一致性。图源：arXiv HTML。}
+\end{center}
+
+\subsubsection{7.3 Ablation：TCD 和 MOCA 都有用}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Ablation} & \textbf{CLIP-T} & \textbf{Aesthetic} & \textbf{HPS} & \textbf{PickScore} & \textbf{ImageReward}\\
+\midrule
+Flux & 0.2682 & 6.2508 & 0.2986 & 22.66 & 1.1001\\
+MOCA-only & 0.2787 & 6.2120 & 0.3049 & 22.64 & 1.1250\\
+TCD-only & 0.2708 & 6.3270 & 0.3104 & 22.87 & \textbf{1.2618}\\
+OTCA Full & \textbf{0.3071} & \textbf{6.6028} & \textbf{0.3225} & \textbf{22.97} & 1.1998\\
+\bottomrule
+\end{tabular}
+}
+
+{\small \textbf{表 4：} Ablation。TCD-only 和 MOCA-only 都有提升，完整 OTCA 在多数指标上最好。}
+\end{center}
+
+\begin{center}
+  \includegraphics[width=0.95\linewidth]{otca/fig5_reward_curves.png}
+
+  {\small \textbf{图 6：} Reward curves。完整 OTCA 的收敛速度和最终 reward 普遍更好。图源：arXiv HTML。}
+\end{center}
+
+\subsection{8. 训练成本和实现细节}
+
+论文给出的主要实现设置是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Image：} FLUX.1-dev，group size \(G=12\)，训练分辨率 \(512\times512\)，16 sampling steps。
+  \item \textbf{Video：} Wan2.2-T2V-14B-480P，group size \(G=32\)，训练分辨率 \(240\times416\times53\)，16 sampling steps。
+  \item \textbf{Inference：} Flux 用 \(512\times512\)、50 steps；Wan2.2 用 \(480\times832\times53\)、50 steps。
+  \item \textbf{Hardware：} image experiments 用 8 张 NVIDIA H100；video experiments 用 32 张 NVIDIA H100。
+  \item \textbf{SDE stochasticity：} \(\eta=0.3\) for Flux，\(\eta=0.8\) for Wan2.2。
+  \item \textbf{Learning rate：} image \(1\times10^{-5}\)，video \(5\times10^{-6}\)。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{成本判断：} OTCA 比 DenseGRPO 那种每个 timestep ODE readout 便宜，因为 TCD 用 latent similarity proxy；但它并不是低成本小实验，尤其视频部分仍然是 32 张 H100 级别。它的主要节省来自“不对每个中间 latent 都 decode / reward scoring”，不是来自 GRPO 本身变便宜。
+\end{warnbox}
+
+\subsection{9. 我对这篇的理解和保留意见}
+
+\subsubsection{9.1 最值得学的点}
+
+\textbf{OTCA 的最大价值是把 credit assignment 拆成了两个正交轴：}
+
+\[
+\text{when}
+\quad
+\text{and}
+\quad
+\text{what}.
+\]
+
+这比只说“每个 step 都有不同 reward”更进一步。因为在真实 visual post-training 里，reward 往往不是一个，而是一组：
+
+\[
+\text{text alignment},\quad
+\text{aesthetic},\quad
+\text{human preference},\quad
+\text{motion},\quad
+\text{physical plausibility}.
+\]
+
+如果只做 temporal credit，不处理 reward objective 冲突，仍然可能把某些 steps 往错误目标上推。
+
+\subsubsection{9.2 最大的局限}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{TCD 是 proxy，不是真正 causal reward gain。} \(\Delta S_t^i\) 衡量的是 latent 朝 final latent 的对齐变化，不等价于 reward improvement。它可能和最终 reward 有相关性，但不是 DenseGRPO 式的 readout counterfactual。
+  \item \textbf{MOCA 的 \(c_k^i\) 不是逐 timestep 的。} 主公式里 \(c_k^i\) 没有 \(t\)，所以它更多是在 trajectory / sample 层面做 objective mixture，再通过 \(w_t^i\) 分配到各 steps。
+  \item \textbf{advantage-space MOO 是近似。} 它避免了 per-objective gradient 的计算，但也意味着它没有真正解决 gradient conflict，只是在 scalar advantage 层面做了一个 proxy。
+  \item \textbf{实验成本仍然很高。} 特别是视频部分用了 32 张 H100，这说明方法虽然避免了 Dense readout，但 visual GRPO 本身仍是重计算路线。
+\end{enumerate}
+
+\subsection{10. 和我们当前主线的关系}
+
+读完 OTCA 后，这条主线可以更新成：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llll}
+\toprule
+\textbf{层面} & \textbf{代表论文} & \textbf{解决什么} & \textbf{还没解决什么}\\
+\midrule
+step reward gain & DenseGRPO & 每步真实 reward improvement & 成本高，readout 太密\\
+chunk unit & Chunk-GRPO & 更新粒度更平滑 & 仍多用 terminal advantage\\
+branch counterfactual & TempFlow-GRPO & 单步分叉的局部影响 & branch 设计和成本复杂\\
+ratio / objective scale & PCPO & ratio 自带 timestep bias & 不直接重构 reward credit\\
+temporal + objective credit & OTCA & when + what & TCD / MOCA 都是 proxy\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{当前阶段我的判断：} OTCA 值得学，但不要把它看成 credit assignment 的最终答案。它更像一个框架提醒：真实 visual GRPO 的有效 advantage 应该同时包含 temporal importance 和 objective importance。对于我们后续想做的改进，更关键的问题仍然是：能否用低成本方式估计更接近 causal reward gain 的 \(w_t\) 或 chunk-level \(w_{\mathrm{ch}}\)，同时保留多目标 reward 的动态分配。
+\end{summarybox}

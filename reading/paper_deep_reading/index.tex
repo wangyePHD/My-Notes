@@ -1,0 +1,38 @@
+% Paper deep reading note zone.
+% Add topic sub-zones below.
+
+\part*{论文精读专区}
+\phantomsection
+\addcontentsline{toc}{part}{论文精读专区}
+
+\begin{conceptbox}
+\textbf{用途：} 这里沉淀单篇论文的精读笔记。日报负责发现论文，Survey 负责组织专题，精读专区负责把一篇论文拆到问题、方法、实验、局限和可复用点。\\
+\textbf{组织方式：} 每个方向一个小专区，单篇精读放进对应子目录；跨方向论文优先按“最主要贡献”归档，必要时在其它专区索引里加交叉引用。\\
+\textbf{建议节奏：} 每篇精读控制在一个稳定模板内，避免只摘摘要；重点写清楚它解决什么问题、相对前作改了哪里、关键假设是什么、哪些结论可以迁移到自己的研究。
+\end{conceptbox}
+
+\section*{专区索引}
+\phantomsection
+\addcontentsline{toc}{section}{专区索引}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{后训练与 RL 对齐}：RLHF/RLVR/GRPO/DPO/奖励模型/信用分配。
+  \item \textbf{图像生成与编辑模型}：T2I、image editing、视觉文本生成、可控生成。
+  \item \textbf{视频生成与编辑模型}：T2V/I2V、视频编辑、长视频 DiT、物理一致性。
+  \item \textbf{统一理解与生成模型}：BAGEL/Janus/Tuna/BLIP3o/any-to-any。
+  \item \textbf{世界模型与 3D}：world model、3D/4D 生成、空间智能、仿真。
+  \item \textbf{具身智能与 VLA}：VLA、机器人后训练、仿真环境、操作策略。
+  \item \textbf{Style / Identity / Design}：风格、身份保持、设计工作流、审美奖励。
+  \item \textbf{评测、安全与红队}：benchmark、safety、provenance、failure discovery。
+  \item \textbf{系统与推理效率}：训练/推理系统、attention、采样加速、工程优化。
+\end{itemize}
+
+\input{reading/paper_deep_reading/post_training/index}
+\input{reading/paper_deep_reading/image_models/index}
+\input{reading/paper_deep_reading/video_models/index}
+\input{reading/paper_deep_reading/unified_models/index}
+\input{reading/paper_deep_reading/world_models/index}
+\input{reading/paper_deep_reading/embodied_ai/index}
+\input{reading/paper_deep_reading/style_identity/index}
+\input{reading/paper_deep_reading/evaluation_safety/index}
+\input{reading/paper_deep_reading/systems_inference/index}
