@@ -1,0 +1,567 @@
+% ============================================================
+% Stage 0：标准 Attention 的瓶颈账本
+% ============================================================
+
+\section{Stage 0：标准 Attention 的瓶颈账本}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 先不急着学 FlashAttention。你要先把标准 attention 到底贵在哪里讲清楚。学完这一节，你至少要能回答四件事：\\
+1. \key{标准 scaled dot-product attention 的每一步在算什么}；\\
+2. \key{$O(n^2)$ 到底来自哪里，是计算量、显存，还是 IO}；\\
+3. \key{训练和推理阶段 attention 的显存瓶颈有什么不同}；\\
+4. \key{为什么 FlashAttention 能成为 AIGC 工程里的默认优化方向。}
+\end{conceptbox}
+
+\note{这一节只建立瓶颈账本，不深入 FlashAttention kernel。你可以把它理解成后面所有高效 attention 技术的“问题定义”。}
+
+\subsection{一、先从标准 attention 公式开始}
+
+Transformer 里的 scaled dot-product attention 通常写成：
+
+\[
+\mathrm{Attention}(Q,K,V)
+=
+\mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d}} + M\right)V
+\]
+
+其中：
+\begin{itemize}[leftmargin=1.5em]
+  \item $Q$ 是 query，表示“当前位置想找什么信息”。
+  \item $K$ 是 key，表示“每个位置能被什么方式匹配”。
+  \item $V$ 是 value，表示“匹配之后真正要取回的信息”。
+  \item $d$ 是每个 head 的维度，$\sqrt{d}$ 用来缩放 dot product，避免 logits 过大导致 softmax 饱和。
+  \item $M$ 是 mask，例如 causal mask、padding mask、局部窗口 mask、文档边界 mask。
+\end{itemize}
+
+从工程实现上看，单个 attention head 的核心流程可以拆成四步：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.2cm}p{5.4cm}}
+\hline
+\textbf{步骤} & \textbf{张量形状} & \textbf{含义} \\
+\hline
+输入 $Q,K,V$ & $Q,K,V \in \mathbb{R}^{n \times d}$ & $n$ 是 token 数，$d$ 是 head dim。 \\
+算 score & $S = QK^\top \in \mathbb{R}^{n \times n}$ & 每个 query token 和每个 key token 两两打分。 \\
+做 softmax & $P = \mathrm{softmax}(S / \sqrt{d} + M)$ & 把分数变成每个 query 对所有 key 的注意力分布。 \\
+加权求和 & $O = PV \in \mathbb{R}^{n \times d}$ & 用注意力分布从 value 里取信息。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{最关键的直觉：} 标准 attention 的语义是\key{每个 token 都和所有 token 发生一次关系判断}。所以只要 token 数 $n$ 变大，token pair 数量就会按 $n^2$ 增长。
+\end{intubox}
+
+\subsection{二、$O(n^2)$ 到底在哪里出现？}
+
+最容易混淆的一点是：$O(n^2)$ 不只是“算得多”，它还意味着中间矩阵可能很大，而且这些中间矩阵还要在 GPU 显存层级之间反复读写。
+
+\subsubsection*{1. 计算量：每个 query 都要扫所有 key}
+
+单个 head 的 score 计算是：
+
+\[
+S = QK^\top
+\]
+
+$Q$ 的形状是 $n \times d$，$K^\top$ 的形状是 $d \times n$，所以输出 $S$ 是 $n \times n$。这个矩阵里每一个元素 $S_{ij}$ 都表示：第 $i$ 个 query token 和第 $j$ 个 key token 的相似度。
+
+因此 score matmul 的计算量大约是：
+
+\[
+O(n^2 d)
+\]
+
+后面的 $PV$ 也是类似量级：
+
+\[
+P \in \mathbb{R}^{n \times n},\quad V \in \mathbb{R}^{n \times d},\quad O=PV \Rightarrow O(n^2 d)
+\]
+
+所以 attention 的主要矩阵乘计算可以粗略理解成两次 $n^2d$ 级别的操作。
+
+\subsubsection*{2. 显存：score / probability matrix 是 $n \times n$}
+
+如果朴素实现把 score matrix $S$ 和 softmax 后的 probability matrix $P$ 都显式保存下来，那么单个 batch、单个 head 就会有 $n^2$ 个元素。
+
+如果考虑 batch size $B$ 和 attention heads $H$，那么 attention probability 的元素数量就是：
+
+\[
+B \times H \times n \times n
+\]
+
+若 dtype 是 BF16/FP16，每个元素 2 bytes，那么只保存一个 attention matrix 的字节数约为：
+
+\[
+M_{\text{attn matrix}}
+\approx
+B \times H \times n^2 \times 2
+\]
+
+\begin{warnbox}
+\textbf{注意：} 这还只是一个矩阵的大小。训练时为了反向传播，朴素实现可能还需要保存 softmax 结果、dropout mask、部分中间状态，真实峰值会更复杂。
+\end{warnbox}
+
+\subsubsection*{3. 先把 HBM / SRAM 讲清楚：IO 不是磁盘 IO，而是 GPU 内存搬运}
+
+这里的 \key{IO} 不是读文件、读网络，也不是 CPU 磁盘 IO。FlashAttention 论文里说的 IO，主要是指 \key{GPU 上不同层级内存之间的数据搬运}，尤其是 HBM 和片上高速内存之间的读写。
+
+\begin{conceptbox}
+\textbf{一句话版：} HBM 是 GPU 的“大仓库”，容量大，能长期放 tensor，但访问它仍然比片上内存贵；SRAM 是 GPU 芯片里的“小工作台”，非常快，但容量很小，只能临时放 tile、局部变量和中间结果。FlashAttention 的核心直觉就是：\key{少把大矩阵搬进搬出大仓库，多在小工作台上分块算完就合并结果。}
+\end{conceptbox}
+
+先按工程直觉理解这几个层级：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.9cm}p{3.2cm}p{3.4cm}p{3.5cm}}
+\hline
+\textbf{层级} & \textbf{大概是什么} & \textbf{特点} & \textbf{在 attention 里的角色} \\
+\hline
+HBM / global memory & GPU 显存主体，CUDA tensor 大多长期存这里 & 容量大，带宽高，但相对片上内存仍然慢 & 放 $Q,K,V,O$，朴素实现还会放完整 $S$ 和 $P$。 \\
+L2 cache & GPU 芯片上的共享缓存 & 比 HBM 快，容量远小于 HBM，由硬件自动管理 & 缓存最近访问的数据，提升复用，但不能指望它装下完整 attention matrix。 \\
+Shared memory / L1 & 每个 SM 附近的片上高速存储 & 很快，容量很小，常由 kernel 显式组织使用 & 放当前 block 正在处理的 $Q/K/V$ tile。 \\
+Registers & 每个线程自己的寄存器 & 最快，但最小 & 放 running max、running sum、局部累加结果等标量或小向量。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{怎么理解论文里的 SRAM：} FlashAttention 论文把 HBM 和 SRAM 抽象成两级内存模型。这里的 SRAM 不是说你在代码里一定会看到一个变量叫 \texttt{SRAM}，而是泛指 GPU 芯片上的高速小容量存储，例如 registers、shared memory、L1/L2 cache 等。实际 CUDA/Triton kernel 会综合使用这些层级。
+\end{intubox}
+
+\subsubsection*{4. 为什么不能直接把 attention matrix 放进 SRAM？}
+
+因为 attention matrix 太大，而 SRAM 太小。以前面这个例子看：
+
+\[
+B=1,\quad H=32,\quad n=8192,\quad \text{dtype}=\mathrm{BF16/FP16}
+\]
+
+完整 attention matrix 的大小是：
+
+\[
+1 \times 32 \times 8192^2 \times 2
+\approx
+4.0\ \mathrm{GiB}
+\]
+
+如果只看\key{单个 head}，也有：
+
+\[
+8192^2 \times 2
+= 128\ \mathrm{MiB}
+\]
+
+而一个 GPU block 能直接高效使用的 shared memory / registers 只是很小的一块片上工作区，远远装不下一个完整的 $8192 \times 8192$ 矩阵。
+
+\begin{warnbox}
+\textbf{所以 FlashAttention 不是“把完整 $S$ 放到 SRAM 里”。}\\
+真正做法是：每次只拿一小块 $Q$、一小块 $K/V$ 到片上高速内存里，算出当前 tile 的局部 score；用 online softmax 把局部结果合并到最终输出；然后丢掉这个局部 score tile，继续处理下一块。这样就避免把完整 $S$ 或 $P$ 写回 HBM。
+\end{warnbox}
+
+\subsubsection*{5. 朴素 attention 的 HBM 往返路径}
+
+朴素 attention 的问题不是只算了一次 $S$，而是可能经历这样的路径：
+
+\begin{center}
+\begin{tabular}{p{13.2cm}}
+\hline
+从 HBM 读 $Q,K$，计算 $S=QK^\top$，把完整 $S$ 写回 HBM \\
+$\downarrow$ \\
+再从 HBM 读 $S$，做 mask 和 softmax，把完整 $P$ 写回 HBM \\
+$\downarrow$ \\
+再从 HBM 读 $P,V$，计算 $O=PV$，把 $O$ 写回 HBM \\
+\hline
+\end{tabular}
+\end{center}
+
+如果 $S$ 和 $P$ 都是 $B \times H \times n \times n$ 级别，那么这里最浪费的不是“有一次矩阵乘”，而是\key{把巨大的中间矩阵写到 HBM，再从 HBM 读回来}。
+
+\subsubsection*{6. FlashAttention 的 IO-aware 到底是什么意思？}
+
+\key{IO-aware} 的意思是：设计 attention 算法时，不只数 FLOPs，也要数 HBM 和片上内存之间搬了多少数据。
+
+它的思路可以粗略理解成：
+
+\begin{center}
+\begin{tabular}{p{13.2cm}}
+\hline
+从 HBM 读一块 $Q$，再分批读 $K,V$ 的 tile 到片上高速内存 \\
+$\downarrow$ \\
+在 tile 内部算局部 score，并用 online softmax 更新 running max / running sum \\
+$\downarrow$ \\
+不保存完整 $S/P$，只维护当前输出块的累加结果 \\
+$\downarrow$ \\
+最后把输出 $O$ 写回 HBM \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{FlashAttention 论文最重要的切入点就是这里：} 标准 attention 的数学公式没有错，瓶颈在于朴素实现会把巨大的 $n \times n$ 中间矩阵写回 HBM，再读出来继续算。FlashAttention 要优化的正是这种\key{HBM 读写次数、内存访问路径和中间矩阵物化}。
+\end{intubox}
+
+\begin{summarybox}
+\textbf{你现在应该形成的准确理解：} HBM 约等于 GPU 上放大 tensor 的主显存；SRAM 约等于 GPU 芯片上很快但很小的工作区。FlashAttention 不是把全部 attention matrix 塞进 SRAM，而是把计算切成很多 tile，在 SRAM 级别的小工作区里一块块处理，并用 online softmax 合并结果，从而避免完整物化 $S/P$。
+\end{summarybox}
+
+\subsubsection*{7. online softmax：为什么分块以后还能等价于标准 softmax？}
+
+上面一直说 FlashAttention 可以一块一块处理 score tile，并用 online softmax 合并结果。这里先把 online softmax 单独讲清楚。
+
+\begin{conceptbox}
+\textbf{一句话版：} online softmax 是一种\key{边读 logits、边维护 softmax 所需统计量}的方法。它不要求一次性拿到完整 logits 向量，也不需要先把整行 $S$ 存下来；只要维护 running max、running sum 和输出累加器，就能得到和普通 stable softmax 等价的结果。
+\end{conceptbox}
+
+普通 softmax 对一行 logits $x=[x_1,x_2,\dots,x_n]$ 的定义是：
+
+\[
+\mathrm{softmax}(x_i)=\frac{e^{x_i}}{\sum_j e^{x_j}}
+\]
+
+工程里一般不会直接这样算，因为 $e^{x_i}$ 可能数值溢出。更稳定的写法是先减去全局最大值：
+
+\[
+m=\max_j x_j
+\]
+
+\[
+\mathrm{softmax}(x_i)=\frac{e^{x_i-m}}{\sum_j e^{x_j-m}}
+\]
+
+这个写法的麻烦在于：朴素实现需要先看到整行 logits，才能知道全局最大值 $m$ 和分母。
+
+online softmax 的思路是：如果 logits 是一块一块来的，也可以边处理边维护两个量：
+
+\[
+m=\text{目前看过的最大值}
+\]
+
+\[
+l=\sum_{j \in \text{已看过的位置}} e^{x_j-m}
+\]
+
+这里的 $l$ 可以理解成当前 softmax 分母，只不过它永远是基于当前最大值 $m$ 归一化后的分母。
+
+如果已经处理过一部分 logits，状态是 $m_{old},l_{old}$，现在新来一个 logit $x$，新的最大值是：
+
+\[
+m_{new}=\max(m_{old},x)
+\]
+
+旧分母 $l_{old}$ 是基于旧最大值 $m_{old}$ 算的；如果最大值变了，就必须把旧分母缩放到新最大值的坐标系下：
+
+\[
+l_{new}
+=
+e^{m_{old}-m_{new}}l_{old}
++
+e^{x-m_{new}}
+\]
+
+\begin{intubox}
+\textbf{关键直觉：} 如果后面来了一个更大的 logit，那么以前所有 $e^{x_j-m_{old}}$ 都要按照 $e^{m_{old}-m_{new}}$ 缩小。这样前后所有项都被统一到新的最大值 $m_{new}$ 下面，数值稳定性仍然成立。
+\end{intubox}
+
+FlashAttention 里通常不是一个 logit 一个 logit 地更新，而是一个 tile 一个 tile 地更新。假设新来一块 logits $x_{block}$，先算这一块自己的最大值和分母：
+
+\[
+m_{block}=\max(x_{block})
+\]
+
+\[
+l_{block}=\sum_{x_i\in x_{block}}e^{x_i-m_{block}}
+\]
+
+再和旧状态合并：
+
+\[
+m_{new}=\max(m_{old},m_{block})
+\]
+
+\[
+l_{new}
+=
+e^{m_{old}-m_{new}}l_{old}
++
+e^{m_{block}-m_{new}}l_{block}
+\]
+
+这说明即使没有一次性保存完整 logits，也能得到和普通 stable softmax 相同的全局最大值和全局分母。
+
+放回 attention 里，我们最终要的不是单独的 softmax probability matrix，而是：
+
+\[
+O=\mathrm{softmax}(S)V
+\]
+
+所以 FlashAttention 还会维护一个输出累加器：
+
+\[
+o=\sum_j e^{x_j-m}v_j
+\]
+
+当新 block 到来时，输出累加器也要和分母一样缩放到新的最大值坐标系：
+
+\[
+o_{new}
+=
+e^{m_{old}-m_{new}}o_{old}
++
+e^{m_{block}-m_{new}}o_{block}
+\]
+
+最后再做归一化：
+
+\[
+O=\frac{o}{l}
+\]
+
+\begin{warnbox}
+\textbf{online softmax 不是近似算法。} 它没有改变 softmax 的数学定义，也没有少看 token。它只是把“先存完整 logits 再统一 softmax”的流程，改成了“边分块扫描、边更新 running max / running sum / output accumulator”。在浮点误差范围内，它仍然是在算标准 softmax attention。
+\end{warnbox}
+
+\begin{summarybox}
+\textbf{看代码时的理解方式：} 如果你看到 FlashAttention 或类似 kernel 里维护 \texttt{m}、\texttt{l}、\texttt{acc}、\texttt{rowmax}、\texttt{rowsum} 这类变量，它们通常就在做 online softmax：\texttt{m} 负责数值稳定的 running max，\texttt{l} 负责 softmax denominator，\texttt{acc} 负责累加 $\mathrm{softmax}(S)V$ 的未归一化输出。
+\end{summarybox}
+
+\subsection{三、一个长序列显存口算}
+
+现在做一个最小口算，帮助你建立直觉。假设：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item batch size $B=1$；
+  \item attention heads $H=32$；
+  \item sequence length $n=8192$；
+  \item attention matrix 使用 BF16/FP16，2 bytes / element。
+\end{itemize}
+
+那么只保存一个 $B \times H \times n \times n$ attention matrix 就需要：
+
+\[
+1 \times 32 \times 8192^2 \times 2
+\approx
+4.29 \times 10^9 \text{ bytes}
+\approx
+4.0 \text{ GiB}
+\]
+
+这只是\key{一层 attention 的一个大中间矩阵}。如果训练时每层都需要保存相关中间状态，或者 batch 更大、序列更长、head 更多，显存压力会非常快地爆炸。
+
+再看 $n=32768$：
+
+\[
+1 \times 32 \times 32768^2 \times 2
+\approx
+68.7 \times 10^9 \text{ bytes}
+\approx
+64.0 \text{ GiB}
+\]
+
+\begin{warnbox}
+\textbf{这就是长上下文为什么难：} sequence length 从 8k 增到 32k，是变成 4 倍；但 attention matrix 是 $n^2$，所以相关中间矩阵会变成 16 倍。
+\end{warnbox}
+
+\subsection{四、AIGC 里为什么 attention 瓶颈特别常见？}
+
+你是 AIGC 方向，所以不要只把 $n$ 理解成文本 token。很多生成模型都会把不同模态变成 token 序列：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.4cm}p{5.5cm}}
+\hline
+\textbf{场景} & \textbf{$n$ 来自哪里} & \textbf{为什么容易变大} \\
+\hline
+LLM 长上下文 & 文本 token 数 & 从 4k、8k 到 32k、128k，$n^2$ 压力迅速上升。 \\
+Diffusion Transformer / DiT & 图像 patch token & 分辨率越高，patch 数越多；多尺度或高分辨率训练更贵。 \\
+视频生成 & 帧数 $\times$ 空间 patch token & 时间维度和空间维度一起放大，token 数很容易爆炸。 \\
+多图多文本生成 & 文本 token + 图像 token & 条件信息更多，cross/self attention 的 token 组合更复杂。 \\
+多文档 / RAG / 长 prompt & 多段文档 token & 还可能需要 document mask、prefix mask、局部窗口等复杂 mask。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{AIGC 使用者视角：} Attention 优化不是一个“只在 LLM 里有用”的技巧。只要你的模型把文本、图像 patch、视频帧、条件信息都组织成 token，$n$ 变大以后 attention 就会变成核心瓶颈之一。
+\end{summarybox}
+
+\subsection{五、训练和推理的 attention 显存瓶颈不同}
+
+\subsubsection*{1. 训练：主要怕激活和中间状态}
+
+训练时要做 backward，所以 forward 阶段的很多中间状态要么需要保存，要么需要在 backward 时重算。对 attention 来说，朴素实现中最典型的压力来自：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $Q,K,V$ projection 输出；
+  \item attention score matrix $S$；
+  \item softmax probability matrix $P$；
+  \item dropout mask；
+  \item attention output 以及后续 residual / MLP 的激活。
+\end{itemize}
+
+因此训练 OOM 时，attention 相关优化通常会和这些策略一起出现：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{FlashAttention：} 减少 $S/P$ 这类 $n^2$ 中间矩阵的显式保存和 HBM 往返。
+  \item \textbf{Activation checkpointing：} 少保存部分激活，反向时重算。
+  \item \textbf{Mixed precision：} 用 BF16/FP16 降低参数、激活和中间状态的字节数。
+  \item \textbf{Sequence parallel / tensor parallel：} 把某些张量在多个 GPU 上切分。
+\end{itemize}
+
+\subsubsection*{2. 推理：prefill 和 decode 是两种瓶颈}
+
+LLM 推理通常可以分成两个阶段：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.6cm}p{5.3cm}}
+\hline
+\textbf{阶段} & \textbf{在做什么} & \textbf{attention 瓶颈} \\
+\hline
+Prefill & 一次性处理整个 prompt & prompt 长时仍然接近训练里的 dense causal attention，容易受 $n^2$ 影响。 \\
+Decode & 每次生成一个或少量新 token & 新 token 查询历史 KV cache，单步计算近似随历史长度线性增长。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+推理时通常不会像训练那样保存完整 backward 所需激活，但会长期保存 KV cache：
+
+\[
+M_{\text{KV cache}}
+\propto
+B \times L \times n \times H_{kv} \times d \times 2 \times \text{bytes}
+\]
+
+其中 $L$ 是层数，$H_{kv}$ 是 KV heads 数，$d$ 是 head dim，额外的 $2$ 表示 K 和 V 两份缓存。
+
+\begin{intubox}
+\textbf{一句话区分：} 训练更怕\key{attention 中间激活和 backward 状态}；LLM 推理更怕\key{长上下文 prefill 的计算量}和\key{decode 阶段不断增长的 KV cache}。
+\end{intubox}
+
+\subsection{六、为什么说 FlashAttention 是“实现优化”，不是“模型改造”？}
+
+这是第一节最重要的概念边界。
+
+标准 attention 的数学目标是：
+
+\[
+O_i = \sum_j \mathrm{softmax}\left(\frac{q_i k_j^\top}{\sqrt{d}} + M_{ij}\right)v_j
+\]
+
+FlashAttention 不改变这个公式。它不是说“只看一部分 token”，也不是说“用近似 softmax”。它做的是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把 $Q,K,V$ 分块搬到更快的小内存里计算；
+  \item 用 online softmax 在分块扫描时维持数值稳定；
+  \item 尽量不把完整 $n \times n$ score/probability matrix 写回 HBM；
+  \item backward 阶段通过重算部分中间量，减少 forward 需要保存的状态。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{所以你看别人代码时要分清两类东西：}\\
+\textbf{FlashAttention / SDPA backend} 通常是在\key{更高效地计算同一个 dense/causal attention}；\\
+\textbf{sliding window / sparse / block mask} 则是在\key{改变哪些 token pair 允许互相注意}。前者主要是实现优化，后者会改变 attention pattern。
+\end{warnbox}
+
+\subsection{七、看代码时应该抓哪些关键词？}
+
+第一节虽然不深入接口，但你现在可以先建立代码阅读雷达。看到下面这些词时，你应该意识到它们和 attention backend 或瓶颈有关：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.2cm}p{8.6cm}}
+\hline
+\textbf{关键词} & \textbf{你应该想到什么} \\
+\hline
+\texttt{scaled\_dot\_product\_attention} & PyTorch SDPA 统一入口，底层可能选择 math、memory-efficient 或 flash 类 backend。 \\
+\texttt{attn\_implementation} & Hugging Face 常见配置，例如 \texttt{eager}、\texttt{sdpa}、\texttt{flash\_attention\_2}。 \\
+\texttt{flash\_attn\_func} & 直接调用 \texttt{flash-attn} 包的 dense attention kernel。 \\
+\texttt{flash\_attn\_varlen\_func} & 变长序列 attention，通常会配合 \texttt{cu\_seqlens} 和 \texttt{max\_seqlen}。 \\
+\texttt{is\_causal} / \texttt{causal} & 是否使用因果 mask，即 token 不能看未来。 \\
+\texttt{attention\_mask} & 可能是 padding mask、causal mask 或业务自定义 mask；复杂 mask 会影响是否能命中高性能 backend。 \\
+\texttt{sliding\_window} & 局部窗口 attention，常见于长上下文或视频 token 场景。 \\
+\texttt{head\_dim} & 某些 kernel 对 head dimension 有限制，太大或不对齐可能 fallback。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{代码阅读第一原则：} 不要只看函数名里有没有 “flash”。你要同时看 \key{Q/K/V shape、dtype、mask 类型、causal 标志、head dim、是否变长序列}。这些条件共同决定它到底能不能走高性能路径。
+\end{summarybox}
+
+\subsection{八、这一节的最终账本}
+
+把这一节压缩成一张表：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.2cm}p{5.3cm}}
+\hline
+\textbf{维度} & \textbf{标准 attention 的成本} & \textbf{工程含义} \\
+\hline
+计算 & $QK^\top$ 和 $PV$ 都是 $O(n^2d)$ & 长序列和视频 token 会显著放大计算量。 \\
+显存 & score/probability 可能是 $B \times H \times n \times n$ & 朴素训练实现会被 $n^2$ 中间矩阵拖垮。 \\
+IO & $S/P$ 大矩阵在 HBM 与片上高速内存之间反复搬运 & 速度可能受 memory bandwidth 限制；FlashAttention 重点减少 HBM 读写，而不是减少 attention 的数学语义。 \\
+训练 & 要保存或重算 backward 所需中间状态 & FlashAttention、checkpointing、mixed precision 常组合使用。 \\
+推理 & prefill 受长 prompt 影响，decode 受 KV cache 影响 & FlashAttention 主要帮助 prefill / dense attention；KV cache 另有账本。 \\
+mask & 不同 mask 改变 token pair 可见性 & 简单 dense/causal 适合 SDPA/FlashAttention，复杂 mask 后面看 FlexAttention。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{conceptbox}
+\textbf{Stage 0 最终结论：} 标准 attention 的问题不是公式难，而是工程代价大。$n^2$ 同时体现在\key{计算量、显存中间矩阵和 HBM IO} 上。FlashAttention 的意义，就是在不改变 dense/causal attention 数学结果的前提下，减少 $n \times n$ 中间矩阵物化和内存读写；online softmax 则解释了为什么分块扫描 score tile 以后，仍然能得到标准 softmax 的结果。你先把这个问题定义吃透，后面学 tiling、SDPA、FlexAttention 才不会散。
+\end{conceptbox}
+
+\subsection{九、你学完这一节后应该能立刻回答的问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 标准 attention 里 $QK^\top$ 和 $PV$ 的形状分别是什么？
+  \item 为什么 attention 的 token pair 数是 $O(n^2)$？
+  \item 为什么只说 FLOPs 不够，还要看 HBM / SRAM IO？
+  \item 为什么 8k 到 32k sequence length 会让 attention matrix 变成 16 倍？
+  \item online softmax 里 running max 和 running sum 分别在维护什么？
+  \item 如果新 block 的最大值更大，为什么旧分母和旧输出累加器都要缩放？
+  \item 训练 OOM 时，attention 相关的中间状态主要有哪些？
+  \item LLM 推理里的 prefill 和 decode 为什么不是同一种瓶颈？
+  \item FlashAttention 为什么是 exact attention 的实现优化，而不是 sparse/approximate attention？
+\end{itemize}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item Vaswani 等，\emph{Attention Is All You Need}, arXiv:1706.03762。原始 Transformer 论文，给出 scaled dot-product attention 和 multi-head attention 的基本形式。\\
+  \url{https://arxiv.org/abs/1706.03762}
+  \item Dao 等，\emph{FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness}, arXiv:2205.14135。本文明确指出标准 attention 的瓶颈不仅是 FLOPs，也包括 HBM 读写和 $n^2$ 中间矩阵物化；同时使用 tiling 与 online softmax 来避免显式保存完整 attention matrix。\\
+  \url{https://arxiv.org/abs/2205.14135}
+  \item Milakov 和 Gimelshein，\emph{Online normalizer calculation for softmax}, arXiv:1805.02867。介绍 online normalizer / online softmax 的递推思想，是理解分块 softmax 归一化的重要背景资料。\\
+  \url{https://arxiv.org/abs/1805.02867}
+  \item Dao，\emph{FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning}, arXiv:2307.08691。作为后续版本，用来理解 FlashAttention 从省显存进一步走向更高 GPU 利用率。\\
+  \url{https://arxiv.org/abs/2307.08691}
+  \item PyTorch \texttt{scaled\_dot\_product\_attention} 文档：PyTorch 2.x 的 SDPA 统一接口，以及 math、memory-efficient、FlashAttention 等 backend 语义。\\
+  \url{https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html}
+  \item PyTorch CUDA notes：Scaled Dot Product Attention backend 控制与 CUDA 相关说明。\\
+  \url{https://docs.pytorch.org/docs/stable/notes/cuda.html#scaled-dot-product-attention}
+  \item PyTorch \texttt{MultiheadAttention} 文档：标准多头 attention 模块和 PyTorch 内部对 SDPA 快路径的说明。\\
+  \url{https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html}
+  \item NVIDIA CUDA C++ Programming Guide：CUDA memory hierarchy、global memory、shared memory、registers 等 GPU 内存层级说明。\\
+  \url{https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#memory-hierarchy}
+  \item NVIDIA CUDA C++ Best Practices Guide：memory optimizations 章节，用于理解内存访问、带宽和数据复用对 kernel 性能的影响。\\
+  \url{https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#memory-optimizations}
+  \item NVIDIA GPU Performance Background User's Guide：GPU 性能背景、内存带宽和计算吞吐之间关系的官方说明。\\
+  \url{https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html}
+\end{itemize}
+\endgroup

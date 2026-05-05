@@ -1,0 +1,592 @@
+% ============================================================
+% Stage 2：ZeRO 与 FSDP 这条工业主线
+% ============================================================
+
+\section{Stage 2：ZeRO 与 FSDP 这条工业主线}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 把 ZeRO 和 FSDP 放进同一个坐标系里学。学完这一页，你至少要能回答四件事：\\
+1. \key{DDP 的显存冗余到底冗余在哪里}；\\
+2. \key{ZeRO Stage 1/2/3 分别切了哪些状态}；\\
+3. \key{FSDP 和 ZeRO-3 为什么本质上很像，但工程接口不同}；\\
+4. \key{什么时候用 ZeRO-2、什么时候用 ZeRO-3、什么时候用 FSDP。}
+\end{conceptbox}
+
+\note{这一节默认你已经理解前两节：DDP 中每个 rank 完整保存参数、梯度和优化器状态；\texttt{all\_gather} 表示临时拼出完整对象，\texttt{reduce\_scatter} 表示归约后按 rank 分片保存。这里不会深挖 NCCL 或 collective 算法实现，只保留理解框架设计所需的通信语义。}
+
+\subsection*{资料收集与引用口径}
+
+\begin{conceptbox}
+\textbf{本节先查资料再整理结论。} 这一页主要参考三类资料：\\
+1. \key{DeepSpeed 官方资料}：DeepSpeed ZeRO tutorial 与 ZeRO-3 文档，用来确认 ZeRO Stage 1/2/3 的状态分片定义、offload、配置方式和工程约束；\\
+2. \key{PyTorch 官方资料}：PyTorch FSDP 文档与教程，用来确认 FSDP 的 sharding strategy、auto wrap、state dict、CPU offload、mixed precision 等接口语义；\\
+3. \key{论文与工程报告}：ZeRO、ZeRO-Offload、PyTorch FSDP 论文，用来理解状态冗余的理论动机、显存节省边界和工业训练经验。
+\end{conceptbox}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.7cm}p{9cm}}
+\hline
+\textbf{笔记结论} & \textbf{主要依据} \\
+\hline
+ZeRO 通过分片 optimizer states、gradients、parameters 来消除经典数据并行冗余 & DeepSpeed ZeRO tutorial；ZeRO 论文。 \\
+ZeRO-1/2/3 是逐步增加分片对象的三个阶段 & DeepSpeed ZeRO tutorial 与 ZeRO-3 文档。 \\
+FSDP 的 FULL\_SHARD 与 ZeRO-3 在目标上接近：参数、梯度、优化器状态都分片 & PyTorch FSDP 文档；PyTorch FSDP 论文。 \\
+FSDP 训练时需要在计算前临时 all-gather 参数，反向后 reduce-scatter 梯度 & PyTorch FSDP 文档与教程。 \\
+Offload 可以进一步降低 GPU 显存，但会把瓶颈转移到 CPU/NVMe 与互连带宽 & DeepSpeed ZeRO-Offload 文档；ZeRO-Offload 论文。 \\
+选型不只看能不能省显存，还要看吞吐、网络、checkpoint、生态和调试复杂度 & ZeRO、FSDP 工程文档与论文经验。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{一、先重新定位问题：DDP 到底浪费了什么}
+
+DDP 的设计非常干净：每个 rank 保存完整模型，处理不同数据子集，反向时同步梯度。它的问题也正因为这个设计而来：\key{模型状态在每个 rank 上完整复制}。
+
+设全模型参数量为 $N$，数据并行组大小为 $D$，每个参数相关状态字节数为：
+
+\[
+c_{\text{state}} = c_p + c_g + c_o
+\]
+
+其中 $c_p$ 是参数本体，$c_g$ 是梯度，$c_o$ 是优化器状态。DDP 单 rank 长期驻留的模型状态近似为：
+
+\[
+M_{\text{DDP}} = N(c_p + c_g + c_o)
+\]
+
+这里没有除以 $D$。这就是 ZeRO/FSDP 要解决的问题。
+
+\begin{warnbox}
+\textbf{一句话：} DDP 扩的是\key{吞吐}，不是\key{模型状态容量}。如果模型状态单卡放不下，加更多 DDP 卡通常也救不了，因为每张卡仍然要保存完整参数、完整梯度和完整优化器状态。
+\end{warnbox}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.5cm}p{5cm}}
+\hline
+\textbf{状态} & \textbf{DDP 单 rank 是否完整保存} & \textbf{为什么贵} \\
+\hline
+参数 & 是 & BF16/FP16 参数通常约 2 bytes/param。 \\
+梯度 & 是 & 反向后每个 rank 都有完整梯度。 \\
+优化器状态 & 是 & Adam/AdamW 的 $m/v$ 常见是 FP32，约 8 bytes/param；有时还有 FP32 master weights。 \\
+激活 & 不按参数分片 & 主要由 local micro-batch、序列长度、层数和实现决定。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{二、ZeRO 的统一视角：把数据并行里的冗余状态切开}
+
+ZeRO 是 \emph{Zero Redundancy Optimizer} 的缩写。它不是抛弃数据并行，而是继续保留数据并行的训练语义，同时把原本每个 rank 都完整保存的模型状态分片到不同 rank 上。\footnote{DeepSpeed ZeRO tutorial 明确说明 ZeRO 通过在数据并行设备之间 partition weights、gradients 和 optimizer states 来减少每个 GPU 的内存消耗；ZeRO 论文也把经典数据并行的状态冗余作为核心优化对象。}
+
+\begin{summarybox}
+\textbf{ZeRO 的核心思想：}\
+\key{训练还是数据并行；样本还是按 rank 切；但模型状态不再每张卡完整复制，而是让每张卡长期只负责其中一部分状态。}
+\end{summarybox}
+
+ZeRO 分成三个经典阶段：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.6cm}p{3.9cm}p{3.7cm}p{3.1cm}}
+\hline
+\textbf{阶段} & \textbf{分片对象} & \textbf{单 rank 长期状态近似} & \textbf{直觉} \\
+\hline
+ZeRO-1 & optimizer states & $N(c_p + c_g + c_o/D)$ & 先切最贵的 Adam 状态。 \\
+ZeRO-2 & optimizer states + gradients & $N(c_p + (c_g+c_o)/D)$ & 再把梯度也切掉。 \\
+ZeRO-3 & optimizer states + gradients + parameters & $N(c_p+c_g+c_o)/D$ & 参数、梯度、优化器状态全切。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{不要把 ZeRO 理解成模型并行。}\
+ZeRO 的主语仍然是数据并行：每个 rank 仍然处理不同数据样本。区别在于模型状态的\key{保存方式}变了，不是说每一层矩阵乘法都被切开计算。真正把单层计算切开的，是后面的 tensor parallel。
+\end{intubox}
+
+\subsection{三、ZeRO-1：先切 optimizer states}
+
+Adam/AdamW 的优化器状态通常很贵。以 BF16 参数和梯度、FP32 Adam moments 为例：
+
+\[
+2\text{ bytes 参数} + 2\text{ bytes 梯度} + 8\text{ bytes Adam moments}
+= 12\text{ bytes/param}
+\]
+
+其中 optimizer states 占了 $8/12$，也就是三分之二左右。因此 ZeRO-1 的第一刀非常自然：\key{只分片优化器状态}。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.2cm}p{5.1cm}}
+\hline
+\textbf{对象} & \textbf{ZeRO-1 状态} & \textbf{说明} \\
+\hline
+参数 & 完整复制 & 每个 rank 都有完整模型参数。 \\
+梯度 & 完整复制 & 反向后每个 rank 仍有完整梯度。 \\
+优化器状态 & 按 rank 分片 & 每个 rank 只维护自己负责那部分参数的 Adam states。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{ZeRO-1 适合什么情况？}\
+模型参数和梯度还能放下，但 Adam states 很吃紧；你想先用较低工程复杂度换一部分显存收益。它通常比 ZeRO-3 更少打扰训练时序，但省显存也有限。
+\end{summarybox}
+
+\subsection{四、ZeRO-2：再切 gradients}
+
+ZeRO-2 在 ZeRO-1 的基础上进一步分片梯度。直觉是：参数更新时，每个 rank 只负责自己那片 optimizer states，那么它也只需要对应那片参数的梯度来做更新，不必长期保存完整梯度。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.2cm}p{5.1cm}}
+\hline
+\textbf{对象} & \textbf{ZeRO-2 状态} & \textbf{说明} \\
+\hline
+参数 & 完整复制 & 每个 rank 仍有完整模型参数，所以前向/反向不需要临时 gather 参数。 \\
+梯度 & 按 rank 分片 & 梯度归约后只保留当前 rank 负责的那一片。 \\
+优化器状态 & 按 rank 分片 & 每个 rank 只更新自己负责的参数分片。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{为什么 ZeRO-2 很常用？}\
+因为它切掉了优化器状态和梯度这两大块，但参数仍然完整复制。这样显存收益明显，同时训练时不需要像 ZeRO-3 那样频繁在每层计算前临时拼参数，工程复杂度和吞吐损失通常更可控。
+\end{intubox}
+
+\begin{warnbox}
+\textbf{ZeRO-2 的边界：}\
+如果参数本体已经很大，导致每张卡连完整参数都放不下，那么 ZeRO-2 仍然不够。这个时候就要进入 ZeRO-3 或 FSDP FULL\_SHARD。
+\end{warnbox}
+
+\subsection{五、ZeRO-3：参数也切开}
+
+ZeRO-3 把三类模型状态都切开：optimizer states、gradients、parameters。它的稳态显存下界最漂亮：
+
+\[
+M_{\text{ZeRO-3 steady}}
+\approx
+\frac{N(c_p+c_g+c_o)}{D}
+\]
+
+但这个公式有一个重要限制：它说的是\key{长期驻留状态}，不是任意时刻的峰值显存。因为计算某一层时，rank 需要看到这一层可计算的参数，所以 ZeRO-3 会在需要时临时把参数分片 gather 出来，用完后再释放或重新分片。\footnote{DeepSpeed ZeRO-3 文档和 ZeRO 论文都强调 Stage 3 会分片模型参数，并按需收集参数；这带来更强显存节省，也引入更多通信和调度复杂度。}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.2cm}p{5.1cm}}
+\hline
+\textbf{对象} & \textbf{ZeRO-3 状态} & \textbf{说明} \\
+\hline
+参数 & 按 rank 分片 & 平时只保存一片；计算前按需临时拼出需要的参数。 \\
+梯度 & 按 rank 分片 & 反向后归约并分片保存。 \\
+优化器状态 & 按 rank 分片 & 每个 rank 更新自己负责的参数状态。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{ZeRO-3 适合什么情况？}\
+当模型参数本体、梯度和 Adam states 合起来已经远超单卡显存，或者你希望最大化数据并行组内的模型状态分片收益时，ZeRO-3 就很有价值。代价是通信更多、配置更复杂、checkpoint 和调试也更需要框架支持。
+\end{summarybox}
+
+\subsection{六、FSDP 的统一视角：PyTorch 原生的 fully sharded data parallel}
+
+FSDP 是 PyTorch 生态里的 Fully Sharded Data Parallel。它和 ZeRO-3 在目标上非常接近：\key{把参数、梯度、优化器状态都按 data-parallel ranks 分片}。区别更多体现在工程入口、模块包装方式、state dict 接口、PyTorch 原生集成和生态习惯上。\footnote{PyTorch FSDP 文档将 FSDP 描述为一种数据并行方法，通过跨 data-parallel workers 分片模块参数、梯度和优化器状态来节省显存；PyTorch FSDP 工程论文总结了它在大规模训练中的设计和经验。}
+
+\begin{summarybox}
+\textbf{FSDP 的核心直觉：}\
+\key{每个 rank 平时只保存参数分片；进入某个 FSDP 单元计算时临时 all-gather 出完整参数；计算结束后再释放完整参数，只保留分片。}
+\end{summarybox}
+
+一个简化的 FSDP 训练时序是：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{9.4cm}}
+\hline
+\textbf{阶段} & \textbf{发生了什么} \\
+\hline
+初始化 & 模型被包成一个或多个 FSDP unit，参数被 flatten/shard 到不同 rank。 \\
+前向前 & 当前 FSDP unit 需要计算时，临时 all-gather 参数，让每个 rank 能执行这一段 forward。 \\
+前向后 & 如果策略要求 reshard，则释放完整参数，只保留本 rank 分片。 \\
+反向前/中 & 需要对应参数时再次准备完整参数。 \\
+反向后 & 梯度被 reduce-scatter，归约后每个 rank 只保留自己负责的梯度分片。 \\
+优化器更新 & 每个 rank 用本地参数分片、梯度分片和 optimizer state 分片完成局部更新。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{FSDP 不是“永久没有完整参数”。}\
+它是平时分片，计算时临时 materialize 当前 FSDP unit 的完整参数。所以 FSDP 的峰值显存取决于 wrap 粒度、prefetch、reshard 策略、activation、bucket 和 allocator 行为，不能只看 $/D$ 的稳态公式。
+\end{warnbox}
+
+\subsection{七、FSDP 的几个关键配置概念}
+
+你第一次看 FSDP 文档时，很容易被配置项淹没。先抓住下面几个核心开关就够了。
+
+\subsubsection*{1. Sharding strategy}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.7cm}p{4.7cm}p{4.3cm}}
+\hline
+\textbf{策略} & \textbf{切分对象} & \textbf{直觉} \\
+\hline
+\texttt{FULL\_SHARD} & 参数、梯度、优化器状态都分片 & 最接近 ZeRO-3，显存省得最多。 \\
+\texttt{SHARD\_GRAD\_OP} & 梯度和优化器状态分片，前向后不一定立即 reshard 参数 & 更接近 ZeRO-2/ZeRO-3 之间的折中，可能换取吞吐。 \\
+\texttt{NO\_SHARD} & 不分片 & 类似 DDP，不是主要学习目标。 \\
+\texttt{HYBRID\_SHARD} & 节点内或子组内 full shard，组间复制 & 多机时在显存节省和跨机通信之间折中。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection*{2. Auto wrap policy}
+
+FSDP 通常不会只把整个模型包成一个巨大 unit。更常见的是按 Transformer block 这类边界拆成多个 FSDP unit。这样可以控制每次临时 all-gather 的参数规模，也影响通信计算重叠和峰值显存。
+
+\begin{intubox}
+\textbf{wrap 粒度的直觉：}\
+包得太大：一次要临时 materialize 的参数太多，峰值显存高；\\
+包得太小：通信次数变多，调度开销和性能损失可能变大。\\
+所以工程上常按 block/layer 级别 wrap，而不是按每个小 Linear 都 wrap。
+\end{intubox}
+
+\subsubsection*{3. State dict 类型}
+
+FSDP 下 checkpoint 不是一句 \texttt{model.state\_dict()} 就完事。常见有三种口径：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4.8cm}p{4.3cm}}
+\hline
+\textbf{state dict} & \textbf{含义} & \textbf{适用场景} \\
+\hline
+Full state dict & 聚合出完整模型权重 & 保存可迁移、可单卡加载的 checkpoint；可能很吃 CPU/GPU 内存。 \\
+Sharded state dict & 每个 rank 保存自己分片 & 大模型训练恢复，避免单点聚合压力。 \\
+Local state dict & 更贴近本地 FSDP 内部布局 & 特定工程场景，迁移性较弱。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{checkpoint 是 FSDP/ZeRO 的工程重点。}\
+模型一旦被分片，保存和恢复就不再只是“rank 0 写一个完整文件”。大模型训练更常用 sharded checkpoint，否则 rank 0 聚合完整权重可能非常慢甚至 OOM。
+\end{warnbox}
+
+\subsubsection*{4. CPU offload}
+
+CPU offload 会把一部分状态放到 CPU 内存，进一步降低 GPU 显存压力。ZeRO-Offload 甚至会把 optimizer compute 放到 CPU 侧来扩大可训练模型规模。\footnote{ZeRO-Offload 论文和 DeepSpeed 文档讨论了将 optimizer states 与计算 offload 到 CPU，从而在较少 GPU 资源下训练更大模型；但这通常会引入 PCIe/CPU 内存带宽瓶颈。}
+
+\begin{summarybox}
+\textbf{offload 的判断：}\
+如果目标是“先训起来”，offload 很有用；如果目标是“最高吞吐”，offload 经常不是首选，因为它把压力从 GPU 显存转移到了 CPU 内存、PCIe/NVMe 和调度开销上。
+\end{summarybox}
+
+\subsection{八、ZeRO-3 和 FSDP 到底什么关系}
+
+可以先用一句话记住：\key{FSDP 可以理解为 PyTorch 原生生态中的 ZeRO-3 类方案，但它不是 DeepSpeed ZeRO 的同一个实现。}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.6cm}p{4.8cm}}
+\hline
+\textbf{维度} & \textbf{DeepSpeed ZeRO} & \textbf{PyTorch FSDP} \\
+\hline
+生态入口 & DeepSpeed engine/config 驱动 & PyTorch 原生 wrapper/API 驱动。 \\
+核心目标 & 消除数据并行中的状态冗余 & fully shard 参数、梯度、优化器状态。 \\
+Stage/策略 & ZeRO Stage 1/2/3 & sharding strategy，例如 FULL\_SHARD、SHARD\_GRAD\_OP、HYBRID\_SHARD。 \\
+配置风格 & JSON config 较多，DeepSpeed 管理训练引擎 & Python API 与 PyTorch 生态集成更直接。 \\
+checkpoint & DeepSpeed checkpoint 体系 & FSDP full/sharded/local state dict 体系。 \\
+常见优势 & ZeRO-Offload、ZeRO-Infinity、训练引擎生态成熟 & PyTorch 原生、与 torch.distributed/checkpoint/compile 生态贴近。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{学习时不要陷入阵营之争。}\
+你真正要掌握的是同一个底层问题：\key{参数、梯度、优化器状态如何分片；计算前如何临时拿到需要的参数；反向后如何把梯度归约并重新分片；checkpoint 如何保存这些分片。}
+\end{intubox}
+
+\subsection{九、显存账本：用 7B 模型看 ZeRO/FSDP 的收益}
+
+仍然用 Stage 0 的 7B 例子。假设：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 参数量 $N = 7 \times 10^9$；
+  \item BF16 参数：$c_p = 2$ bytes；
+  \item BF16 梯度：$c_g = 2$ bytes；
+  \item FP32 Adam moments：$c_o = 8$ bytes；
+  \item 不额外保存 FP32 master weights；
+  \item 数据并行组大小 $D=8$。
+\end{itemize}
+
+DDP 单 rank 模型状态：
+
+\[
+7 \times 10^9 \times (2+2+8)
+=84\text{ GB}
+\approx78.2\text{ GiB}
+\]
+
+不同方案的长期模型状态近似为：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.8cm}p{4.4cm}}
+\hline
+\textbf{方案} & \textbf{公式} & \textbf{7B / 8 卡近似} \\
+\hline
+DDP & $N(2+2+8)$ & $84$ GB / rank。 \\
+ZeRO-1 & $N(2+2+8/8)$ & $35$ GB / rank。 \\
+ZeRO-2 & $N(2+(2+8)/8)$ & $22.75$ GB / rank。 \\
+ZeRO-3 / FSDP FULL\_SHARD & $N(2+2+8)/8$ & $10.5$ GB / rank。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{这张表只算长期模型状态。}\
+真实峰值还要加 activation、临时 full parameters、communication buffers、prefetch、CUDA allocator 碎片、checkpoint buffer 等。所以它适合建立方向感，不是替代 profiler 的精确估算。
+\end{warnbox}
+
+\subsection{十、训练时序对比：DDP、ZeRO-2、ZeRO-3/FSDP}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.6cm}p{3.5cm}p{3.7cm}p{3.7cm}}
+\hline
+\textbf{阶段} & \textbf{DDP} & \textbf{ZeRO-2} & \textbf{ZeRO-3 / FSDP} \\
+\hline
+前向前 & 参数本来完整 & 参数本来完整 & 需要当前 unit 参数时临时 gather。 \\
+前向 & 每 rank 算 local batch & 每 rank 算 local batch & 每 rank 算 local batch。 \\
+反向 & 计算完整梯度 & 计算梯度后归约并分片 & 需要参数时临时 gather，梯度归约后分片。 \\
+梯度保存 & 每 rank 完整梯度 & 每 rank 梯度分片 & 每 rank 梯度分片。 \\
+优化器更新 & 每 rank 更新完整模型 & 每 rank 更新自己负责的参数状态，再同步必要结果 & 每 rank 更新自己负责的参数分片。 \\
+参数驻留 & 完整复制 & 完整复制 & 分片驻留，计算时临时完整。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{最重要的分界线：}\
+ZeRO-2 之前，参数通常还是完整复制；ZeRO-3/FSDP 开始，参数本体也被切开。\\
+所以如果问题是 optimizer states 和 gradients 太贵，ZeRO-2 可能够；如果问题是参数本体也放不下，就要 ZeRO-3/FSDP。
+\end{summarybox}
+
+\subsection{十一、最小配置骨架}
+
+\subsubsection*{1. DeepSpeed ZeRO 配置骨架}
+
+下面只保留学习用主干。真实项目还会加入 scheduler、gradient clipping、activation checkpointing、checkpoint 保存策略、日志和容错。
+
+\begin{lstlisting}[language={}, caption=DeepSpeed ZeRO-2/ZeRO-3 配置骨架]
+{
+  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 8,
+  "bf16": {
+    "enabled": true
+  },
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 500000000,
+    "allgather_bucket_size": 500000000
+  }
+}
+\end{lstlisting}
+
+如果要切到 ZeRO-3，核心是：
+
+\begin{lstlisting}[language={}]
+"zero_optimization": {
+  "stage": 3,
+  "overlap_comm": true,
+  "contiguous_gradients": true,
+  "stage3_prefetch_bucket_size": 50000000,
+  "stage3_param_persistence_threshold": 100000
+}
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{配置不要死抄。}\
+DeepSpeed 的 bucket、prefetch、persistence threshold、offload 参数都和模型结构、GPU 显存、网络、batch size 有关。学习阶段先理解每个开关在控制\key{显存、通信、预取和碎片}中的哪一类，不要把某个模板当万能答案。
+\end{warnbox}
+
+\subsubsection*{2. PyTorch FSDP 配置骨架}
+
+\begin{lstlisting}[language=Python, caption=PyTorch FSDP 最小训练骨架]
+import functools
+
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+
+def build_fsdp_model(model, transformer_block_cls):
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={transformer_block_cls},
+    )
+    mixed_precision = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+    return FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=mixed_precision,
+        device_id=torch.cuda.current_device(),
+    )
+
+
+def train_one_step(fsdp_model, batch, criterion, optimizer):
+    optimizer.zero_grad(set_to_none=True)
+    outputs = fsdp_model(batch["input_ids"])
+    loss = criterion(outputs, batch["labels"])
+    loss.backward()
+    optimizer.step()
+    return loss
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{FSDP 代码看起来像 DDP，但语义更复杂。}\
+外层训练循环仍然是 forward、backward、optimizer step；真正的差异隐藏在 FSDP wrapper 里：参数何时 gather、何时 reshard、梯度何时 reduce-scatter、state dict 如何保存。
+\end{intubox}
+
+\subsection{十二、怎么选：ZeRO-2、ZeRO-3、FSDP}
+
+先给一个实用决策表：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.3cm}p{3.1cm}p{5.1cm}}
+\hline
+\textbf{场景} & \textbf{优先考虑} & \textbf{原因} \\
+\hline
+模型参数能放下，但 Adam states/梯度很吃紧 & ZeRO-2 & 省显存明显，参数仍完整复制，训练时序相对简单。 \\
+模型参数本体也接近或超过单卡容量 & ZeRO-3 或 FSDP FULL\_SHARD & 必须把参数也切开。 \\
+团队已经深度使用 DeepSpeed 配置和训练引擎 & DeepSpeed ZeRO & 生态和已有工程成本更低。 \\
+团队希望尽量走 PyTorch 原生接口 & FSDP & 与 PyTorch distributed、state dict、checkpoint 生态更贴近。 \\
+单机 8 卡内训练中大模型，追求易集成 & FSDP 或 ZeRO-2/3 都可 & 取决于已有代码栈和 checkpoint 需求。 \\
+多机训练且跨机网络一般 & HYBRID\_SHARD 或更保守 ZeRO 策略 & 减少频繁跨机 full-shard 通信，优先利用节点内高速互连。 \\
+显存实在不够，吞吐可以牺牲 & ZeRO-3/FSDP + offload & 先把训练跑起来，再优化吞吐。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{一句话选型：}\
+能用 DDP 跑且吞吐够，就先别复杂化；DDP 显存不够但参数能放下，优先看 ZeRO-2；参数也放不下，再看 ZeRO-3/FSDP；如果多机网络成为主瓶颈，再考虑 HYBRID\_SHARD、混合并行或更细的并行策略。
+\end{summarybox}
+
+\subsection{十三、常见坑与排查方向}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.8cm}p{4.8cm}p{4.2cm}}
+\hline
+\textbf{现象} & \textbf{常见原因} & \textbf{排查方向} \\
+\hline
+FSDP/ZeRO-3 仍然 OOM & 只算了分片下界，没算临时参数、激活和 buffer & 调小 micro-batch，调整 wrap 粒度，打开 activation checkpointing。 \\
+吞吐比 DDP 慢很多 & 参数 gather/reshard 太频繁，通信无法隐藏 & 看 wrap 粒度、bucket、prefetch、网络和 profile。 \\
+checkpoint 保存很慢或 OOM & 试图聚合完整 state dict 到单点 & 使用 sharded checkpoint，避免 rank 0 聚合超大权重。 \\
+resume 后 loss 不对 & optimizer/scheduler/scaler/sampler 状态没恢复完整 & 检查模型、优化器、lr scheduler、AMP scaler、随机数和 dataloader 状态。 \\
+参数 frozen 或 LoRA 场景出错 & trainable/non-trainable 参数混合包装不当 & 检查 FSDP wrap 策略、requires\_grad、ignored modules。 \\
+多机性能不稳定 & 跨机通信或 IO 抖动 & 先分清 step time、dataloader time、checkpoint time 和通信 time。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{FSDP/ZeRO 的排查要有账本思维。}\
+先问是哪类状态爆了：参数、梯度、optimizer states、activation、临时 buffer、checkpoint buffer，还是碎片。不要只看到 OOM 就盲目切 ZeRO stage。
+\end{warnbox}
+
+\subsection{十四、面试版回答}
+
+\subsubsection*{1. ZeRO Stage 1/2/3 分别做了什么？}
+
+ZeRO 是对经典数据并行模型状态冗余的优化。Stage 1 分片 optimizer states；Stage 2 在 Stage 1 基础上继续分片 gradients；Stage 3 再进一步分片 parameters。越往后显存节省越强，但需要更多参数 gather、梯度 reduce-scatter、checkpoint 和调度支持，工程复杂度也更高。
+
+\subsubsection*{2. FSDP 和 ZeRO-3 有什么关系？}
+
+它们目标很接近，都是把参数、梯度和优化器状态在 data-parallel ranks 之间分片。FSDP 是 PyTorch 原生的 fully sharded data parallel wrapper；ZeRO-3 是 DeepSpeed 生态中的 Stage 3 优化。二者的核心问题相同：平时分片保存状态，计算时临时拿到需要的参数，反向后把梯度归约并重新分片。
+
+\subsubsection*{3. 为什么 ZeRO-3/FSDP 省显存但可能变慢？}
+
+因为参数不再长期完整驻留。每个 FSDP unit 或 ZeRO-3 管理的模块在计算前需要临时 gather 参数，反向后还要归约并分片梯度。这些通信和调度会增加 step time。显存省了，但吞吐不一定免费提升。
+
+\subsubsection*{4. 什么时候 ZeRO-2 比 ZeRO-3 更合适？}
+
+当参数本体还能放下，但 optimizer states 和 gradients 是主要显存压力时，ZeRO-2 往往是很好的折中。它不切参数，避免了大量前向/反向参数 gather，吞吐和工程复杂度通常比 ZeRO-3 更友好。
+
+\subsubsection*{5. 为什么 checkpoint 在 FSDP/ZeRO 里更复杂？}
+
+因为模型状态被分片保存，不再天然存在一个 rank 拥有完整权重和完整优化器状态。保存完整 checkpoint 可能需要 all-gather 或聚合，容易慢或 OOM；大模型训练更常用 sharded checkpoint，让每个 rank 保存自己的分片，并在恢复时按分布式方式加载。
+
+\subsection{十五、学完这一节后的检查清单}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 你能从 DDP 的显存公式解释为什么需要 ZeRO/FSDP。
+  \item 你能说清 ZeRO-1、ZeRO-2、ZeRO-3 分别切分 optimizer states、gradients、parameters 中的哪些对象。
+  \item 你能解释为什么 ZeRO-3/FSDP 的 $/D$ 只是长期状态下界，不等于峰值显存。
+  \item 你能画出 FSDP 一次 forward/backward 中参数 all-gather 和梯度 reduce-scatter 的位置。
+  \item 你知道 auto wrap policy 会影响峰值显存和通信开销。
+  \item 你知道 sharded checkpoint 为什么比 full checkpoint 更适合超大模型。
+  \item 你能根据“参数是否放得下、optimizer states 是否吃紧、网络是否足够好、生态偏好是什么”来选择 ZeRO-2、ZeRO-3 或 FSDP。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{Stage 2 最终结论：}\
+ZeRO/FSDP 是 DDP 之后最重要的工业主线，因为它们解决的是 DDP 最大的短板：\key{模型状态在每张卡上完整冗余}。\\
+ZeRO 用 Stage 1/2/3 逐步切分 optimizer states、gradients、parameters；FSDP 则在 PyTorch 原生生态里提供 fully sharded 的训练方式。\\
+你现在最该记住的不是某个配置模板，而是这条因果链：\key{状态冗余导致 OOM；分片降低长期显存；临时 gather/reshard 带来通信和工程复杂度；最终选型是在显存、吞吐、网络和生态之间做 trade-off。}
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item DeepSpeed ZeRO Tutorial：说明 ZeRO 通过分片 weights、gradients 和 optimizer states 来减少数据并行训练中的状态冗余，并给出 Stage 1/2/3 的定义。\\
+  \url{https://www.deepspeed.ai/tutorials/zero/}
+  \item DeepSpeed ZeRO-3 Documentation：ZeRO 配置、Stage 3、offload、memory-centric tiling 等工程接口说明。\\
+  \url{https://deepspeed.readthedocs.io/en/stable/zero3.html}
+  \item Rajbhandari 等，\emph{ZeRO: Memory Optimizations Toward Training Trillion Parameter Models}, arXiv:1910.02054：提出 ZeRO，把模型训练状态分成 optimizer states、gradients、parameters 并逐阶段分片。\\
+  \url{https://arxiv.org/abs/1910.02054}
+  \item Ren 等，\emph{ZeRO-Offload: Democratizing Billion-Scale Model Training}, arXiv:2101.06840：讨论将 optimizer states 和计算 offload 到 CPU 以降低 GPU 显存压力。\\
+  \url{https://arxiv.org/abs/2101.06840}
+  \item PyTorch FSDP 文档：FSDP API、sharding strategy、mixed precision、CPU offload、state dict 等接口说明。\\
+  \url{https://docs.pytorch.org/docs/stable/fsdp.html}
+  \item PyTorch FSDP Tutorial：PyTorch 官方 FSDP 入门示例，展示如何包装模型并进行分片训练。\\
+  \url{https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html}
+  \item PyTorch FSDP Advanced Tutorial：FSDP auto wrap、transformer 模型训练、checkpoint 等高级用法。\\
+  \url{https://docs.pytorch.org/tutorials/intermediate/FSDP_advanced_tutorial.html}
+  \item Zhao 等，\emph{PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel}, arXiv:2304.11277：总结 PyTorch FSDP 在大规模训练中的设计、性能和工程经验。\\
+  \url{https://arxiv.org/abs/2304.11277}
+\end{itemize}
+\endgroup

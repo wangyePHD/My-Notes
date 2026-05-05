@@ -1,0 +1,24 @@
+% ============================================================
+% Sub-topic: Pixel-Space Diffusion & Tokenizer-Generation Tradeoff
+% ============================================================
+
+\section*{专题：Pixel-Space Diffusion 与 Tokenizer-Generation Tradeoff}
+\phantomsection
+\addcontentsline{toc}{section}{专题：Pixel-Space Diffusion 与 Tokenizer-Generation Tradeoff}
+
+\begin{conceptbox}
+\textbf{专题动机：} Latent Diffusion 是当前图像生成的主流范式，但它以信息损失换取生成效率，存在重建-生成 tradeoff（reconstruction-generation dilemma）。这个专题追踪"如何在不损失信息的前提下做高效扩散生成"这条研究线，从 DiT 基础架构出发，经过 REPA 表示对齐、JiT pixel-space 生成，到 Latent Forcing 的多模态联合去噪。\\
+\textbf{核心问题：} Tokenizer 的压缩率与生成质量之间的 tradeoff 是否是必然的？能否在 pixel-space 直接做端到端扩散，同时保持 latent diffusion 的收敛效率？\\
+\textbf{论文脉络：}
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{DiT}（Peebles \& Xie, 2023）：Scalable Diffusion Transformers，奠定 DiT 架构基础。
+  \item \textbf{LDM}（Rombach et al., 2021）：Latent Diffusion Models，定义 tokenizer + diffusion 的两阶段范式。
+  \item \textbf{REPA}（Yu et al., 2025）：用 DINOv2 等预训练表示对齐加速 DiT 训练，揭示表示质量对生成的影响。
+  \item \textbf{LightningDiT / Yao et al.}（2025）：系统分析重建-生成 tradeoff，指出 tokenizer PSNR 与 FID 的反向关系。
+  \item \textbf{JiT}（Li \& He, 2025）：Back to Basics，证明 x-prediction 让 DiT 可以直接在 pixel-space 高维空间工作。
+  \item \textbf{RAE}（Zheng et al., 2025）：Representation Autoencoder，将 DINOv2 latent 融入 tokenizer 编解码。
+  \item \textbf{Latent Forcing}（Baade et al., 2026）：多时间变量联合去噪，latent 先行作为 scratchpad，pixel-space 端到端生成。
+\end{enumerate}
+\end{conceptbox}
+
+\input{reading/paper_deep_reading/image_models/pixel_diffusion/2026_02_11_latent_forcing.tex}

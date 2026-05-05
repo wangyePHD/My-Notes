@@ -114,6 +114,21 @@ RGBA, 1080p, 500 images & 38.274 & 0.970 & 0.018\\
 \textbf{和 Tuna-2 的区别：} Tuna-2 去掉 VAE 是为了验证 pixel-space unified modeling 的可行性；Wan-Image 保留并强化 VAE，是因为专业生产要可控、高清、可编辑、可透明合成。二者回答的问题不同，不能简单说谁路线更先进。
 \end{warnbox}
 
+\subsubsection{补充：VAE 是否应该保留}
+
+如果把 Wan-Image 和近期一些去 VAE 的路线放在一起看，例如 Tuna-2、SenseNova 这类更偏 encoder-free / pixel-space 的方向，我的判断不是“VAE 必须保留”或“VAE 已经过时”，而是：\textbf{这取决于你到底想优化什么。}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{更倾向保留 VAE 的场景：} 目标里明确包含小字号文字、密集排版、透明 alpha、局部编辑、身份保持、素材合成、2K--4K 交付，或者你更在意商业工作流里的稳定边界。这类任务本质上都在惩罚“高频细节丢失”和“重建不可控”，而一个足够强的专用 VAE 可以把压缩、重建和语义先验先固定住，降低后端生成器需要同时解决的难题数量。
+  \item \textbf{更倾向去掉 VAE 的场景：} 你更在意统一建模纯度、端到端 token 表示、理解与生成共享同一空间、避免 latent bottleneck，以及继续把 scaling law 往 pixel-space 推进。在这种目标下，VAE 本身反而可能变成中间瓶颈：它的压缩误差、频率偏置和重建上限，会提前决定系统能达到的视觉边界。
+\end{itemize}
+
+Wan-Image 代表的立场可以概括成一句话：\textbf{它愿意接受 latent bottleneck，换取更强的重建确定性和工程可控性。} 这对专业生产系统是合理的，因为它服务的不是“证明 unified modeling 能否完全去中介”，而是“让文字、透明图层、复杂编辑和高分辨率输出尽量稳定落地”。相对地，Tuna-2 / SenseNova 一类路线更像是在赌另一件事：随着模型规模、算力和 pixel-space 训练方法继续推进，VAE 这个中间压缩器本身，也许才是限制统一能力和端到端扩展性的地方。
+
+\begin{intubox}
+所以我的结论不是“VAE 一定要保留”，而是：如果目标是 \textbf{生产交付稳定性}，我会先保留强 VAE；如果目标是 \textbf{统一建模与长期 scaling 潜力}，去 VAE 是值得下注的路线，但要准备为文字、alpha、超高分辨率和编辑稳定性补更多额外工程。
+\end{intubox}
+
 \subsection{4. 数据引擎：真正的护城河}
 
 Wan-Image 把数据系统写得很重。数据覆盖理解和生成两大部分。
@@ -232,7 +247,23 @@ SFT & 13K & 0.62T & 512--2048 & curated mix\\
 
 \subsubsection{6.3 Cascade RL}
 
-RL 阶段是这篇和你后训练专区连接最强的部分。Wan-Image 构造 domain-wise preference data，确保 RL prompts 与 SFT prompts 互斥，避免记忆式高 reward。reward model 不是只看 held-out validation，而是额外构造更广泛的 reward benchmark 来降低 preference overfitting。
+RL 阶段是这篇和你后训练专区连接最强的部分，而且它的 framing 很值得注意：Wan-Image 并不把 RL 写成“最后上一遍同一种偏好优化”，而是把它做成一个 \textbf{按 domain 组织、按 reward 形态选工具、按风险逐层推进} 的级联系统。这里的关键词不是某一个算法名，而是 \textbf{Cascade}。
+
+先说论文明写的两条基础原则。第一，Wan-Image 构造 \textbf{domain-wise preference data}，说明偏好数据不是混成一个大池子，而是围绕不同生成场景分别采集和筛选。第二，\textbf{RL prompts 与 SFT prompts 互斥}，这是很重要的反过拟合设计：如果 RL 继续在 SFT 看过的 prompt 上做，很容易把 reward 学成“记住训练分布里什么图更像标注者喜欢”，而不是学到可迁移的偏好对齐能力。
+
+再看图 4，论文把 RL 前面的 data/reward pipeline 单独画了出来：\textbf{Data Collection}、\textbf{Data Pair}、\textbf{Aesthetic Expert}、\textbf{Data Retrieval}、\textbf{Quality Monitoring}、\textbf{Reward Benchmark}、\textbf{Reward Model}。这其实透露了 Wan-Image 的系统思路：\textbf{先做偏好数据工程，再做 reward 工程，最后才是 RL 工程}。也就是说，它并不把 reward model 当成一个“训完就用”的静态打分器，而是持续用更广的 benchmark 和人工质检去检查 reward 是否偏离真实偏好。
+
+从图里的维度名还能看出 reward 不是单一 aesthetic score，而是至少覆盖：\textbf{Realism、Text、Harmony、Structure、Aesthetics、Consistency}。这和前面模型的产品目标是对齐的：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Realism：} 针对写实感、材质和整体自然度；
+  \item \textbf{Text：} 针对文字可读性、拼写与排版；
+  \item \textbf{Structure：} 针对空间关系、布局和物体结构正确性；
+  \item \textbf{Aesthetics：} 针对构图、色彩和设计感；
+  \item \textbf{Consistency / Harmony：} 更偏编辑、多图和组合场景里的身份保持、风格一致与局部协调。
+\end{itemize}
+
+这个设计的直接含义是：\textbf{Wan-Image 的 RL 目标不是把所有样本都往“更漂亮”一个方向推，而是按任务暴露出的短板做多维对齐。} 这也解释了为什么它最后不是单一 RL，而是 DPO、ReFL、DenseGRPO、ReFMA 的组合。
 
 Cascade RL 组合了：
 
@@ -243,18 +274,84 @@ Cascade RL 组合了：
   \item in-house ReFMA，即 reinforcement learning with flow matching anchors。
 \end{itemize}
 
-ReFMA 的作用是用 anchor-based control 在不同 noise levels 之间平衡优化目标，同时使用 reward model 的梯度信号指导 policy optimization。论文报告 Cascade RL 相比 SFT baseline 在不同场景下 Win Score 提升约 15\%--50\%，主要改善 photorealism、structural correctness、text rendering、aesthetic quality，以及 I2I 的一致性与和谐度。
+我的理解是，这四类方法并不是互相替代，而是分别覆盖不同风险/成本/信用分配条件下的优化位置。
+
+\textbf{1. DPO：先用离线 pairwise preference 把方向拉正。}
+
+DPO 的优点是稳定、便宜、工程风险低。给定同一 prompt 下的 winner/loser 对，模型直接学“让 winner 相对 loser 更可能”，同时参考模型提供一个 KL-like anchor，避免分布漂太远。放到 Wan-Image 这里，DPO 很适合作为级联里的低风险起点：\textbf{先把明显的人类偏好方向学进去，例如更好的排版、更合理的构图、更顺眼的整体风格，而不急着上高成本在线探索。}
+
+但 DPO 的边界也很明确：它主要吃现有偏好对，\textbf{不会自己探索新轨迹}，也不能细致回答“到底是哪几个 denoising steps 把图像变好了”。所以它更像是偏好对齐的第一层，不太像最终解法。
+
+\textbf{2. ReFL：当 reward 可微时，直接把 reward 梯度压回生成过程。}
+
+从 Wan-Image 把 ReFL 放进同一工具箱来看，它显然想利用一类和 policy-ratio 不同的优化信号：\textbf{如果 reward model 可微，就可以不只靠采样后比较 winner/loser，也可以直接沿 reward gradient 优化生成轨迹。} 这类方法的直觉通常是：对那些 reward 能稳定评估、而且修改更像局部连续修正的目标，直接梯度会比纯采样式 RL 更高效。
+
+结合你前面后训练主线里的经验，可以把 ReFL 粗略记成“更偏 direct reward optimization 的路线”。它通常更容易先改善后期可见的质量问题，比如局部细节、审美微调、文字边缘和表面纹理。但它的前提也更苛刻：\textbf{reward 要可微，训练稳定性也更依赖 reward 本身的质量。}
+
+\textbf{3. DenseGRPO：解决 flow/diffusion 里的时间步信用分配。}
+
+这部分最值得和你已经读过的 DenseGRPO 对照。标准 Flow-GRPO/GRPO 的一个硬伤是：最终图像只有一个 terminal reward，但整条生成轨迹有很多 denoising steps。如果把同一个终局 reward 平均分给所有 timestep，就等于默认“最终图像好，说明每一步都好”，这通常不成立。
+
+DenseGRPO 的价值正是在这里。它不满足于 trajectory-level reward，而是试图估计每一步到底带来了多少 reward gain。具体做法是：从中间 latent 通过 ODE readout 还原出可打分的 clean prediction，再看相邻 step 的 reward 提升量。这样得到的是 step-wise dense reward，而不是把同一个 terminal reward 广播到全轨迹。
+
+放到 Wan-Image 的语境里，DenseGRPO 很适合那些\textbf{明显依赖生成过程信用分配}的目标，例如结构稳定性、文字渲染和多对象空间关系。因为这些问题往往不是“最后一张图总体不好看”这么简单，而是某些关键步把 layout、shape 或字符骨架画错了。如果 credit assignment 太粗，模型只知道“这张图分低”，却不知道应该改前期布局还是后期 refinement。
+
+当然，DenseGRPO 的代价也很实在：中间步读出和打分很贵，工程上明显重于 DPO。Wan-Image 愿意把它放进 Cascade RL，本身就说明他们认为单靠离线偏好或整图 reward 已经不够解决生产场景里的细粒度问题。
+
+\textbf{4. ReFMA：用 flow-matching anchor 稳住 reward-driven optimization。}
+
+论文对 ReFMA 的公开细节没有 DenseGRPO 那么充分，但从名字和图示可以读出两个关键信号。第一，它是 \textbf{flow matching anchors}，说明它不是完全放飞的 reward maximization，而是保留一个和原始 flow trajectory/teacher policy 相关的锚点。第二，现有描述强调 \textbf{在不同 noise levels 之间平衡优化目标}，并使用 \textbf{reward model 的梯度信号} 指导优化。
+
+这意味着 ReFMA 很可能是在解决一个非常实际的问题：\textbf{直接用 reward 去推 flow model，容易在某些噪声区间过度优化，导致分布漂移、结构塌陷或者局部 reward hacking；anchor 的作用就是把模型拴回原始可用分布附近。} 如果这么理解，ReFMA 扮演的是“高强度 reward optimization 的安全带”。
+
+我会把它看成 Wan-Image 在工业落地里的关键补件：\textbf{既想吃到 reward-gradient 带来的强对齐收益，又不愿意让模型因为几类 reward 被拉坏基础生成分布。} 这和纯研究论文常见的“只报 reward 提升”不同，Wan-Image 更在乎长期可用性和跨任务稳定性。
+
+\textbf{把四者连起来看，Cascade RL 背后的逻辑就清楚了。}
+
+如果只用 DPO，优点是稳，但缺少在线探索和 step-level credit；如果只用 DenseGRPO，credit 更准，但成本高；如果只用 ReFL 一类 direct-gradient 方法，优化效率高，但受 reward 可微性和稳定性约束；如果只有强 reward gradient 而没有 anchor，又容易过冲。Wan-Image 把它们级联，本质上是在做下面这件事：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 先用更稳的离线偏好方法把大方向拉正；
+  \item 再用更强的 reward-based 方法补足在线探索和细粒度 credit；
+  \item 最后用 anchor/control 机制把 reward optimization 限制在可用分布附近。
+\end{itemize}
+
+所以这部分最值得记住的，不是“Wan-Image 也用了 DPO/DenseGRPO”，而是：
+
+\begin{intubox}
+对于专业图像系统，RL 不是一个统一算法，而是一套要和数据分区、reward 维度、生成轨迹结构、稳定性约束一起设计的后训练工具链。
+\end{intubox}
+
+论文报告 Cascade RL 相比 SFT baseline 在不同场景下 Win Score 提升约 15\%--50\%。结合图 4 的 reward 维度，这个提升不应理解成单纯 aesthetic bump，而更像是对 \textbf{photorealism、structural correctness、text rendering、aesthetic quality，以及 I2I consistency/harmony} 这些生产敏感指标的系统性补强。
 
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=0.92\linewidth]{wan_image/wan_image_fig4_rl_framework.pdf}
-  \caption{Cascade RL 框架和相对 SFT baseline 的提升。这里值得和 DenseGRPO / Flow-GRPO 主线对照：Wan-Image 并没有只押一个 RL 算法，而是把 DPO、ReFL、DenseGRPO、ReFMA 作为级联偏好对齐工具箱。图源：arXiv source。}
+  \caption{Cascade RL 框架和相对 SFT baseline 的提升。图里除了 DPO、ReFL、DenseGRPO、ReFMA 的级联关系，还明确画出了 reward system 的前置基础设施：data pair、aesthetic expert、data retrieval、quality monitoring、reward benchmark、reward model，以及 realism/text/harmony/structure/aesthetics/consistency 六个对齐维度。图源：arXiv source。}
 \end{figure}
 
 \subsubsection{6.4 Distillation}
 
-最后做 step distillation，目标是降低 NFE 和交互延迟。论文采用 multi-stage progressive distillation，结合 trajectory distillation 和 distribution matching distillation，声称在保持生成 fidelity 的同时带来超过 \(8\times\) 的 speedup。这里的关键是生产约束：如果不能快，4K 和交互编辑的体验会很难落地。
+蒸馏在 Wan-Image 里不是泛指的“模型压缩”，而是非常具体的 \textbf{inference step distillation}：目标不是再造一个更小的基座模型，而是在尽量不破坏生成能力的前提下，把原始采样流程压缩到更少 step，从而满足真实交互应用对低延迟的要求。论文特别指出，尽管 base model 的参数规模已经相对克制，但其原始的 iterative generation scheme 再叠加 classifier-free guidance (CFG)，仍然会带来显著计算负担；部署时真正昂贵的，不只是参数量本身，而是一次生成要做多少次 denoising/function evaluation，也就是 NFE。
 
+这里最重要的理解是：\textbf{Wan-Image 要解决的不是一般意义上的“少步采样会降质”，而是少步采样会优先破坏那些最有产品价值的能力。} 论文明确点出，已有 step distillation 方法虽然可以提升速度，但往往会在 \textbf{high-frequency facial details} 和 \textbf{text rendering capability} 上出现明显退化。这两个点之所以值得作者单独拿出来说，是因为它们恰好对应 Wan-Image 想重点建立优势的使用场景：真实人像、广告图文、海报排版、品牌素材，以及需要多轮编辑的商业工作流。也就是说，Wan-Image 的蒸馏目标不是“把图粗略生成出来”就够了，而是要求在提速之后，仍尽量保住脸部微细节、文字可读性、局部纹理锐度，以及整体结构稳定性。
+
+为了解这个矛盾，论文没有采用单一蒸馏技巧，而是设计了一个 \textbf{multi-stage progressive distillation} 框架，把两类互补思路组合起来：trajectory distillation 和 distribution matching distillation。虽然这一节没有公开每个 stage 的精确步数、loss 权重和 scheduler 细节，但从作者对目标的描述可以比较清楚地看出，两者扮演的角色并不一样。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Trajectory distillation：} 让 student 用更少的采样步去逼近 teacher 的 denoising trajectory。按我的理解，它更偏向“过程对齐”，核心作用是保住全局布局、主体关系、结构演化，以及多步去噪过程中逐步收敛的动态。对于高容量 teacher 来说，这一步尤其重要，因为 teacher 的去噪轨迹通常比小模型更复杂，如果直接从多步 teacher 硬压到极少步 student，学生模型很容易只学到一个粗糙终态，结果就是构图漂移、局部关系不稳，或者 prompt 条件在中间过程里被过早丢失。
+  \item \textbf{Distribution matching distillation：} 进一步把 student 的输出分布往 teacher 的高质量分布上拉齐。它更像“结果对齐”，关注的不是每一步都长得像 teacher，而是最后生成出来的样本在统计意义上仍然落在 teacher 擅长的那类结果附近。结合论文强调的退化点，这一步可以理解为对 trajectory imitation 的补充：前者负责守住结构与轨迹，后者负责补 realism、纹理锐度和文本 fidelity，尽量避免少步近似之后出现的过平滑、字形塌陷、局部细节发糊等问题。
+\end{itemize}
+
+为什么还要做成 \textbf{progressive} 的多阶段蒸馏？一个合理解释是，作者并不想让 student 一次性从“高 NFE teacher”直接跳到“极少步部署模型”，而是把压缩过程做成一种 curriculum。这样每个阶段只承担一部分步数压缩和误差吸收，训练更容易稳定，也更容易在速度和保真之间找到可接受的折中。论文虽然没有展开完整训练配方，但从问题设定上看，这种 staged compression 本质上是在规避一个老问题：单次激进压步通常能换来更快采样，却很容易把 fidelity 尤其是细节 fidelity 一起压坏。
+
+所以这部分最值得记住的，不是“Wan-Image 也做了蒸馏”，而是：
+
+\begin{intubox}
+Wan-Image 把蒸馏当成“保持能力边界的采样压缩”，而不是单纯追求更少 step。真正要守住的是 \textbf{全局结构、高频细节和文本对齐} 这三件事。
+\end{intubox}
+
+把它放回整篇论文的系统视角里看，这一步其实是前面所有能力模块的产品化收口：VAE 负责高压缩下的视觉重建，thinking/instruct 负责复杂理解与编辑控制，Cascade RL 负责把生成偏好往高质量分布推，而 distillation 则负责把这些能力压进真实可部署的延迟预算里。论文给出的结论是，经过这一套 multi-stage progressive distillation 后，推理流程获得了超过 \(8\times\) 的 speedup，同时仍能较好保持 generation fidelity。这里的“保真”更应理解为系统级保真，而不是所有子任务严格无损；但从作者特意强调脸部高频细节、文本渲染，以及 Figure 19 中 teacher vs. distilled model 的对比可以看出，他们真正担心的，就是那些最容易在少步采样里首先塌掉、却又最影响商业可用性的能力。
 \subsection{7. 结果怎么读}
 
 论文报告的核心结果包括：
@@ -305,7 +402,7 @@ Wan-Image 说明一个很现实的点：即使 encoder-free/pixel-space 是很�
   \item \textbf{common/difference 编辑表示：} 对 reference editing 很实用，明确“保留什么”和“修改什么”。
   \item \textbf{数据 taxonomy + structured JSON caption：} 对图像生成训练比单纯自然语言 caption 更可控，尤其适合长尾任务。
   \item \textbf{RL 不是单算法：} 可以把 DPO、ReFL、DenseGRPO、flow-matching anchor 类方法按领域级联，而不是期待一个 reward objective 解决所有偏好。
-  \item \textbf{VAE 仍有战略价值：} 如果目标是透明图层、小字、文档和 4K，专用 VAE 的工程价值很高。
+  \item \textbf{VAE 是否保留取决于目标：} 如果目标是透明图层、小字、文档和 4K，专用 VAE 的工程价值很高；如果目标是追求 encoder-free 的统一建模与长期 scaling，可以继续关注 pixel-space 路线。
 \end{itemize}
 
 \subsection{11. 待查问题}

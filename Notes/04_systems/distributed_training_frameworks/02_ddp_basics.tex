@@ -1,0 +1,527 @@
+% ============================================================
+% Stage 1：DDP 作为基线框架
+% ============================================================
+
+\section{Stage 1：DDP 作为基线框架}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 把 DDP 当作后面所有分布式训练框架的\key{对照组}来学。学完这一页，你至少要能回答三件事：\\
+1. \key{DDP 到底解决了什么问题}；\\
+2. \key{DDP 为什么扩吞吐很强，但显存扩展性差}；\\
+3. \key{什么时候 DDP 足够，什么时候必须进入 ZeRO/FSDP 或模型并行。}
+\end{conceptbox}
+
+\note{前置知识：这一页默认你已经理解 Stage 0 里的 \texttt{rank / world\_size / process group}、\texttt{all\_reduce} 和训练显存账本。DDP 的核心就是把这些底层概念组织成一个稳定的训练范式。}
+
+\subsection*{资料收集与引用口径}
+
+\begin{conceptbox}
+\textbf{本节先查资料再整理结论。} 这一页的写法主要参考三类来源：\\
+1. \key{官方文档}：PyTorch \texttt{DistributedDataParallel} API、DDP Design Note、\texttt{DistributedSampler}、\texttt{torch.distributed} 文档，用来确认 DDP 的梯度同步、bucket、autograd hook、数据切分和 collective 语义；\\
+2. \key{通信库文档}：NVIDIA NCCL collective operations 文档，用来确认 \texttt{AllReduce / AllGather / ReduceScatter} 等通信原语的语义；\\
+3. \key{论文与工程报告}：\emph{PyTorch Distributed: Experiences on Accelerating Data Parallel Training}、\emph{Accurate, Large Minibatch SGD}、\emph{Horovod}、\emph{ZeRO}，用来理解 DDP 的工程优化、大 batch 训练口径、ring all-reduce 背景，以及为什么 ZeRO/FSDP 要解决 DDP 的状态冗余问题。
+\end{conceptbox}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.4cm}p{9.4cm}}
+\hline
+\textbf{笔记结论} & \textbf{主要依据} \\
+\hline
+DDP 复制模型、切分数据、同步梯度 & PyTorch \texttt{DistributedDataParallel} API 与 DDP Design Note。 \\
+DDP 用 bucket 和 autograd hook 重叠通信与反向计算 & PyTorch DDP Design Note；\emph{PyTorch Distributed} 工程论文。 \\
+\texttt{DistributedSampler.set\_epoch} 是数据 shuffle 正确性的关键 & PyTorch \texttt{DistributedSampler} 文档。 \\
+\texttt{all\_reduce} 是 DDP 的核心通信原语 & PyTorch \texttt{torch.distributed} 文档；NCCL collective operations 文档。 \\
+DDP 不切分参数、梯度、优化器状态，因此不是显存分片方案 & PyTorch DDP 文档；ZeRO 论文对经典数据并行状态冗余的分析。 \\
+Global batch size 与大 batch 训练稳定性需要单独核对 & \emph{Accurate, Large Minibatch SGD} 与数据并行训练经验。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{一、DDP 的一句话模型}
+
+\begin{summarybox}
+\textbf{DDP 的核心直觉：}\\
+\key{数据切开，模型不切；每个 rank 独立前后向；反向时同步梯度；每个 rank 各自做同一次 optimizer step。}\footnote{这一点对应 PyTorch \texttt{DistributedDataParallel} 官方文档：DDP 在数据并行进程之间同步梯度，用户仍需要自己处理输入数据切分；文档同时提醒 DDP 不会在每次迭代中广播参数。}
+\end{summarybox}
+
+也就是说，假设有 $D$ 张 GPU：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{9.7cm}}
+\hline
+\textbf{对象} & \textbf{DDP 里的状态} \\
+\hline
+模型参数 & 每个 rank 都保存完整一份模型参数。 \\
+输入数据 & 每个 rank 只拿当前 step 的一小片 mini-batch。 \\
+前向计算 & 每个 rank 独立计算自己的 local loss。 \\
+反向计算 & 每个 rank 先独立得到 local gradient。 \\
+梯度同步 & 对梯度做 \texttt{all\_reduce}，让所有 rank 得到同一个平均梯度。 \\
+优化器更新 & 每个 rank 用同一个梯度、同一个优化器配置，本地更新自己的完整模型副本。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{DDP 能保持参数一致的原因不是“每一步广播参数”。}\\
+真正的不变量是：\key{初始参数一致 + 每一步梯度一致 + optimizer 状态转移一致}，所以每个 rank 本地更新后仍然得到同一份参数。
+\end{intubox}
+
+\subsection{二、为什么 DDP 是工业训练的基线框架}
+
+DDP 解决的是最朴素、也最常见的扩展需求：\key{模型单卡放得下，但单卡训练太慢}。这时最自然的做法就是把数据切给多张卡，让多张卡并行处理不同样本。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.8cm}p{5.1cm}}
+\hline
+\textbf{方案} & \textbf{做法} & \textbf{工业实践评价} \\
+\hline
+单卡训练 & 一个进程、一张 GPU、完整模型和完整 batch 流水 & 最简单，但吞吐受单卡限制。 \\
+\texttt{DataParallel} & 单进程内把 batch 切到多卡，主卡负责聚合 & 易用，但 Python 调度、主卡瓶颈和扩展性较差。 \\
+DDP & 多进程多 GPU，每个进程控制一张 GPU，反向时同步梯度 & PyTorch 训练中最常用的数据并行基线。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{DDP 的定位要非常明确：}\\
+它主要扩的是\key{吞吐}，不是显存容量。模型参数、梯度和优化器状态仍然在每张卡上完整复制。\\
+所以 DDP 不是 ZeRO/FSDP 的替代品，而是 ZeRO/FSDP 要优化的基线。
+\end{warnbox}
+
+\subsection{三、一次 DDP 训练 step 的真实时序}
+
+一轮 DDP 训练可以按下面的顺序理解：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.7cm}p{10.2cm}}
+\hline
+\textbf{阶段} & \textbf{发生了什么} \\
+\hline
+初始化 & 启动 $D$ 个进程，建立 \texttt{process group}，每个进程绑定一张 GPU。 \\
+模型包装 & 每个 rank 构造完整模型，并用 \texttt{DistributedDataParallel} 包起来。 \\
+数据切分 & \texttt{DistributedSampler} 让不同 rank 读取不同样本子集。 \\
+前向 & 每个 rank 用自己的 local mini-batch 计算 loss。 \\
+反向 & 每个 rank 先计算本地梯度；DDP 在 autograd hook 中把梯度放进 bucket。 \\
+梯度同步 & bucket 就绪后触发 \texttt{all\_reduce}，得到跨 rank 平均梯度。 \\
+参数更新 & 每个 rank 本地执行 \texttt{optimizer.step()}，模型副本继续保持一致。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{DDP 的一个重要优化：} 它不会等所有反向计算结束后才通信。DDP 会把梯度按 bucket 分组，并在某个 bucket 的梯度就绪后尽早 \texttt{all\_reduce}，从而尽量把通信和后续反向计算重叠起来。\footnote{PyTorch DDP Design Note 将这一机制描述为 reducer、gradient buckets、autograd hooks 与通信调度；\emph{PyTorch Distributed: Experiences on Accelerating Data Parallel Training} 也把 bucket 化和 overlap 作为 DDP 性能优化的核心经验。}
+\end{intubox}
+
+\subsubsection*{参数到底会不会每步同步？}
+
+这里最容易混淆，需要单独拎出来：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 构造 DDP 时，框架会确保不同 rank 的模型状态一致。
+  \item 训练期间，DDP 主要同步的是\key{梯度}，不是每一步都广播完整参数。
+  \item 如果模型里有 buffer，例如 BatchNorm 的 running statistics，DDP 默认可能从 rank 0 广播 buffer，具体取决于 \texttt{broadcast\_buffers} 设置。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{判断 DDP 是否正常的核心指标：}\\
+如果初始权重一致、每个 rank 参与了同样次数的 backward、梯度同步没有被跳过、optimizer 配置一致，那么各 rank 参数就应该持续一致。\\
+如果某些 rank 走了不同分支、跳过了某些参数、或者数据步数不一致，就可能出现 hang、梯度缺失或参数漂移。
+\end{warnbox}
+
+\subsection{四、Global batch size、梯度平均与 accumulation}
+
+DDP 学不清楚，很多时候不是通信原语没懂，而是 batch 口径没算清楚。
+
+\begin{conceptbox}
+设：
+\begin{itemize}[leftmargin=1.5em]
+  \item $B_{\mu}$：每个 rank 单次 forward 使用的 micro-batch size；
+  \item $D$：数据并行组大小，也就是 \texttt{world\_size}；
+  \item $A$：gradient accumulation steps。
+\end{itemize}
+那么一个 optimizer step 对应的 global batch size 是：
+\[
+B_{\text{global}} = B_{\mu} \times D \times A
+\]
+\end{conceptbox}
+
+例如每张卡一次放 4 条样本，8 卡训练，累积 2 次再更新，那么：
+
+\[
+B_{\text{global}} = 4 \times 8 \times 2 = 64
+\]
+
+\subsubsection*{DDP 的梯度是 sum 还是 average？}
+
+在 PyTorch DDP 的常规语义里，跨 rank 梯度同步后通常等价于\key{对各 rank 的梯度取平均}。如果你的 loss 在本地 mini-batch 上使用默认的 \texttt{mean} reduction，并且每个 rank 的 batch 大小一致，那么 DDP 后的梯度就等价于在 global batch 上求平均梯度。\footnote{PyTorch DDP 文档明确提醒：当 loss 在各进程内按 batch 平均时，DDP 下梯度与单机大 batch 训练的平均梯度口径一致；若使用 sum reduction 或 batch 大小不一致，则需要重新检查梯度尺度。}
+
+\begin{warnbox}
+\textbf{最常见的训练口径 bug：}\\
+如果你用了 \texttt{sum} reduction、变长样本、最后一个 batch 不齐，或者手动对 loss 又做了一次缩放，就要重新检查梯度尺度。否则学习率、loss 曲线和单卡 baseline 对不上。
+\end{warnbox}
+
+\subsubsection*{Gradient accumulation 时为什么要用 \texttt{no\_sync}}
+
+如果累积 $A$ 个 micro-step 才做一次 optimizer step，朴素写法会在每个 micro-step 的 backward 后都触发 DDP 梯度同步，这会浪费通信。更常见的做法是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 前 $A-1$ 个 micro-step 使用 \texttt{model.no\_sync()}，只在本地累积梯度；
+  \item 最后一个 micro-step 正常 backward，触发一次跨 rank 同步；
+  \item 为保持梯度尺度，通常把每个 micro-step 的 loss 除以 $A$。
+\end{itemize}
+
+\begin{lstlisting}[language=Python, caption=DDP gradient accumulation 的典型写法]
+from contextlib import nullcontext
+
+accum_steps = 4
+optimizer.zero_grad(set_to_none=True)
+
+for step, batch in enumerate(loader):
+    is_sync_step = (step + 1) % accum_steps == 0
+    context = nullcontext() if is_sync_step else ddp_model.no_sync()
+
+    with context:
+        outputs = ddp_model(batch["input_ids"])
+        loss = criterion(outputs, batch["labels"])
+        loss = loss / accum_steps
+        loss.backward()
+
+    if is_sync_step:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+\end{lstlisting}
+
+\subsection{五、DDP 最小训练骨架}
+
+下面是一份最小骨架。真实项目里你会再加 AMP、checkpoint、日志、验证和异常恢复，但主线不会变。
+
+\begin{lstlisting}[language=Python, caption=PyTorch DDP 最小训练骨架]
+import os
+
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+
+def setup_distributed():
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def train(model, dataset, criterion, optimizer, num_epochs):
+    local_rank, rank, world_size = setup_distributed()
+
+    model = model.to(local_rank)
+    ddp_model = DDP(model, device_ids=[local_rank])
+
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=8,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    for epoch in range(num_epochs):
+        sampler.set_epoch(epoch)
+        ddp_model.train()
+
+        for batch in loader:
+            inputs = batch["input_ids"].to(local_rank, non_blocking=True)
+            labels = batch["labels"].to(local_rank, non_blocking=True)
+
+            outputs = ddp_model(inputs)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        if rank == 0:
+            torch.save(
+                {"model": ddp_model.module.state_dict(), "epoch": epoch},
+                "checkpoint.pt",
+            )
+
+    dist.destroy_process_group()
+\end{lstlisting}
+
+启动方式通常是：
+
+\begin{lstlisting}
+torchrun --standalone --nproc-per-node=8 train_ddp.py
+\end{lstlisting}
+
+多机时还需要设置 \texttt{nnodes}、\texttt{node\_rank}、\texttt{master\_addr} 和 \texttt{master\_port}。
+
+\subsection{六、DDP 的显存账本：为什么它不省显存}
+
+回到 Stage 0 的账本。设模型参数总数为 $N$，参数每元素字节数为 $c_p$，梯度为 $c_g$，优化器状态为 $c_o$。DDP 单 rank 的长期模型状态近似是：
+
+\[
+M_{\text{DDP model states}}
+=
+N(c_p + c_g + c_o)
+\]
+
+注意这里\warn{没有}除以 $D$。这就是 DDP 和 ZeRO/FSDP 的根本区别。\footnote{PyTorch DDP 文档强调 DDP 是数据并行包装器，而 ZeRO 论文则把经典数据并行的问题总结为参数、梯度和优化器状态在每个 data-parallel worker 上冗余保存；ZeRO/FSDP 的价值正是切分这些状态。}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.1cm}p{5.7cm}}
+\hline
+\textbf{状态} & \textbf{DDP 单 rank 是否完整保存} & \textbf{说明} \\
+\hline
+参数 & 是 & 每张卡都有完整模型。 \\
+梯度 & 是 & 每张卡最终都有完整平均梯度。 \\
+优化器状态 & 是 & Adam 的 $m/v$ 等状态每张卡都有一份。 \\
+激活 & 只和本 rank 的 micro-batch 有关 & 增大 \texttt{world\_size} 本身不会切分模型激活；但如果固定 global batch，增大卡数可能降低每卡 micro-batch。 \\
+通信 bucket & 额外开销 & DDP 为了重叠通信会维护梯度 bucket，峰值显存可能受 bucket 大小影响。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{一句话判断：}\\
+如果一个模型在单卡上因为参数、梯度、Adam states 放不下，那么只用 DDP 加更多卡通常也放不下。\\
+DDP 增加的是并行算样本的能力，不是把模型状态切给多张卡保存的能力。
+\end{warnbox}
+
+\subsection{七、DDP 的通信账本：为什么 \texttt{all\_reduce} 会成为瓶颈}
+
+DDP 每个 optimizer step 至少要同步一次完整梯度。若梯度总大小约为：
+
+\[
+G = N \times c_g
+\]
+
+在 ring all-reduce 的粗略模型下，每个 rank 的通信量量级约为：
+
+\[
+2 \times \frac{D - 1}{D} \times G
+\]
+
+这不是你每次排查性能时都要手算的精确公式，但它给了一个很重要的直觉：\key{模型越大，梯度越大；数据并行规模越大，梯度同步越容易变成 step time 里的主要开销。}\footnote{NCCL 文档给出了 AllReduce 等 collective 的语义；Horovod 论文和大规模数据并行训练资料常用 ring all-reduce 解释梯度同步通信量，PyTorch DDP 的工程论文也围绕梯度 bucket 与 all-reduce overlap 展开性能讨论。}
+
+\begin{intubox}
+\textbf{DDP 为什么还能跑得很快？}\\
+因为 DDP 会把梯度切成 bucket，并尽量在反向计算还没完全结束时就开始同步已就绪的 bucket。性能好不好，很大程度取决于\key{反向计算和梯度通信能重叠多少}。
+\end{intubox}
+
+常见影响因素包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{网络拓扑：} 单机 NVLink 通常比跨机网络更容易扩展。
+  \item \textbf{bucket 大小：} bucket 太小会产生过多通信启动开销，太大又可能降低重叠机会。
+  \item \textbf{模型结构：} 大量小参数、动态分支、unused parameters 都可能影响 bucket 行为。
+  \item \textbf{累积策略：} gradient accumulation 若不用 \texttt{no\_sync}，会把通信次数放大 $A$ 倍。
+\end{itemize}
+
+\subsection{八、\texttt{DistributedSampler}：DDP 数据正确性的核心}
+
+DDP 不会自动帮你把输入 batch 切给不同 GPU。真正负责数据切分的是 \texttt{DistributedSampler} 或你自己实现的等价逻辑。\footnote{PyTorch DDP 文档说明 DDP 不会 shard/chunk 输入，用户需要自己定义数据切分方式；\texttt{DistributedSampler} 文档则给出了按 rank 切分 dataset replica 以及每个 epoch 调用 \texttt{set\_epoch} 的规范。}
+
+\begin{warnbox}
+\textbf{一个非常常见的错误：}\\
+只把模型包成 DDP，但 DataLoader 仍然让每个 rank 读完整数据。这样虽然代码能跑，但每张卡看到的是重复样本，global batch 和训练语义都错了。
+\end{warnbox}
+
+\texttt{DistributedSampler} 有几个必须记住的细节：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{每个 epoch 调用 \texttt{set\_epoch(epoch)}：} 否则 shuffle 种子不变，每个 epoch 的样本顺序可能重复。
+  \item \textbf{不要重复手动切分数据：} 已经用了 \texttt{DistributedSampler}，就不要再在 dataset 里按 rank 二次切分。
+  \item \textbf{注意最后一个 batch：} 如果各 rank batch 数不一致，可能导致某些 rank 先退出，其他 rank 卡在 collective 上。
+  \item \textbf{变长数据要看有效 token：} NLP/多模态训练里，样本条数相同不代表 token 数相同，吞吐和 loss 统计都要按真实 token 看。
+\end{itemize}
+
+\subsection{九、日志、指标与 checkpoint}
+
+\subsubsection*{1. 日志只让 rank 0 打印}
+
+多进程训练时，如果每个 rank 都打印日志或写同一个文件，输出会非常混乱，甚至造成文件竞争。常见做法是：
+
+\begin{lstlisting}[language=Python, caption=只在 rank 0 写日志]
+if dist.get_rank() == 0:
+    print(f"loss={loss.item():.4f}")
+\end{lstlisting}
+
+\subsubsection*{2. 指标要区分 local metric 和 global metric}
+
+某个 rank 上的 loss 或 accuracy 只是 local mini-batch 的结果，不一定等于全局指标。若要得到全局平均值，可以显式 \texttt{all\_reduce}：
+
+\begin{lstlisting}[language=Python, caption=跨 rank 平均一个标量指标]
+metric = torch.tensor([local_loss], device=device)
+dist.all_reduce(metric, op=dist.ReduceOp.SUM)
+metric = metric / dist.get_world_size()
+\end{lstlisting}
+
+如果要汇总预测结果、样本 id 或 reward，往往要用 \texttt{all\_gather} 或对象收集，而不是 \texttt{all\_reduce}。
+
+\subsubsection*{3. DDP checkpoint 的基本做法}
+
+DDP 下每个 rank 的模型参数理论上相同，所以通常让 rank 0 保存公共 checkpoint：
+
+\begin{lstlisting}[language=Python, caption=DDP checkpoint 的常见保存方式]
+if dist.get_rank() == 0:
+    torch.save(
+        {
+            "model": ddp_model.module.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "step": global_step,
+        },
+        checkpoint_path,
+    )
+\end{lstlisting}
+
+恢复时所有 rank 从同一个 checkpoint 加载即可。若你追求完全 bit-level resume，还要额外保存随机数状态、数据采样状态、AMP scaler 状态，以及可能的 dataloader 进度。
+
+\begin{warnbox}
+\textbf{不要直接保存 \texttt{ddp\_model.state\_dict()} 当作普通单卡模型权重。}\\
+更通用的做法是保存 \texttt{ddp\_model.module.state\_dict()}，这样之后单卡加载或迁移到其他并行策略时更干净。
+\end{warnbox}
+
+\subsection{十、DDP 最常见的坑}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{5.1cm}p{4.3cm}}
+\hline
+\textbf{现象} & \textbf{常见原因} & \textbf{排查方向} \\
+\hline
+多卡后仍然 OOM & DDP 不切参数、梯度和优化器状态 & 看单卡模型状态账本，考虑 ZeRO/FSDP。 \\
+每个 epoch 数据顺序一样 & 忘了调用 \texttt{sampler.set\_epoch(epoch)} & 在 epoch 开头设置 sampler epoch。 \\
+训练 hang 住 & 某些 rank 没有进入同一个 collective & 检查 batch 数、条件分支、异常退出和 unused parameters。 \\
+loss 和单卡对不上 & global batch、loss reduction 或 accumulation 缩放不一致 & 重新核对 $B_{\text{global}}$ 和 loss scaling。 \\
+日志重复很多份 & 每个 rank 都在打印或写文件 & 只让 rank 0 做外部可见日志。 \\
+checkpoint 文件损坏 & 多个 rank 同时写同一路径 & 只让 rank 0 保存，其他 rank 等待或直接继续。 \\
+通信开销很大 & 梯度 all-reduce 不能和 backward 充分重叠 & 看 bucket、网络、模型结构和 \texttt{no\_sync}。 \\
+提示 unused parameter & 某些参数在当前 forward 没参与 loss & 检查动态图分支，必要时使用 \texttt{find\_unused\_parameters=True}。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{关于 \texttt{find\_unused\_parameters}:}\\
+它能让某些动态图模型避免因为参数未参与反向而卡住，但也会带来额外 autograd graph 遍历开销。稳定静态图模型不应该长期依赖它。
+\end{intubox}
+
+\subsection{十一、什么时候 DDP 足够，什么时候该升级}
+
+DDP 是强基线，但不是万能答案。判断是否继续用 DDP，可以看下面这张表：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{4.2cm}p{4.6cm}}
+\hline
+\textbf{场景} & \textbf{DDP 是否合适} & \textbf{原因} \\
+\hline
+模型和 optimizer states 单卡放得下，只是训练慢 & 合适 & DDP 正是为吞吐扩展设计的。 \\
+想把 global batch 做大，提高 tokens/sec & 通常合适 & 只要优化稳定性和学习率策略跟得上。 \\
+模型参数或 Adam states 单卡放不下 & 不合适 & DDP 完整复制模型状态，需要 ZeRO/FSDP。 \\
+长序列导致激活 OOM & 只靠 DDP 不够 & 需要 activation checkpointing、sequence parallel 或减小 micro-batch。 \\
+单层矩阵本身太大，单卡无法计算 & 不合适 & 需要 tensor parallel 等模型并行。 \\
+跨机 all-reduce 占 step time 大头 & 可能不够 & 需要检查网络、bucket、overlap，或考虑混合并行策略。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{升级路线：}\\
+如果瓶颈是\key{吞吐不够}，先用 DDP；\\
+如果瓶颈是\key{模型状态显存不够}，看 ZeRO/FSDP；\\
+如果瓶颈是\key{单层计算本身放不下}，看 tensor parallel；\\
+如果瓶颈是\key{长序列激活太大}，看 activation checkpointing、sequence parallel 和更省显存的 attention 实现。
+\end{summarybox}
+
+\subsection{十二、面试版回答}
+
+\subsubsection*{1. 为什么说 DDP 是分布式训练 baseline？}
+
+因为 DDP 是最经典的数据并行：每张卡保存完整模型，处理不同数据子集，反向时用 \texttt{all\_reduce} 同步梯度。它能很好地扩展吞吐，而且工程上成熟稳定。因此后面的 ZeRO、FSDP、Megatron 混合并行，通常都要和 DDP 这条基线比较：到底省了哪些状态、增加了哪些通信、换来了什么规模扩展能力。
+
+\subsubsection*{2. DDP 为什么不省显存？}
+
+因为 DDP 只切分输入数据，不切分模型状态。参数、梯度、Adam optimizer states 在每个 rank 上都有完整一份，所以单 rank 模型状态仍然是 $N(c_p + c_g + c_o)$。增加 GPU 数不会让这个式子除以 \texttt{world\_size}。
+
+\subsubsection*{3. DDP 如何保证不同 rank 参数一致？}
+
+DDP 依赖三个条件：初始参数一致、每一步通过 \texttt{all\_reduce} 得到一致梯度、每个 rank 使用相同 optimizer 规则更新。这样即使参数不是每步广播，各 rank 本地更新后仍然保持一致。
+
+\subsubsection*{4. DDP 中 global batch size 怎么算？}
+
+如果每个 rank 的 micro-batch size 是 $B_{\mu}$，数据并行组大小是 $D$，gradient accumulation steps 是 $A$，那么 global batch size 是 $B_{\mu} \times D \times A$。调学习率、loss scale、吞吐和实验复现时都要用这个口径。
+
+\subsubsection*{5. 为什么 DDP 可能被通信卡住？}
+
+因为每个 optimizer step 都要同步完整梯度。模型越大，梯度越大；跨机规模越大，all-reduce 成本越明显。DDP 通过 bucket 和通信计算重叠缓解这个问题，但网络拓扑、bucket 设置、动态图结构和 accumulation 写法都会影响最终效率。
+
+\subsection{十三、学完这一节后的检查清单}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 你能画出 DDP 一次 step 中 forward、backward、bucket all-reduce、optimizer step 的顺序。
+  \item 你能解释为什么 DDP 是“数据并行”而不是“模型分片”。
+  \item 你能算出 $B_{\text{global}} = B_{\mu} \times D \times A$。
+  \item 你知道 gradient accumulation 时为什么要用 \texttt{no\_sync}。
+  \item 你知道 \texttt{DistributedSampler.set\_epoch(epoch)} 为什么不能忘。
+  \item 你能解释为什么 rank 0 保存 \texttt{ddp\_model.module.state\_dict()} 更通用。
+  \item 你能判断一个问题应该继续用 DDP，还是升级到 ZeRO/FSDP、activation checkpointing 或模型并行。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{Stage 1 最终结论：}\\
+DDP 是后面所有工业级分布式训练框架的\key{基线坐标系}。它的设计非常清晰：\key{复制模型、切分数据、同步梯度、各自更新}。\\
+它强在吞吐扩展和工程成熟度，弱在模型状态完全冗余。正是因为 DDP 的显存冗余太明显，后面的 ZeRO/FSDP 才有意义。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item PyTorch \texttt{DistributedDataParallel} API 文档：确认 DDP 的基本语义、梯度同步、参数/buffer 行为、输入数据不由 DDP 自动切分，以及 DDP 相比 \texttt{DataParallel} 的推荐使用方式。\\
+  \url{https://docs.pytorch.org/docs/2.11/generated/torch.nn.parallel.DistributedDataParallel.html}
+  \item PyTorch DDP Design Note：确认 DDP reducer、autograd hooks、gradient buckets、bucket rebuild、communication overlap 等内部机制。\\
+  \url{https://docs.pytorch.org/docs/2.11/notes/ddp.html}
+  \item PyTorch \texttt{DistributedSampler} 文档：确认按 rank 切分 dataset replica、\texttt{shuffle} 与 \texttt{set\_epoch(epoch)} 的正确用法。\\
+  \url{https://docs.pytorch.org/docs/2.11/data.html#torch.utils.data.distributed.DistributedSampler}
+  \item PyTorch \texttt{torch.distributed} 文档：确认 \texttt{init\_process\_group}、collective communication、\texttt{all\_reduce}、\texttt{all\_gather}、\texttt{reduce\_scatter} 等接口语义。\\
+  \url{https://docs.pytorch.org/docs/2.11/distributed.html}
+  \item NVIDIA NCCL Collective Operations 文档：确认 \texttt{AllReduce}、\texttt{Broadcast}、\texttt{AllGather}、\texttt{ReduceScatter} 等 GPU 通信库里的 collective 语义。\\
+  \url{https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html}
+  \item Li 等，\emph{PyTorch Distributed: Experiences on Accelerating Data Parallel Training}, arXiv:2006.15704：工程视角总结 PyTorch DDP 在梯度 bucket、通信计算重叠和大规模数据并行训练中的经验。\\
+  \url{https://arxiv.org/abs/2006.15704}
+  \item Goyal 等，\emph{Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour}, arXiv:1706.02677：理解数据并行扩大 global batch 后学习率、warmup 和训练稳定性的经典参考。\\
+  \url{https://arxiv.org/abs/1706.02677}
+  \item Sergeev 与 Del Balso，\emph{Horovod: fast and easy distributed deep learning in TensorFlow}, arXiv:1802.05799：理解 ring all-reduce、梯度同步通信开销和数据并行工程抽象的经典工程论文。\\
+  \url{https://arxiv.org/abs/1802.05799}
+  \item Rajbhandari 等，\emph{ZeRO: Memory Optimizations Toward Training Trillion Parameter Models}, arXiv:1910.02054：用于和 DDP 对照，说明经典数据并行会冗余保存参数、梯度和优化器状态，而 ZeRO 通过状态分片降低单 rank 显存。\\
+  \url{https://arxiv.org/abs/1910.02054}
+\end{itemize}
+\endgroup

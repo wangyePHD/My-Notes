@@ -1,0 +1,56 @@
+% ============================================================
+% Topic overview: Positional Encoding
+% ============================================================
+
+\subsection{位置编码学习总览}
+
+这个专题先作为“位置编码学习入口”。后续每次在论文里遇到 RoPE、MRoPE、3D-RoPE、position offset、segment boundary、long-context extrapolation，都可以回到这里补一块。
+
+\begin{intubox}
+\textbf{先记住一个总问题：}Transformer 的 attention 本身只看 token 间内容相似度，不天然知道“谁在前、谁在后、谁在左上角、谁是第几帧”。位置编码就是给 token 补上可计算的位置关系，让模型知道顺序、空间、时间和模态边界。
+\end{intubox}
+
+\textbf{第一层：语言模型的位置。}
+
+语言里最基础的问题是顺序。比如“狗咬人”和“人咬狗”token 集合相近，但顺序完全改变语义。早期 absolute/sinusoidal positional encoding 直接给每个位置加一个位置向量；RoPE 则把位置信息放进 query/key 的旋转关系里，让 attention score 能感知相对位移。
+
+\textbf{第二层：图像模型的位置。}
+
+图像 token 不只有一维顺序，还要知道二维空间。一个 patch 在左上角、右下角、人物脸部还是背景天空，对生成和编辑都很关键。因此图像模型常常需要 2D 位置编码，或者把 RoPE 扩展到 $H,W$ 两个空间维度。
+
+\textbf{第三层：视频和图组的位置。}
+
+视频、图像序列、multi-image generation 又多了时间/序列维。此时位置编码要同时表示第几张图/第几帧 $T$，以及图像内部第几行第几列 $H,W$。Wan-Image 里提到的 3D-RoPE 就是这一类：它让生成侧知道 latent token 在 $T,H,W$ 中的位置。
+
+\textbf{第四层：多模态边界。}
+
+统一理解与生成模型里，文本 token、ViT visual tokens、VAE latent tokens 可能放在同一个上下文里。如果只给它们普通位置，模型可能分不清“这是文本段的位置”还是“这是图像 latent 的位置”。所以很多系统会引入 segment boundary、positional offset 或 modality-specific encoding。Wan-Image 在 text segment 和 image segment 之间沿 $T$ 轴加入 fixed positional offset，就是这个方向的设计。
+
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+后续学习路线：
+1. Absolute / sinusoidal PE：最基础的位置向量。
+2. RoPE：为什么旋转能表达相对位置。
+3. ALiBi / xPos：长上下文和外推问题。
+4. 2D RoPE：图像 patch 的 H,W 位置。
+5. MRoPE：多模态 text + image token 的位置组织。
+6. 3D-RoPE：视频/图组/latent 的 T,H,W 位置。
+7. Segment offset：文本段、图像段、latent 段如何隔开。
+\end{lstlisting}
+
+\textbf{和 Wan-Image 的连接。}
+
+Wan-Image 3.1 里最值得回头细学的是这句话：理解侧使用 MRoPE，生成侧使用 3D-RoPE，并在 text/image segments 之间插入 fixed positional offset。它背后的直觉是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{MRoPE：}帮助理解侧把文本描述和图像区域对齐，比如“左下角 logo”“右侧人物脸部”。
+  \item \textbf{3D-RoPE：}帮助生成侧知道 VAE latent token 属于第几张图/第几帧、图像第几行、第几列。
+  \item \textbf{fixed offset：}把 text segment 和 image segment 在位置空间里隔开，避免不同模态的位置混在一起。
+\end{itemize}
+
+后面精读位置编码时，不要只停在公式。每种方法都按三个问题学：
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item 它给 token 注入了哪种位置信息？
+  \item 它改变的是 embedding、attention score，还是 query/key 的几何关系？
+  \item 它适合语言、图像、视频、多模态里的哪一种场景？
+\end{enumerate}

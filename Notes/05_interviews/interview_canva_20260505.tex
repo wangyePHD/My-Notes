@@ -1,0 +1,326 @@
+% ============================================================
+% Canva 技术面试笔记
+% 日期：2026/05/05
+% ============================================================
+
+\section{面试笔记：Canva · 2026/05/05}
+
+\begin{conceptbox}
+\textbf{面试速查笔记 · 2026/05/05 · Canva}\\
+面试形式：全英文技术面试\\
+面试官背景：韩国面试官\\
+当前整理范围：按你的要求，本页重点展开 3.2、3.3、3.4；3.1 项目深挖先保留问题清单。
+\end{conceptbox}
+
+\begin{warnbox}
+\textbf{本轮考察主线：}\\
+Canva 不是在问零散八股，而是在检查你是否同时具备三种能力：\\
+1. 能把生成模型讲到原理层；\\
+2. 能把注意力和训练系统讲到工程层；\\
+3. 回答时能做出明确 trade-off，而不是只背名词。
+\end{warnbox}
+
+% ============================================================
+\subsection{一、项目深挖（OmniStyle 论文）}
+% ============================================================
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 你在腾讯、阿里、百度、京东等大厂实习期间，核心研究与工程落地分别是什么？
+  \item 详细介绍你 CVPR 2025 论文 OmniStyle 的核心动机，以及现存方法的三大缺陷是什么？
+  \item OmniFilter 过滤流水线是人工规则还是自动化方案？整体技术链路如何设计？
+  \item 内容保留、风格一致性、视觉质量三大评分维度，具体如何量化计算？
+  \item 如果 6 个候选生成结果的得分整体都很低，如何处理这批低质数据对？
+  \item 模型架构基于 Flux 改造，多模态 latent（风格、内容、噪声）拼接后，如何解决 RoPE 位置编码与空间信息错位问题？
+  \item 为什么选择全量微调（full fine-tuning）而不是 LoRA？二者在千级风格类别下的性能差距如何？
+  \item 百万级数据集规模的设计依据是什么？数据量大小与模型效果、训练稳定性之间如何权衡？
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{说明：}\\
+本轮先不展开 3.1。你当前要求是把 3.2、3.3、3.4 的每个问题写成可直接面试作答的笔记与答案，所以这部分先保留原始问题清单。
+\end{summarybox}
+
+% ============================================================
+\subsection{二、生成模型基础对比}
+% ============================================================
+
+\subsubsection{Q2.1：扩散模型、GAN、VAE 三类生成模型的核心优缺点对比}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+GAN 的优势是采样最快、图像最锐，但训练最不稳定；VAE 的优势是训练稳定、潜变量结构清晰，但重建目标往往带来模糊；Diffusion 的优势是训练稳定、分布覆盖好、条件控制强，所以成了当前图像生成主流，但缺点是采样慢、推理成本高。
+\end{conceptbox}
+
+\textbf{展开逻辑：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{GAN}：本质是生成器和判别器的对抗博弈。优点是\key{单次前向即可采样}，图像通常锐利；缺点是训练目标是 minimax saddle point，容易震荡、模式崩塌、覆盖不全，也没有天然的显式推断器。
+  \item \textbf{VAE}：本质是学习隐变量模型并优化 ELBO。优点是\key{训练稳定、推断方便、潜空间连续且可解释}，适合表示学习、压缩和下游控制；缺点是像素级重建和 KL 正则常常让样本偏平滑，视觉细节不如 GAN 和 Diffusion。
+  \item \textbf{Diffusion}：本质是把生成拆成一系列去噪子问题，训练目标通常是噪声预测或 score/velocity 回归。优点是\key{优化稳定、模式覆盖更完整、容易做条件控制与编辑}；缺点是采样需要多步迭代，延迟高于 GAN/VAE。
+\end{itemize}
+
+\textbf{面试加分点：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 如果面试官问“为什么现在工业界主流不是 GAN 了”，可以直接答：\key{不是因为 GAN 不能生成好图，而是因为 diffusion 在 fidelity、coverage、可控性、可扩展性上更均衡}。
+  \item 如果面试官追问 VAE 为什么容易糊，可以答：常见高斯似然或逐像素重建损失更偏向平均解，视觉上就容易损失高频纹理。
+\end{itemize}
+
+\subsubsection{Q2.2：GAN 训练不稳定的核心底层原因是什么？}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+GAN 不稳定的根因不是“实现不好”，而是\key{优化目标本身是两个网络之间的非凸非稳态博弈}。判别器一变，生成器的损失面就跟着变；如果判别器太强，生成器梯度会变弱甚至失效；再加上目标只要求“骗过当前判别器”，就很容易出现震荡和模式崩塌。
+\end{conceptbox}
+
+\textbf{展开逻辑：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{非稳态目标}：GAN 是 two-player minimax game，不像监督学习那样面对一个固定目标。训练过程中，$D$ 更新以后，$G$ 的优化方向立刻变化。
+  \item \textbf{支持集不重叠时梯度问题严重}：真实分布和生成分布早期通常几乎不重合，原始 GAN 的 JS 散度在这种情况下容易导致梯度饱和，生成器拿不到稳定的改进信号。
+  \item \textbf{模式崩塌}：生成器只需要学会“当前哪些模式最容易骗过判别器”，并不会被显式奖励去覆盖整个数据分布，所以容易把很多 latent 都映射到少数样本模式。
+  \item \textbf{对超参数非常敏感}：学习率、更新频率、判别器容量、正则化强度稍一失衡，就可能从“判别器太弱”跳到“判别器太强”。
+\end{itemize}
+
+\textbf{如何进一步回答“那后来怎么缓解” ：}
+\begin{itemize}[leftmargin=1.5em]
+  \item WGAN / WGAN-GP 通过更合理的距离和 Lipschitz 约束改善梯度质量。
+  \item Spectral Norm、TTUR、gradient penalty、本体结构约束都在尝试让博弈更平衡。
+  \item 但这些方法是在\key{修补对抗优化}，并没有改变 GAN 的博弈本质，所以稳定性问题只是缓解，不是彻底消失。
+\end{itemize}
+
+\subsubsection{Q2.3：扩散模型相比其他生成方案，能大规模落地、效果更好的本质原因}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+扩散模型之所以能大规模落地，是因为它把困难的生成问题分解成一系列局部去噪问题，训练目标更稳定，分布覆盖更完整，而且条件控制、编辑、反演都更自然；代价只是推理更慢，而这个问题后来又被 latent diffusion、加速采样和蒸馏逐步缓解了。
+\end{conceptbox}
+
+\textbf{展开逻辑：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{训练目标稳定}：Diffusion 训练通常退化为噪声预测、score matching 或 velocity regression，本质上接近一个监督式回归问题，比 GAN 的对抗博弈稳定得多。
+  \item \textbf{分布覆盖更好}：它不是只奖励“骗过判别器”，而是在整个噪声轨迹上学习如何回到数据分布，因此更不容易只学少数模式。
+  \item \textbf{可控性强}：文本条件、图像条件、结构条件、classifier-free guidance、ControlNet、inversion 都能自然接入 iterative denoising 流程。
+  \item \textbf{可扩展性强}：随着模型规模、数据规模、算力规模上升，diffusion 的效果通常更平滑地提升，工程上更容易标准化训练和迭代。
+  \item \textbf{工业上可接受}：虽然采样慢，但可以用 latent space、DDIM、蒸馏、consistency、rectified flow 等路线降低 NFE，因此整体 trade-off 越来越好。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{本节记忆钩子：}\\
+GAN = 快但不稳；VAE = 稳但偏糊；Diffusion = 稳、覆盖好、可控，但慢。\\
+真正让 diffusion 成为主流的，不只是“指标高”，而是\key{训练稳定性 + 分布覆盖 + 条件控制 + 可扩展性}这四件事同时成立。
+\end{summarybox}
+
+% ============================================================
+\subsection{三、Diffusion 与 Transformer 基础}
+% ============================================================
+
+\subsubsection{Q3.1：自注意力（Self-Attention）核心原理、Q/K/V 计算流程}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+Self-attention 的本质是：对每个 token，用它自己的 query 去和所有 token 的 key 算相关性，得到一组权重，再对所有 value 做加权求和，输出一个融合全局上下文的信息表示。Q、K、V 都是输入 token 经过不同线性映射得到的。
+\end{conceptbox}
+
+\textbf{标准公式：}
+\[
+\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+\]
+
+\textbf{展开逻辑：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 输入序列先经过三组线性层，分别得到 $Q$、$K$、$V$。
+  \item 对第 $i$ 个 token 来说，$q_i$ 和所有 $k_j$ 做点积，表示“我应该关注谁”。
+  \item 除以 $\sqrt{d_k}$ 是为了防止维度大时点积过大，softmax 过度饱和。
+  \item 对这些分数做 softmax，得到权重后，再对对应的 $v_j$ 加权求和，得到第 $i$ 个 token 的输出。
+  \item 多头注意力（multi-head attention）是把这个过程并行做多次，让不同 head 在不同子空间里学习不同关系，比如局部语法、长程依赖、实体对齐等。
+\end{itemize}
+
+\textbf{回答时最好顺手补一句：}
+\begin{itemize}[leftmargin=1.5em]
+  \item Self-attention 里 Q/K/V 来自同一序列；cross-attention 里 Q 通常来自当前生成流，K/V 来自条件侧，比如文本编码器或图像编码器。
+\end{itemize}
+
+\subsubsection{Q3.2：自注意力的核心缺陷是什么？时间、空间复杂度问题？}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+标准 self-attention 的主要问题是\key{二次复杂度}。长度为 $n$ 的序列要构造一个 $n \times n$ 的注意力分数矩阵，所以时间复杂度大约是 $O(n^2 d)$，显存开销大约是 $O(n^2)$。当上下文很长，或者图像 token 很多时，计算和显存都会快速爆炸。
+\end{conceptbox}
+
+\textbf{展开逻辑：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 每个 query 都要和所有 key 交互，所以配对数是 $n^2$。
+  \item 训练时不仅要算出分数矩阵，还要保存大量中间激活用于反向传播，因此显存压力很大。
+  \item 在长上下文 LLM、视频模型、高分辨率视觉 Transformer 里，这个问题尤其突出。
+  \item 实际瓶颈不只是 FLOPs，还有\key{内存读写}。很多时候 GPU 不是算不动，而是 HBM 和片上 SRAM 之间搬运注意力矩阵太慢。
+\end{itemize}
+
+\textbf{因此工业界常见优化路线：}
+\begin{itemize}[leftmargin=1.5em]
+  \item FlashAttention：不改数学结果，改 kernel 与 IO 路径。
+  \item Sparse / Local / Sliding Window Attention：减少真正参与计算的 token 对。
+  \item KV Cache、MQA/GQA、Chunking、Sequence Parallel：从推理或并行维度继续减负。
+\end{itemize}
+
+\subsubsection{Q3.3：FlashAttention / FlexAttention 了解吗？使用场景与作用？}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+FlashAttention 是\key{精确 attention 的高性能实现}，核心思想是 IO-aware tiling，不显式物化完整 attention matrix，从而减少显存和 HBM 读写；FlexAttention 则更像 PyTorch 提供的\key{可编程注意力接口}，允许你定义自定义的 score 修改和 block mask，在保持高性能的同时表达 sliding window、prefix-LM、block-sparse 等复杂注意力模式。
+\end{conceptbox}
+
+\textbf{FlashAttention：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 不改变 vanilla attention 的数学结果，属于 \key{exact attention}。
+  \item 核心收益是减少高带宽显存和片上 SRAM 之间的读写，不必完整保存 $n \times n$ attention matrix。
+  \item 适合长序列训练与推理，是 GPT/BERT/多模态 Transformer 中最常见的底层 kernel 优化之一。
+  \item 如果面试官问价值，直接说：\key{它解决的是 wall-clock 和 memory bottleneck，而不是 attention 理论本身。}
+\end{itemize}
+
+\textbf{FlexAttention：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 是 PyTorch 官方文档中的可编程注意力 API，允许通过 \texttt{score\_mod}、\texttt{mask\_mod} 和 \texttt{BlockMask} 定义自定义注意力。
+  \item 它特别适合\key{非标准 mask}，例如 sliding window、prefix-LM、document mask、block-sparse attention。
+  \item 适用场景不是“替代所有 FlashAttention”，而是当你需要\key{既保留高性能，又表达复杂稀疏模式}时，FlexAttention 很有价值。
+  \item 你可以把它理解成：FlashAttention 更像高性能 dense kernel；FlexAttention 更像高性能可编程 attention 抽象层。
+\end{itemize}
+
+\textbf{面试加分说法：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 如果是标准 causal / dense attention，我优先直接使用成熟的 FlashAttention kernel。
+  \item 如果是 prefix-LM、局部窗口、块稀疏或业务定制 mask，我会优先考虑 FlexAttention 这类可编程接口，再配合 \texttt{torch.compile} 获得 fused kernel 的收益。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{本节记忆钩子：}\\
+Attention 的本质是\key{相关性加权聚合}；Attention 的瓶颈是\key{二次复杂度和内存 IO}；FlashAttention 解的是\key{实现效率}，FlexAttention 解的是\key{复杂模式下的高性能可编程性}。
+\end{summarybox}
+
+% ============================================================
+\subsection{四、大模型分布式训练}
+% ============================================================
+
+\subsubsection{Q4.1：多机多卡训练的主流并行策略，数据并行、模型并行核心原理？}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+数据并行是\key{每张卡一份完整模型、每张卡处理不同 batch shard}，然后做梯度同步；模型并行是\key{模型本身切开}，因为单卡放不下或者单层算得太大。模型并行又常拆成 tensor parallel 和 pipeline parallel，实际大模型通常是数据并行、模型并行、ZeRO/FSDP 混合使用。
+\end{conceptbox}
+
+\textbf{标准展开：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{数据并行（Data Parallel / DDP）}：每个 rank 保留完整参数，读不同 mini-batch shard，前反向后通过 all-reduce 同步梯度，再在各 rank 做相同的 optimizer step。优点是实现简单、吞吐高；缺点是\key{模型参数、梯度、优化器状态都要完整复制一份}，显存冗余大。
+  \item \textbf{张量并行（Tensor Parallel）}：把单层线性层或注意力中的大矩阵沿 hidden dimension 等方向切到多张卡上，每张卡只算局部块，再通过 all-gather / reduce-scatter 合并。适合单层过大时使用。
+  \item \textbf{流水线并行（Pipeline Parallel）}：把不同层分配到不同设备或 stage，用 micro-batch 方式形成流水线。优点是能把深模型拆开；缺点是有 pipeline bubble 和负载均衡问题。
+  \item \textbf{现实系统}：通常不是二选一，而是 \key{DP + TP + PP + ZeRO/FSDP} 组合，也就是所谓 3D 并行或混合并行。
+\end{itemize}
+
+\textbf{面试时最好补一句：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 如果模型能放进单卡，优先用数据并行；如果单卡放不下，先考虑 FSDP/ZeRO；如果单层 matmul 已经很大，再加 tensor parallel；如果层数非常深，再引入 pipeline parallel。
+\end{itemize}
+
+\subsubsection{Q4.2：DeepSpeed ZeRO Stage 1 / 2 / 3 的核心作用与区别}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+ZeRO 的核心思想是\key{把数据并行里原本重复保存的状态拆到不同 rank 上}。Stage 1 只切 optimizer states；Stage 2 再切 gradients；Stage 3 进一步把 parameters 也切掉。阶段越高，显存越省，但通信和实现复杂度也越高。
+\end{conceptbox}
+
+\textbf{分阶段理解：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Stage 1}：shard optimizer states。参数和梯度仍然每卡完整保留，但像 Adam 的一阶、二阶矩不再每卡都存整份。
+  \item \textbf{Stage 2}：在 Stage 1 基础上继续 shard gradients。这样优化器状态和梯度都不再完整复制，显存进一步下降。
+  \item \textbf{Stage 3}：在 Stage 2 基础上继续 shard parameters。训练时只在需要计算的时刻 all-gather 当前参数 shard，用完再释放，是最激进的内存节省方案。
+\end{itemize}
+
+\textbf{如何回答 trade-off：}
+\begin{itemize}[leftmargin=1.5em]
+  \item Stage 1：改造最轻，收益最稳，适合中等规模模型。
+  \item Stage 2：是很多工程场景里性价比很高的一档。
+  \item Stage 3：最省显存，适合超大模型，但通信更频繁，对网络带宽、实现细节和 checkpoint 流程要求更高。
+\end{itemize}
+
+\textbf{一句补充：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 从思想上看，FSDP 的 FULL\_SHARD 和 ZeRO Stage 3 很接近，都是把参数、梯度、优化器状态尽可能分片化。
+\end{itemize}
+
+\subsubsection{Q4.3：混合精度训练（Mixed Precision）的作用、场景与利弊}
+
+\begin{conceptbox}
+\textbf{30 秒答法：}\\
+Mixed precision 的目标是用低精度做大部分前反向计算，用高精度保留关键数值稳定环节，从而同时获得\key{更低显存占用和更高吞吐}。它现在几乎是大模型训练标配，但代价是要处理 fp16 的溢出/下溢、loss scaling 和少数算子的精度敏感问题。
+\end{conceptbox}
+
+\textbf{标准展开：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{作用}：降低参数、激活、梯度的存储成本，并利用 Tensor Cores 等硬件提升矩阵乘法吞吐。
+  \item \textbf{常见形式}：训练主计算用 fp16 或 bf16，优化器更新、master weights 或部分 reduction 仍保留 fp32。
+  \item \textbf{典型收益}：显存占用显著下降，batch size 更大，单步吞吐更高，整体训练效率更好。
+  \item \textbf{使用场景}：LLM、Diffusion、ViT、视频模型，基本都默认启用混合精度。
+\end{itemize}
+
+\textbf{利弊和工程判断：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{优点}：更省显存、更快训练、更容易把模型做大。
+  \item \textbf{缺点}：fp16 动态范围小，容易 underflow/overflow，需要 loss scaling；某些归一化、softmax、reduction 或 optimizer 更新仍需更高精度。
+  \item \textbf{实践经验}：如果硬件支持 bf16，通常优先 bf16，因为指数范围更大，数值稳定性通常优于 fp16，训练体验更省心。
+\end{itemize}
+
+\subsubsection{Q4.4：多节点 FSDP / DeepSpeed 大规模训练的实操落地经验怎么答？}
+
+\begin{conceptbox}
+\textbf{核心策略：}\\
+这一题最怕空泛。面试官真正想听的是：\key{你怎么选并行策略，怎么控显存，怎么定位瓶颈，怎么做 checkpoint 和恢复，遇到过什么问题以及如何解决。}
+\end{conceptbox}
+
+\textbf{如果你确实做过，可以按这条模板回答：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 先交代规模：多少节点、多少 GPU、模型多大、序列长度多长、全局 batch 多大。
+  \item 再交代方案：比如 BF16 + activation checkpointing + FSDP FULL\_SHARD，或者 DeepSpeed ZeRO-2/3 + gradient accumulation。
+  \item 再讲关键配置：auto wrap policy 是否按 Transformer block 包装，是否用 CPU offload，是否用 sharded checkpoint，是否打开 backward prefetch / overlap communication。
+  \item 再讲踩坑：OOM、NCCL timeout、文件系统写 checkpoint 太慢、数据加载不均衡、resume 后 loss 漂移、跨节点网络瓶颈。
+  \item 最后讲优化结果：吞吐提升多少，显存从多少降到多少，训练稳定性如何改善。
+\end{itemize}
+
+\textbf{如果你没有完整的大规模多节点实战，推荐这样诚实回答：}
+\begin{warnbox}
+\textbf{稳妥答法：}\\
+我有多卡训练和内存优化经验，也系统研究过 FSDP / DeepSpeed 的分片与 checkpoint 机制；如果是超大规模多节点场景，我会优先根据模型是否放得下单卡来选择 DDP、FSDP 或 ZeRO，再结合 mixed precision、activation checkpointing 和 sharded checkpoint 控制内存与吞吐。我不会声称自己做过没做过的规模，但我清楚配置路径和关键 bottleneck 在哪里。
+\end{warnbox}
+
+\textbf{你可以继续展开成工程答案：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{FSDP 侧}：如果目标是极限省显存，我会优先考虑 FULL\_SHARD；如果跨节点带宽一般，而节点内 NVLink 很强，我会考虑 HYBRID\_SHARD，尽量把昂贵通信压在节点内。
+  \item \textbf{DeepSpeed 侧}：模型还没大到必须参数分片时，ZeRO-2 很常是稳定的工程折中；再往上才推 ZeRO-3。
+  \item \textbf{稳定性侧}：默认配 BF16、grad clipping、activation checkpointing，必要时对优化器和 reduction 保留更高精度。
+  \item \textbf{checkpoint 侧}：训练中保存 sharded state dict，离线导出 full checkpoint 时只让 rank 0 汇总到 CPU，避免 GPU 和主机内存冗余。
+  \item \textbf{监控侧}：重点看 step time、GPU util、all-gather / reduce-scatter 时间占比、NCCL 错误、dataloader stall、resume 一致性。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{本节记忆钩子：}\\
+DDP 解决吞吐，FSDP / ZeRO 解决显存冗余，TP / PP 解决单层或整模放不下；Mixed Precision 和 Activation Checkpointing 是几乎所有大模型训练都会叠加的基础优化。
+\end{summarybox}
+
+% ============================================================
+\subsection{检索依据}
+% ============================================================
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Goodfellow et al., \textit{Generative Adversarial Networks}, arXiv:1406.2661.
+  \item Kingma and Welling, \textit{Auto-Encoding Variational Bayes}, arXiv:1312.6114.
+  \item Ho et al., \textit{Denoising Diffusion Probabilistic Models}, arXiv:2006.11239.
+  \item Dhariwal and Nichol, \textit{Diffusion Models Beat GANs on Image Synthesis}, arXiv:2105.05233.
+  \item Vaswani et al., \textit{Attention Is All You Need}, arXiv:1706.03762.
+  \item Dao et al., \textit{FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness}, arXiv:2205.14135.
+  \item Rajbhandari et al., \textit{ZeRO: Memory Optimizations Toward Training Trillion Parameter Models}, arXiv:1910.02054.
+  \item Micikevicius et al., \textit{Mixed Precision Training}, arXiv:1710.03740.
+  \item Shoeybi et al., \textit{Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism}, arXiv:1909.08053.
+  \item PyTorch 2.11 Official Docs: \textit{torch.nn.attention.flex\_attention} and \textit{FullyShardedDataParallel}.
+\end{itemize}
+
+\begin{summarybox}
+\textbf{总复盘：}\\
+这三组问题本质都在考你是否具备\key{从目标函数讲到系统实现}的能力。最稳妥的回答方式不是堆术语，而是始终按同一条线展开：\\
+问题是什么 $\rightarrow$ 为什么会发生 $\rightarrow$ 工业界怎么权衡 $\rightarrow$ 你的判断标准是什么。
+\end{summarybox}

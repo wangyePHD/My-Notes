@@ -1,0 +1,183 @@
+% ============================================================
+% FlashAttention 与 FlexAttention 学习路线图
+% ============================================================
+
+\section{学习路线图：FlashAttention 与 FlexAttention}
+
+\begin{conceptbox}
+\textbf{一句话目标：} 你不是要研究 FlashAttention 或 FlexAttention 本身，而是要成为一个\key{会用、看得懂、能判断 trade-off 的 AIGC 工程使用者}。学完后你应该能回答四件事：\\
+1. \key{标准 attention 为什么在长序列、多图像 token、视频 token 场景下又慢又吃显存}；\\
+2. \key{FlashAttention 大概怎么做到 exact、快、省显存}，但不需要深入 CUDA kernel 细节；\\
+3. \key{看到 PyTorch、Transformers、Diffusers、vLLM 里的 attention backend 配置时，知道代码在做什么}；\\
+4. \key{什么时候用普通 SDPA / FlashAttention，什么时候才需要 FlexAttention 这种可编程 mask 抽象。}
+\end{conceptbox}
+
+\subsection*{资料收集与引用口径}
+
+\begin{conceptbox}
+\textbf{本专区先查资料再整理结论。} 这一页主要综合五类资料：\\
+1. \key{FlashAttention 系列论文}：FlashAttention、FlashAttention-2、FlashAttention-3，用来理解 IO-aware exact attention、并行划分和新硬件优化的来源；\\
+2. \key{官方实现资料}：Dao-AILab \texttt{flash-attention} 仓库，用来确认工程接口、支持硬件、安装和常见使用方式；\\
+3. \key{PyTorch 官方资料}：\texttt{scaled\_dot\_product\_attention} 与 \texttt{torch.nn.attention.flex\_attention}，用来理解 PyTorch 内置 attention backend 与 FlexAttention API；\\
+4. \key{PyTorch 官方博客}：FlexAttention blog，用来理解它为什么强调“PyTorch 的灵活性 + FlashAttention 的性能”；\\
+5. \key{已有系统笔记}：显存账本、mixed precision、activation checkpointing 与 KV cache，用来把 attention kernel 优化放回训练/推理系统上下文里。
+\end{conceptbox}
+
+\subsection{一、这个专区的学习定位}
+
+\begin{warnbox}
+\textbf{不要把目标学偏：} 你当前的目标不是复现 FlashAttention kernel，也不是跟进每一个 CUDA/Triton 优化细节；你的目标是：\key{知道它为什么有用、实际项目里怎么启用、读别人代码时能识别它、出问题时知道排查方向。}
+\end{warnbox}
+
+从 AIGC 工程角度看，FlashAttention / FlexAttention 通常会出现在这些地方：
+\begin{itemize}[leftmargin=1.5em]
+  \item 训练 LLM、DiT、视频模型时，想降低 attention 激活显存和提升吞吐。
+  \item 使用 Hugging Face \texttt{Transformers} 时看到 \texttt{attn\_implementation=\"flash\_attention\_2\"}、\texttt{sdpa}、\texttt{eager}。
+  \item 使用 PyTorch 2.x 时看到 \texttt{scaled\_dot\_product\_attention}，但不知道它底层选了哪个 backend。
+  \item 看推理框架或训练框架时看到 \texttt{flash\_attn\_varlen\_func}、\texttt{cu\_seqlens}、\texttt{causal}、\texttt{sliding\_window}。
+  \item 做长上下文、多图、多帧视频或文档边界 mask 时，发现普通 dense mask 太慢或太占显存，开始接触 FlexAttention。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{本专区的主线：}\\
+不是“论文作者怎么设计 kernel”，而是 \key{普通 attention 为什么不够用 $\rightarrow$ FlashAttention 为什么能作为默认优化 $\rightarrow$ 代码里怎么打开和识别 $\rightarrow$ FlexAttention 什么时候有必要 $\rightarrow$ AIGC 项目怎么选型和排查。}
+\end{summarybox}
+
+\subsection{二、先建立位置关系：它们各自解决什么}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.4cm}p{5.3cm}}
+\hline
+\textbf{主题} & \textbf{你需要掌握的程度} & \textbf{使用者视角的一句话理解} \\
+\hline
+标准 Attention & 必须熟悉公式与瓶颈 & 每个 token 看所有 token，表达力强，但长序列下 $n^2$ 中间矩阵和 IO 很贵。 \\
+PyTorch SDPA & 必须会识别和使用 & PyTorch 2.x 的统一 attention 入口，底层可能走 math、memory-efficient 或 FlashAttention 类 backend。 \\
+FlashAttention & 必须懂核心直觉与使用方式 & 不改 attention 数学结果，通过分块和 online softmax 避免完整物化 attention matrix，通常是标准 dense/causal attention 的优先优化。 \\
+FlashAttention-2/3 & 了解版本差异即可 & 主要是更好的并行划分和新硬件利用率；作为使用者通常只需要知道版本、硬件、dtype 和框架兼容性。 \\
+\texttt{flash-attn} 包 & 会看常见接口即可 & 在很多训练/推理项目里直接调用，常见关键词是 varlen、cu\_seqlens、causal、dropout、head dim。 \\
+FlexAttention & 会判断适用场景 & 不是替代所有 FlashAttention，而是用于复杂 score/mask/block-sparse 需求下的可编程高性能 attention。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{最重要的区分：} FlashAttention 解决的是\key{标准 attention 的实现效率}；FlexAttention 解决的是\key{复杂 attention pattern 的表达与性能}。\\
+如果只是普通 causal LLM 或 dense DiT attention，优先考虑 SDPA / FlashAttention；如果有 prefix-LM、sliding window、document mask、block-sparse、图文分区 mask，再考虑 FlexAttention。
+\end{intubox}
+
+\subsection{三、正式学习顺序（工程使用者版）}
+
+\subsubsection*{Stage 0：先知道普通 Attention 为什么贵}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} scaled dot-product attention 公式、$QK^\top$、softmax、mask、dropout、$PV$，以及 $n \times n$ score/probability matrix 为什么导致显存和 IO 压力。
+  \item \textbf{使用者为什么要懂：} 你以后判断 OOM 或训练慢时，不能只说“开 FlashAttention”，而要知道它主要优化的是 attention 的中间矩阵物化和内存访问。
+  \item \textbf{完成标志：} 看到一个长序列或视频 token 数量，你能直觉判断 attention 可能成为瓶颈。
+\end{itemize}
+
+\subsubsection*{Stage 1：掌握 FlashAttention 的核心直觉，不钻 kernel}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} exact attention、tiling、online softmax、少存中间矩阵、backward 重算一部分中间量、HBM/SRAM IO 差异。
+  \item \textbf{不需要学到什么：} 不需要逐行读 CUDA/Triton kernel，不需要掌握 warp-level scheduling，不需要复现论文里的 IO complexity 证明。
+  \item \textbf{完成标志：} 你能说清楚：FlashAttention \key{不是近似 attention，不是 sparse attention，也不是改模型结构}；它主要是更聪明地算同一个 attention。
+\end{itemize}
+
+\subsubsection*{Stage 2：学会项目里怎么启用与识别 FlashAttention / SDPA}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} \texttt{torch.nn.functional.scaled\_dot\_product\_attention}、PyTorch SDPA backend、Hugging Face \texttt{attn\_implementation}、\texttt{flash\_attention\_2}、\texttt{sdpa}、\texttt{eager}，以及 \texttt{flash-attn} 包的常见接口。
+  \item \textbf{为什么这是重点：} 你大多数时候不是手写 attention kernel，而是在别人的模型代码、训练脚本、配置文件里看到这些开关。
+  \item \textbf{完成标志：} 看到代码里使用 \texttt{attn\_implementation=\"flash\_attention\_2\"} 或 \texttt{scaled\_dot\_product\_attention}，你知道它大概影响性能、显存、兼容性和 mask 支持。
+\end{itemize}
+
+\subsubsection*{Stage 3：读懂常见代码模式和坑}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} \texttt{causal} mask、padding mask、varlen attention、\texttt{cu\_seqlens}、\texttt{max\_seqlen}、head dimension 限制、dtype 限制、dropout、training/eval 行为差异。
+  \item \textbf{为什么要学：} 很多 bug 不是“不懂论文”，而是 mask 形状错、padding 没处理、版本不兼容、head dim 不支持、dtype 不满足 kernel 条件。
+  \item \textbf{完成标志：} 看别人项目里的 attention forward，你能判断 Q/K/V shape、mask 类型、是否 varlen、是否 causal，以及为什么要这样写。
+\end{itemize}
+
+\subsubsection*{Stage 4：再学 FlexAttention，重点放在“什么时候需要”}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} \texttt{score\_mod}、\texttt{mask\_mod}、\texttt{BlockMask}、\texttt{flex\_attention}、\texttt{torch.compile}，以及 sliding window、prefix-LM、document mask、block-sparse attention 的表达方式。
+  \item \textbf{学习重点：} FlexAttention 的价值不是“比 FlashAttention 更高级”，而是当 attention pattern 不是普通 dense/causal 时，还想保留接近 fused kernel 的性能。
+  \item \textbf{完成标志：} 给你一个业务需求，例如“不同文档之间不能互相 attend”或“视频只看局部窗口 + 少量全局 token”，你能判断是否适合 FlexAttention。
+\end{itemize}
+
+\subsubsection*{Stage 5：放回 AIGC 场景做选型}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} LLM 长上下文、DiT 高分辨率图像 token、视频生成、多图多文本条件、KV cache、GQA/MQA、activation checkpointing 与 FlashAttention 的组合。
+  \item \textbf{为什么最后学：} 真实项目里你关心的是“我该开哪个实现、为什么 OOM、为什么速度没变快、mask 支不支持”，不是单独背一个 kernel 名。
+  \item \textbf{完成标志：} 训练 OOM、推理慢、复杂 mask、长上下文四类问题出现时，你能给出 attention 层面的排查顺序。
+\end{itemize}
+
+\subsection{四、建议固化的笔记树}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{00\_learning\_roadmap.tex}：这页使用者路线图。
+  \item \texttt{01\_attention\_bottleneck\_ledger.tex}：标准 attention 的计算、显存与 IO 账本。
+  \item \texttt{02\_flashattention\_core\_intuition.tex}：FlashAttention 的 exact attention、tiling、online softmax 直觉。
+  \item \texttt{03\_sdpa\_and\_flashattn\_usage.tex}：PyTorch SDPA、Hugging Face \texttt{attn\_implementation}、\texttt{flash-attn} 包常见入口。
+  \item \texttt{04\_attention\_code\_reading\_patterns.tex}：Q/K/V shape、causal mask、padding mask、varlen、\texttt{cu\_seqlens}、dtype/head dim 限制。
+  \item \texttt{05\_flexattention\_for\_custom\_masks.tex}：FlexAttention 的 \texttt{score\_mod}、\texttt{mask\_mod}、\texttt{BlockMask} 与适用场景。
+  \item \texttt{06\_aigc\_attention\_selection\_and\_debugging.tex}：LLM、DiT、视频生成、长上下文和复杂 mask 的选型与排查总结。
+\end{itemize}
+
+\subsection{五、你现在最应该掌握到什么深度？}
+
+\begin{summarybox}
+\textbf{必须掌握：} 标准 attention 的 $O(n^2)$ 瓶颈；FlashAttention 为什么 exact 但省显存；PyTorch SDPA / Hugging Face / \texttt{flash-attn} 常见使用入口；常见 mask、shape、dtype、head dim 限制；FlexAttention 适合什么复杂 mask。\\
+\textbf{概念了解：} FlashAttention-2/3 相比 FlashAttention 1 大致优化了并行度、硬件利用率和低精度路径；知道版本和硬件兼容性会影响实际效果。\\
+\textbf{可以暂时不学：} CUDA kernel 源码、Triton kernel 编写、warp/block 级调度、Hopper WGMMA/TMA 指令、论文中完整 IO complexity 证明。
+\end{summarybox}
+
+\subsection{六、如果你现在就开始，我建议的第一轮学习节奏}
+
+\begin{summarybox}
+\textbf{最优起步顺序：}\\
+1. 先学标准 attention 的显存账本，知道 $n^2$ 中间矩阵和 IO 压力从哪来；\\
+2. 再学 FlashAttention 核心直觉，重点是 exact、tiling、online softmax、少存中间矩阵；\\
+3. 立刻进入使用入口：PyTorch SDPA、Hugging Face \texttt{attn\_implementation}、\texttt{flash-attn} 常见接口；\\
+4. 然后专门学一页代码阅读模式，解决“看到别人代码能看懂”的问题；\\
+5. 最后学 FlexAttention，重点是复杂 mask 什么时候值得用。\\
+换句话说，\key{先懂瓶颈和直觉，再学接口和代码，最后再学可编程复杂 mask。}
+\end{summarybox}
+
+\subsection{七、阶段性面试 / 代码评审版总结}
+
+如果面试官或同事问“FlashAttention 和 FlexAttention 你怎么理解”，可以这样答：
+
+\begin{conceptbox}
+FlashAttention 是一种 \key{高性能 exact attention 实现}。它不改变 attention 的数学结果，而是通过 tiling 和 online softmax 避免完整物化 attention matrix，减少 HBM 读写和训练显存峰值。对使用者来说，它通常是标准 dense/causal attention 的默认优化，重点是看框架是否启用、dtype/head dim/mask 是否支持、实际是否命中高性能 backend。FlexAttention 则更偏 \key{可编程 attention 抽象}，适合 sliding window、prefix-LM、document mask、block-sparse 等复杂模式；它不是替代所有 FlashAttention，而是在复杂 mask 场景下兼顾灵活性和性能。
+\end{conceptbox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item Dao 等，\emph{FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness}, arXiv:2205.14135。\\
+  \url{https://arxiv.org/abs/2205.14135}
+  \item Dao，\emph{FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning}, arXiv:2307.08691。\\
+  \url{https://arxiv.org/abs/2307.08691}
+  \item Shah 等，\emph{FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision}, arXiv:2407.08608。\\
+  \url{https://arxiv.org/abs/2407.08608}
+  \item Dao-AILab \texttt{flash-attention} 官方仓库：FlashAttention 安装、接口、支持硬件与使用说明。\\
+  \url{https://github.com/Dao-AILab/flash-attention}
+  \item PyTorch \texttt{scaled\_dot\_product\_attention} 文档：PyTorch 内置 SDPA API 与 backend 语义。\\
+  \url{https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html}
+  \item PyTorch FlexAttention 官方博客：\emph{FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention}。\\
+  \url{https://pytorch.org/blog/flexattention/}
+  \item PyTorch \texttt{torch.nn.attention.flex\_attention} 文档：\texttt{flex\_attention}、\texttt{score\_mod}、\texttt{BlockMask} 等 API。\\
+  \url{https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html}
+\end{itemize}
+\endgroup

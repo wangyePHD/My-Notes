@@ -1,0 +1,307 @@
+% ============================================================
+% Variational Autoencoder Basics
+% 重写日期：2026/05/03
+% ============================================================
+
+\section{VAE 基础：从概率建模到 Latent Diffusion}
+
+\note{重写日期：2026/05/03 \quad 目标：把 VAE 从“会背 ELBO”重写成“知道它为什么这样设计、在图像生成系统里为什么重要、什么时候会失效”。}
+
+\subsection{0. 一句话抓住 VAE}
+
+\begin{conceptbox}
+\textbf{VAE 的本质：} VAE 是一个\key{带显式先验分布的 Autoencoder}。它不只学习“怎么把 $x$ 压成 $z$ 再还原回来”，还强制 latent $z$ 的分布接近一个可采样的先验（通常是 $\mathcal{N}(0,I)$），这样训练后不仅能重建，也能直接从先验采样再解码生成新样本。
+\end{conceptbox}
+
+如果只记一句：
+\[
+\text{VAE} = \text{重建目标} + \text{让 latent 可采样的分布约束}
+\]
+
+前半句保证“别把信息全丢了”，后半句保证“随机采样的 $z$ 不会落到 decoder 从没见过的奇怪区域”。
+
+\begin{summarybox}
+\textbf{最重要的区别：} 普通 Autoencoder 的 latent 空间通常只是“能压缩训练集”的坐标系；VAE 的 latent 空间被整理成一个\key{有全局几何结构、可随机采样、能做插值和生成}的概率空间。
+\end{summarybox}
+
+\subsection{1. 为什么普通 Autoencoder 不够}
+
+标准 Autoencoder 的形式很简单：
+\[
+z = f_\phi(x), \qquad \hat{x} = g_\theta(z)
+\]
+
+训练目标通常是最小化重建误差：
+\[
+\mathcal{L}_{\text{AE}} = \|x - \hat{x}\|_1 \quad \text{或} \quad \|x - \hat{x}\|_2^2
+\]
+
+它适合做压缩、降噪、特征提取，但拿来当生成模型会立刻遇到两个问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{latent 空间没有被规整：} encoder 只需要把训练样本映射到 decoder 能还原的区域，至于这些点在空间里是散乱成团、断裂成岛、还是夹杂空洞，损失函数并不关心。
+  \item \textbf{随机采样几乎不可用：} 你若直接采样 $z\sim\mathcal{N}(0,I)$ 再喂给 decoder，采到的大多数点并不在训练时 encoder 常访问的“有效流形”上，输出往往会崩。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉：} 普通 AE 更像是“给训练集做坐标压缩”；VAE 则是在问：“我能不能一边压缩，一边把这张地图整理成一个规则形状，这样我闭着眼随机扔一个点进去，也大概率能解码成合理样本？”
+\end{intubox}
+
+所以 VAE 的关键不是“重建更准”，而是\key{让 latent space 变得可生成}。
+
+\subsection{2. 概率视角：VAE 到底在建模什么}
+
+VAE 是一个 latent variable model。它假设数据 $x$ 是由隐变量 $z$ 生成的：
+
+\[
+z \sim p(z)=\mathcal{N}(0,I), \qquad x \sim p_\theta(x\mid z)
+\]
+
+这里：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $p(z)$ 是先验分布，规定“生成之前，latent 应该长什么样”；
+  \item $p_\theta(x\mid z)$ 是 decoder 或生成分布；
+  \item 真正困难的是后验 $p_\theta(z\mid x)$，因为它通常不可直接精确计算。
+\end{itemize}
+
+于是 VAE 用一个可学习的近似后验来替代它：
+\[
+q_\phi(z\mid x) \approx p_\theta(z\mid x)
+\]
+
+最常见的参数化是对角高斯：
+\[
+q_\phi(z\mid x) = \mathcal{N}(z;\mu_\phi(x),\operatorname{diag}(\sigma_\phi(x)^2))
+\]
+
+也就是说，encoder 不再输出一个确定点，而是输出一整个分布的参数：均值 $\mu(x)$ 和方差 $\sigma(x)^2$。
+
+\begin{conceptbox}
+\textbf{“Variational” 的含义：} 这里的 variational 不是“变化很多”，而是\key{变分推断}。我们用一个简单、可优化的分布族 $q_\phi(z\mid x)$ 去逼近原本难算的后验 $p_\theta(z\mid x)$。
+\end{conceptbox}
+
+\subsection{3. ELBO：训练目标从哪里来}
+
+我们真正想最大化的是样本对数似然 $\log p_\theta(x)$，但它难算，因为：
+\[
+p_\theta(x)=\int p_\theta(x,z)\,dz
+\]
+
+VAE 的经典做法是引入 $q_\phi(z\mid x)$ 并用 Jensen 不等式得到下界：
+\[
+\begin{aligned}
+\log p_\theta(x)
+&= \log \int q_\phi(z\mid x)\frac{p_\theta(x,z)}{q_\phi(z\mid x)}dz \\
+&\geq \mathbb{E}_{q_\phi(z\mid x)}\left[\log p_\theta(x,z)-\log q_\phi(z\mid x)\right]
+\end{aligned}
+\]
+
+把联合分布 $p_\theta(x,z)=p_\theta(x\mid z)p(z)$ 展开，就得到 ELBO：
+\[
+\mathcal{L}_{\text{ELBO}}(x)
+= \mathbb{E}_{q_\phi(z\mid x)}[\log p_\theta(x\mid z)]
+- \operatorname{KL}(q_\phi(z\mid x)\|p(z))
+\]
+
+它和真正目标的关系是：
+\[
+\log p_\theta(x) = \mathcal{L}_{\text{ELBO}}(x) + \operatorname{KL}(q_\phi(z\mid x)\|p_\theta(z\mid x))
+\]
+
+因为最后这一项恒非负，所以最大化 ELBO 就是在逼近最大化对数似然。
+
+\begin{summarybox}
+\textbf{ELBO 的两部分要分开理解：}
+\begin{itemize}[leftmargin=1.5em]
+  \item $\mathbb{E}_{q}[\log p_\theta(x\mid z)]$：让 decoder 真正会还原，别把信息全扔掉；
+  \item $\operatorname{KL}(q_\phi(z\mid x)\|p(z))$：把每个样本对应的 posterior 往统一先验上拉，让整个 latent 空间更平滑、更可采样。
+\end{itemize}
+\end{summarybox}
+
+训练时通常最小化负 ELBO：
+\[
+\mathcal{L}_{\text{VAE}} = -\mathbb{E}_{q_\phi(z\mid x)}[\log p_\theta(x\mid z)] + \beta\,\operatorname{KL}(q_\phi(z\mid x)\|p(z))
+\]
+
+其中 $\beta=1$ 是标准 VAE，$\beta\neq1$ 时就是常说的 $\beta$-VAE。
+
+\subsubsection{3.1 对角高斯 KL 的闭式公式}
+
+如果 $q_\phi(z\mid x)$ 是对角高斯、先验是标准高斯，那么 KL 可以直接写成：
+\[
+\operatorname{KL}(q_\phi(z\mid x)\|p(z))
+= \frac{1}{2}\sum_j\left(\mu_j^2 + \sigma_j^2 - \log \sigma_j^2 - 1\right)
+\]
+
+这就是很多代码里看到的那条 KL loss。
+
+\subsection{4. 重参数化：为什么这个随机模型还能反向传播}
+
+如果直接写 $z\sim q_\phi(z\mid x)$，采样操作会把随机性和参数耦在一起，梯度不好往 $\phi$ 传。
+
+VAE 的关键技巧是重参数化：
+\[
+z = \mu_\phi(x) + \sigma_\phi(x)\odot\epsilon,
+\qquad \epsilon\sim\mathcal{N}(0,I)
+\]
+
+这样随机性被挪到与参数无关的噪声 $\epsilon$ 上，$\mu$ 和 $\sigma$ 仍然是可微函数，梯度就能正常回传到 encoder。
+
+\begin{intubox}
+\textbf{直觉：} 不是“从某个黑盒分布里硬抽一个 $z$”，而是“先抽一个标准噪声 $\epsilon$，再用网络输出的均值和尺度把它线性变换成 $z$”。随机源固定在外面，可学习部分就能继续求导。
+\end{intubox}
+
+\subsection{5. KL 项到底在约束什么}
+
+很多人会背“VAE = reconstruction + KL”，但容易忽视 KL 的真实作用。KL 不是单纯的正则项，它在决定 latent space 的几何结构。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{如果 KL 太弱：} 模型更像普通 Autoencoder，重建很好，但 latent 点云会碎片化；随机采样生成质量差。
+  \item \textbf{如果 KL 太强：} encoder 被迫把太多样本挤到接近标准高斯，latent 容量不足，重建会发糊、细节丢失。
+  \item \textbf{如果 decoder 太强：} decoder 可能学会“不怎么看 $z$ 也能把东西还原个大概”，这就是 posterior collapse 的来源之一。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{Posterior Collapse：} 最坏情况下，$q_\phi(z\mid x)\approx p(z)$，也就是 encoder 不再携带与样本相关的信息。此时 KL 看起来很小、训练很稳定，但 latent 已经失去表达力，模型几乎退化成“忽略 $z$ 的 decoder”。在文本 VAE 和强自回归 decoder 中这尤其常见。
+\end{warnbox}
+
+工程上常见的缓解手段包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item KL warm-up / KL annealing：前期弱化 KL，先让模型学会重建；
+  \item free bits：不给过小的 KL 继续强压，避免所有维度都被压扁；
+  \item 控制 decoder 容量：不要强到完全绕开 latent；
+  \item 用更高带宽的 latent：比如更多通道、更低压缩率。
+\end{itemize}
+
+\subsection{6. 为什么图像 VAE 常常会“糊”}
+
+VAE 在图像上最常见的抱怨是：重建偏软、边缘发糊、文字细节差。根因通常有三类。
+
+\subsubsection{6.1 似然建模本身会偏向平均解}
+
+若 decoder 用简单高斯似然，对应的优化目标近似像素级 $L_2$。当一个位置存在多种合理细节时，最优策略往往是输出“平均值”，结果就是边缘和纹理被抹平。
+
+\subsubsection{6.2 瓶颈过窄会硬性丢信息}
+
+VAE 的压缩不是免费的。压缩率越高、通道越少，latent 容量越低，高频信息越容易在 encoder 处直接被舍弃。小字、精细纹理、半透明边缘特别容易受伤。
+
+\subsubsection{6.3 教科书 VAE 和工业图像 VAE 不是一回事}
+
+现代图像生成系统里的“VAE”通常不是纯 textbook VAE，而是会混入感知损失、GAN 判别器、甚至语义蒸馏的\key{高保真 tokenizer}。这是因为系统目标已经不是“严谨地优化一条最干净的 ELBO”，而是“在可压缩前提下尽量守住视觉细节”。
+
+\begin{conceptbox}
+\textbf{一个现实判断：} 你在 Stable Diffusion、FLUX、Wan-Image 里看到的 VAE，更准确地说是“以 VAE 结构为骨架的高保真图像 tokenizer”。它保留了 latent sampling 和 KL 约束的思想，但训练目标通常比 vanilla VAE 更工程化。
+\end{conceptbox}
+
+\subsection{7. 在图像生成系统里，VAE 到底扮演什么角色}
+
+VAE 在现代图像生成里通常不是最终生成器，而是\key{压缩器 / tokenizer / latent interface}。
+
+\subsubsection{7.1 为什么 Latent Diffusion 要先上 VAE}
+
+Latent Diffusion 的基本逻辑是：
+\[
+x \xrightarrow{\text{VAE Encoder}} z \xrightarrow{\text{Diffusion / Flow}} \hat{z} \xrightarrow{\text{VAE Decoder}} \hat{x}
+\]
+
+这样做有三个直接收益：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{降算力：} 空间分辨率通常缩小 $8\times$，也就是 token / feature map 数量下降到原来的 $1/64$；
+  \item \textbf{噪声建模更容易：} latent 空间更紧凑、更接近高斯先验；
+  \item \textbf{把像素级高频细节交给 tokenizer：} 生成模型可以把容量优先放在语义、构图和全局结构上。
+\end{itemize}
+
+代价也很明确：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item reconstruction ceiling 存在；
+  \item decoder artifact 可能直接成为整个系统上限；
+  \item 文字、纹理、透明边缘这类高频信号最容易在 VAE 瓶颈处受损。
+\end{itemize}
+
+\subsubsection{7.2 这条线在近期模型里怎么演化}
+
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.18\linewidth} p{0.21\linewidth} p{0.22\linewidth} p{0.25\linewidth}}
+\toprule
+\textbf{系统} & \textbf{VAE/Tokenizer 角色} & \textbf{设计取向} & \textbf{主要取舍}\\
+\midrule
+Stable Diffusion / LDM & 4 通道 KL-VAE，$8\times$ 下采样 & 把扩散搬到 latent 空间 & 训练便宜，但文字和极高频细节受限。\\
+FLUX / SD3 & 更高带宽的 16 通道 VAE & 提高 latent 信息密度 & 细节更强，但 token 通道更重。\\
+Wan-Image & 高保真 RGBA VAE，强调 alpha 和生产细节 & 服务透明图层、小字、设计资产 & 说明工业系统仍然愿意为更强 VAE 付代价。\\
+JiT / Latent Forcing / Tuna-2 一类 & 尽量弱化或绕开 VAE & 回到 pixel-space 或 encoder-free 路线 & 目标是摆脱 reconstruction ceiling，但训练难度更高。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{summarybox}
+\textbf{一句话看当下分歧：} 一派在想“怎么把 VAE 做得更好，让 latent diffusion 上限更高”；另一派在想“能不能直接绕开 VAE，让模型回到 pixel-space”。Wan-Image、FLUX 属于前者；JiT、Latent Forcing、Tuna-2 更接近后者。
+\end{summarybox}
+
+\subsection{8. VAE、AE、VQ-VAE、RAE 到底怎么区分}
+
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.14\linewidth} p{0.18\linewidth} p{0.19\linewidth} p{0.17\linewidth} p{0.24\linewidth}}
+\toprule
+\textbf{方法} & \textbf{latent 类型} & \textbf{是否显式先验} & \textbf{是否易采样} & \textbf{典型用途/问题}\\
+\midrule
+AE & 连续、确定性点表示 & 否 & 差 & 压缩和表征学习强，但随机采样生成通常不稳。\\
+VAE & 连续、概率分布 & 是，常用高斯先验 & 好 & 采样友好；但 KL 与重建存在张力，容易糊。\\
+VQ-VAE & 离散 codebook & 通常不靠高斯先验 & 依赖 code prior & 重建和 token 离散化很好用，但训练更复杂，需要额外 prior。\\
+RAE & 表征 encoder + decoder & 不一定强调标准高斯 & 取决于外部生成器 & 强语义表征，但本质仍是 tokenizer 路线，不等于摆脱 decoder。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里最容易混淆的一点是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{VAE 解决的是“如何得到可采样的连续 latent space”；}
+  \item \textbf{VQ-VAE 解决的是“如何把图像离散化成 code token”；}
+  \item \textbf{RAE 更像“借强表征 encoder 做更语义化的 tokenizer”。}
+\end{itemize}
+
+它们都能给扩散或 Transformer 提供中间表示，但解决的问题并不相同。
+
+\subsection{9. 什么时候该用 VAE，什么时候要警惕 VAE}
+
+\textbf{适合用 VAE 的场景：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 你需要把高分辨率图像压到更小空间里做生成、编辑或检索；
+  \item 你能接受“先 tokenizer、再生成、最后 decode”的两阶段系统；
+  \item 主要瓶颈是算力和上下文长度，而不是最后那一点像素级极限保真。
+\end{itemize}
+
+\textbf{要警惕 VAE 的场景：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文字渲染、细小结构、文档、UI、透明边缘这类任务；
+  \item 你希望最终模型直接优化 raw pixel distribution；
+  \item tokenizer 的 reconstruction ceiling 已经成为系统主瓶颈。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{别把 VAE 神化成“更高级的生成模型”。} 在今天的图像系统里，VAE 更多是一个\key{工程折中}：用信息损失换计算效率、用分布规整换采样便利。它很有用，但不是没有代价。
+\end{warnbox}
+
+\subsection{10. 一页记忆版}
+
+\begin{summarybox}
+\textbf{把 VAE 真正记住，只抓这六点：}
+\begin{enumerate}[leftmargin=1.8em]
+  \item VAE 不是普通 AE 加点噪声，而是\key{显式的 latent variable model}。
+  \item Encoder 输出的是 $q_\phi(z\mid x)$ 的参数，不是一个点。
+  \item 训练目标是 ELBO：\key{重建项保信息，KL 项保可采样性}。
+  \item 重参数化 $z=\mu+\sigma\odot\epsilon$ 让随机采样仍可反传。
+  \item 图像 VAE 发糊，常见原因是像素似然平均化、瓶颈过窄、KL 过强。
+  \item 在 latent diffusion 时代，VAE 更像 tokenizer；它决定系统的效率，也决定系统的 reconstruction ceiling。
+\end{enumerate}
+\end{summarybox}

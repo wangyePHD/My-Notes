@@ -1,0 +1,13 @@
+% Efficient attention study zone.
+
+\section*{FlashAttention 与 FlexAttention 学习专区}
+\phantomsection
+\addcontentsline{toc}{section}{FlashAttention 与 FlexAttention 学习专区}
+
+\begin{conceptbox}
+\textbf{学习目标：} 从 AIGC 工程使用者视角掌握高效注意力：\key{知道原理直觉、会启用和选择实现、能读懂别人代码里的 attention backend / mask / kernel 相关配置}，而不是深入研究 CUDA kernel 或 FlashAttention 论文细节。\\
+\textbf{当前主线：} 按 \key{标准 attention 瓶颈 $\rightarrow$ FlashAttention 核心直觉 $\rightarrow$ PyTorch SDPA / flash-attn 使用入口 $\rightarrow$ 常见代码模式 $\rightarrow$ FlexAttention 自定义 mask $\rightarrow$ AIGC 场景选型与调试} 的顺序推进。
+\end{conceptbox}
+
+\input{Notes/04_systems/efficient_attention/00_learning_roadmap}
+\input{Notes/04_systems/efficient_attention/01_attention_bottleneck_ledger}

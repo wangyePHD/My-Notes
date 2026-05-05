@@ -1,0 +1,324 @@
+% ============================================================
+% 阶段性实践总结：显存优化与策略组合
+% ============================================================
+
+\section{阶段性实践总结：显存优化与策略组合}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 学到 DDP、ZeRO/FSDP、mixed precision 和 activation checkpointing 之后，先停下来做一次工程总结。你读完这一页，不是为了背更多名词，而是要能回答：\\
+1. \key{训练 OOM 时先判断是哪类显存爆了}；\\
+2. \key{每种策略到底节约什么、牺牲什么}；\\
+3. \key{DDP、ZeRO/FSDP、BF16、activation checkpointing 应该怎样组合}；\\
+4. \key{什么时候继续用简单方案，什么时候必须上更复杂的并行策略。}
+\end{conceptbox}
+
+\note{这是一页“实践地图”，不是新理论。它把前面几节的结论压缩成工程决策顺序：先做账本，再选策略；先用低复杂度优化，再上更重的分片和并行。}
+
+\subsection*{资料收集与引用口径}
+
+\begin{conceptbox}
+\textbf{本节先查资料再整理结论。} 这一页主要综合四类资料：\\
+1. \key{PyTorch 官方资料}：DDP、FSDP、AMP、activation checkpointing 文档，用来确认数据并行、状态分片、自动混合精度和重算机制的语义；\\
+2. \key{DeepSpeed 官方资料}：ZeRO tutorial 与 ZeRO-3 文档，用来确认 ZeRO Stage 1/2/3 的分片对象和 offload 口径；\\
+3. \key{论文资料}：ZeRO、PyTorch FSDP、Mixed Precision Training、Sublinear Memory Cost 等论文，用来理解显存优化的动机和 trade-off；\\
+4. \key{工程经验资料}：NVIDIA Mixed Precision Training Guide、PyTorch DDP/FSDP 工程资料，用来理解 BF16/FP16、bucket、overlap、checkpoint 等实践注意事项。
+\end{conceptbox}
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.1cm}p{8.6cm}}
+\hline
+\textbf{总结结论} & \textbf{主要依据} \\
+\hline
+DDP 主要扩吞吐，不切模型状态 & PyTorch DDP 文档；ZeRO 论文对经典数据并行冗余的分析。 \\
+ZeRO/FSDP 主要减少参数、梯度、优化器状态的冗余 & DeepSpeed ZeRO 文档；PyTorch FSDP 文档；ZeRO 与 FSDP 论文。 \\
+Mixed precision 主要降低 tensor 字节数和提升低精度算子吞吐，但不必然把训练显存减半 & PyTorch AMP 文档；NVIDIA Mixed Precision Training Guide；Mixed Precision Training 论文。 \\
+Activation checkpointing 主要减少 forward activation 峰值显存，代价是 backward 重算 & PyTorch checkpoint 文档；Sublinear Memory Cost 论文。 \\
+Offload 能降低 GPU 显存，但常牺牲吞吐，把瓶颈转移到 CPU/NVMe/PCIe & DeepSpeed ZeRO-Offload 文档与论文。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{一、先建立总判断：所有策略都在交换资源}
+
+分布式训练里几乎没有免费的优化。你真正要做的是在四种资源之间做 trade-off：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.5cm}p{5.4cm}}
+\hline
+\textbf{资源} & \textbf{你想减少什么} & \textbf{通常会付出什么代价} \\
+\hline
+GPU 显存 & 参数、梯度、optimizer states、activation、临时 buffer & 更多通信、更多重算、更复杂 checkpoint、吞吐下降。 \\
+计算时间 & step time、训练总时长 & 需要更多显存、更好的 kernel、更少 checkpoint、更简单并行。 \\
+通信带宽 & all-reduce、all-gather、reduce-scatter 开销 & 可能减少分片程度、降低并行规模、改变并行拓扑。 \\
+工程复杂度 & 配置、调试、恢复、监控成本 & 可能牺牲可训练模型规模或硬件利用率。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{一句话实践总纲：}\\
+不要一 OOM 就盲目上最复杂方案。先问：\key{爆的是模型状态、activation、临时 buffer，还是碎片？} 然后再决定用 mixed precision、ZeRO/FSDP、activation checkpointing、offload 或更复杂的模型并行。
+\end{summarybox}
+
+\subsection{二、训练显存先按五个桶拆开}
+
+排查 OOM 时，最有用的不是先背框架名，而是先把显存拆成几个桶：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.4cm}p{5.2cm}p{4.4cm}}
+\hline
+\textbf{显存桶} & \textbf{主要由什么决定} & \textbf{优先策略} \\
+\hline
+参数 parameters & 模型参数量 $N$ 与 dtype & BF16/FP16；ZeRO-3；FSDP FULL\_SHARD；tensor parallel。 \\
+梯度 gradients & 参数量、梯度 dtype、是否完整保存 & ZeRO-2/3；FSDP；gradient accumulation 配合 \texttt{no\_sync} 减少通信次数。 \\
+优化器状态 optimizer states & 优化器类型，Adam $m/v$ 常为 FP32 & ZeRO-1/2/3；FSDP；8-bit optimizer；CPU/NVMe offload。 \\
+激活 activations & micro-batch、sequence length、hidden size、层数、attention 实现 & Activation checkpointing；FlashAttention；减小 micro-batch；sequence parallel。 \\
+临时与碎片 temp/buffer/fragment & bucket、all-gather 临时参数、prefetch、CUDA allocator & 调整 bucket/wrap/prefetch；减少峰值重叠；用 profiler 验证。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{最常见误区：}\\
+只看模型权重大小，然后推断训练能不能放下。训练时真正贵的是 \key{参数 + 梯度 + optimizer states + activation + 临时 buffer}，尤其 Adam states 和 activation 经常比你直觉里更大。
+\end{warnbox}
+
+\subsection{三、每种策略到底节约什么}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{3.8cm}p{3.4cm}p{2.6cm}}
+\hline
+\textbf{策略} & \textbf{主要节约} & \textbf{主要代价} & \textbf{优先级直觉} \\
+\hline
+DDP & 不节约模型状态，主要扩吞吐 & 梯度 all-reduce 通信 & 模型能放下时的 baseline。 \\
+BF16 mixed precision & 参数/梯度/activation/临时 tensor 字节数，低精度算子吞吐 & dtype 兼容性，少量数值风险 & 几乎是默认优先项。 \\
+FP16 mixed precision & 类似 BF16，但动态范围更小 & 需要 loss scaling，NaN/Inf 风险更高 & 硬件不支持 BF16 时考虑。 \\
+ZeRO-1 & optimizer states & 额外状态同步与框架复杂度 & Adam states 吃紧时。 \\
+ZeRO-2 & optimizer states + gradients & reduce-scatter 等通信与配置复杂度 & 参数能放下时的常用折中。 \\
+ZeRO-3 / FSDP FULL\_SHARD & 参数 + 梯度 + optimizer states & 参数 all-gather、reshard、checkpoint 更复杂 & 参数也吃紧时。 \\
+Activation checkpointing & forward activation & backward 重算，step time 增加 & 长序列/大 micro-batch OOM 时。 \\
+CPU/NVMe offload & GPU 上的参数/optimizer states/梯度 & PCIe/NVMe/CPU 带宽瓶颈，吞吐下降 & 先跑起来，不追求最快时。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{最常用组合：}\\
+真实项目里很少只用一种策略。常见组合是 \key{DDP 或 FSDP/ZeRO + BF16 + activation checkpointing + sharded checkpoint}。区别在于：模型状态压力大不大、activation 压力大不大、网络能不能扛住通信。
+\end{intubox}
+
+\subsection{四、遇到 OOM 的实践排查顺序}
+
+如果训练 OOM，可以按下面顺序排查，而不是直接换框架：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{先确认是不是 batch/sequence 导致的 activation OOM。}\\
+  如果减小 micro-batch 或 sequence length 后立刻不 OOM，说明 activation 是主要压力。优先考虑 activation checkpointing、FlashAttention、减小 per-rank micro-batch。
+
+  \item \textbf{再算模型状态账本。}\\
+  用 $N(c_p+c_g+c_o)$ 估算 DDP 下参数、梯度、optimizer states 的单卡成本。AdamW 下常见口径是 BF16 参数 $2$ bytes、BF16 梯度 $2$ bytes、FP32 Adam moments $8$ bytes，也就是 $12$ bytes/param。
+
+  \item \textbf{如果 optimizer states/gradients 是主因，优先 ZeRO-2。}\\
+  因为 ZeRO-2 不切参数，通常比 ZeRO-3/FSDP 更少引入参数 gather，吞吐和调试复杂度更友好。
+
+  \item \textbf{如果参数本体也放不下，再上 ZeRO-3/FSDP FULL\_SHARD。}\\
+  这时参数也必须分片，但要接受 all-gather、reshard、wrap 粒度和 sharded checkpoint 的复杂度。
+
+  \item \textbf{如果仍然 OOM，再考虑 offload 或模型并行。}\\
+  Offload 是把 GPU 显存压力转移到 CPU/NVMe；tensor parallel / pipeline parallel 则是把模型计算本身切开，属于下一阶段更重的方案。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{实践口诀：}\\
+先开 \key{BF16}；再看 \key{activation checkpointing}；模型状态大就上 \key{ZeRO/FSDP}；参数也放不下再上 \key{ZeRO-3/FSDP FULL\_SHARD}；还不够再考虑 \key{offload 或模型并行}。
+\end{summarybox}
+
+\subsection{五、几种典型场景怎么选}
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.3cm}p{4.4cm}p{4.2cm}}
+\hline
+\textbf{场景} & \textbf{优先方案} & \textbf{原因} \\
+\hline
+模型单卡能放下，只是训练慢 & DDP + BF16 & 最简单稳定，主要扩吞吐。 \\
+模型能放下，但 Adam states 很吃紧 & ZeRO-1/ZeRO-2 + BF16 & 先切最贵的 optimizer states，再切 gradients。 \\
+参数能放下，但梯度和优化器状态导致 OOM & ZeRO-2 + BF16 & 显存收益明显，避免参数频繁 gather。 \\
+参数本体也接近单卡上限 & ZeRO-3 或 FSDP FULL\_SHARD + BF16 & 必须把参数也分片。 \\
+长序列训练 OOM & BF16 + activation checkpointing + FlashAttention & activation 通常随 sequence length 急剧上升。 \\
+想维持 global batch，但单卡 batch 放不下 & 减小 micro-batch + gradient accumulation & 保持 optimizer step 的 global batch 口径。 \\
+单机能跑，多机变慢很多 & 检查通信、bucket、overlap；考虑 HYBRID\_SHARD & 跨机通信可能成为主瓶颈。 \\
+只想先让超大模型跑起来 & ZeRO-3/FSDP + offload + checkpointing & 用吞吐换可训练性。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{六、策略组合的推荐顺序}
+
+\subsubsection*{1. 简单稳定 baseline}
+
+适合模型能放下、主要想提高吞吐的情况：
+
+\begin{summarybox}
+\textbf{DDP + BF16 + gradient accumulation}\\
+这是最干净的 baseline。DDP 负责多卡吞吐；BF16 负责低精度计算和部分显存节省；gradient accumulation 负责在 micro-batch 受限时维持 global batch。
+\end{summarybox}
+
+优点是简单、稳定、容易 debug；缺点是参数、梯度、optimizer states 全复制，不适合模型状态很大的场景。
+
+\subsubsection*{2. 常见中大模型折中}
+
+适合参数还能放下，但 Adam states/gradients 很贵的情况：
+
+\begin{summarybox}
+\textbf{ZeRO-2 + BF16 + activation checkpointing}\\
+ZeRO-2 切 optimizer states 和 gradients；BF16 降低 dtype 成本；activation checkpointing 处理长序列或较大 micro-batch 的激活峰值。
+\end{summarybox}
+
+这是很常见的工程折中：比 DDP 省很多显存，比 ZeRO-3/FSDP FULL\_SHARD 少一些参数 gather 压力。
+
+\subsubsection*{3. 参数也必须分片的方案}
+
+适合参数本体、梯度、optimizer states 合起来已经明显超出单卡能力的情况：
+
+\begin{summarybox}
+\textbf{FSDP FULL\_SHARD 或 ZeRO-3 + BF16 + activation checkpointing + sharded checkpoint}\\
+这类组合能最大化数据并行组内的模型状态分片收益，但必须重视 wrap 粒度、bucket、prefetch、checkpoint 保存与恢复。
+\end{summarybox}
+
+它的核心风险是：显存下去了，step time 可能变慢；保存和恢复也会明显复杂。
+
+\subsubsection*{4. 最后兜底方案}
+
+适合显存确实不够、吞吐可以先放一边的情况：
+
+\begin{summarybox}
+\textbf{ZeRO-3/FSDP + offload + activation checkpointing}\\
+Offload 把 GPU 放不下的状态搬到 CPU/NVMe，activation checkpointing 减少激活峰值。这通常是“先跑起来”的方案，不是“最高吞吐”的方案。
+\end{summarybox}
+
+\subsection{七、显存优化和吞吐优化经常互相冲突}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.6cm}p{4.7cm}p{4.2cm}}
+\hline
+\textbf{你做的事} & \textbf{显存效果} & \textbf{吞吐影响} \\
+\hline
+开启 BF16 & 通常下降 & 通常上升或持平。 \\
+开启 activation checkpointing & activation 峰值下降 & backward 变慢，因为要重算。 \\
+从 DDP 换 ZeRO-2 & optimizer/gradient 显存下降 & 通信与调度增加，可能略慢。 \\
+从 ZeRO-2 换 ZeRO-3/FSDP & 参数也分片，显存进一步下降 & 参数 gather/reshard 增加，可能明显变慢。 \\
+开启 offload & GPU 显存下降很多 & 常明显变慢，受 PCIe/CPU/NVMe 影响。 \\
+减小 micro-batch & activation 下降 & 单步吞吐可能下降，需要 accumulation 保持 global batch。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{工程目标要先说清楚：}\\
+如果目标是“不 OOM”，可以接受 checkpointing、ZeRO-3、offload；如果目标是“最高 tokens/sec”，就要尽量减少重算、offload 和过度分片，优先优化 kernel、bucket、overlap 和数据 IO。
+\end{warnbox}
+
+\subsection{八、一个建议的实验矩阵}
+
+真正想学深，最好不要只读笔记，而是做最小实验。可以固定一个 toy Transformer 和随机 token 数据，每次只改一个变量：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3cm}p{4.7cm}p{5cm}}
+\hline
+\textbf{实验} & \textbf{改动} & \textbf{观察指标} \\
+\hline
+Baseline & 单卡 FP32 或 BF16 & max memory、step time、tokens/s。 \\
+DDP & 单卡改多卡 DDP & 吞吐是否提升；显存是否没有按卡数下降。 \\
+DDP + BF16 & 开启 mixed precision & 显存、吞吐、loss 稳定性。 \\
+DDP + checkpoint & 对 Transformer block 做 checkpoint & activation 显存下降多少；step time 增加多少。 \\
+ZeRO-2/FSDP & 切 optimizer/gradient 或 full shard & 模型状态显存下降多少；通信开销多少。 \\
+组合方案 & BF16 + ZeRO/FSDP + checkpoint & 是否能跑更长序列或更大 micro-batch。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+建议记录下面几个指标：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{torch.cuda.max\_memory\_allocated()} 与 \texttt{max\_memory\_reserved()}；
+  \item step time、tokens/sec、samples/sec；
+  \item dataloader time、forward time、backward time、optimizer time；
+  \item checkpoint save/load time；
+  \item loss 是否连续、是否出现 NaN/Inf；
+  \item resume 后 loss 是否接得上。
+\end{itemize}
+
+\subsection{九、阶段性面试版总结}
+
+\subsubsection*{1. 如果训练 OOM，你会怎么排查？}
+
+我会先区分是模型状态 OOM 还是 activation OOM。模型状态可以按参数、梯度和 optimizer states 做 bytes/param 账本；activation 则主要看 micro-batch、sequence length、hidden size、层数和 attention 实现。如果是 optimizer states/gradients 太大，优先考虑 ZeRO-2；如果参数本体也放不下，考虑 ZeRO-3 或 FSDP FULL\_SHARD；如果是长序列 activation 爆了，优先 activation checkpointing、FlashAttention 或减小 micro-batch。
+
+\subsubsection*{2. 如何系统性节约显存？}
+
+第一层是 mixed precision，通常优先 BF16；第二层是用 ZeRO/FSDP 分片模型状态；第三层是 activation checkpointing 减少激活峰值；第四层是减小 micro-batch 并用 gradient accumulation 保持 global batch；最后才考虑 offload、tensor parallel、pipeline parallel 等更重方案。
+
+\subsubsection*{3. 为什么不是永远用 ZeRO-3/FSDP？}
+
+因为显存节省不是免费的。ZeRO-3/FSDP 会引入参数 all-gather、reshard、reduce-scatter、wrap 粒度选择和 sharded checkpoint 复杂度。若参数本体能放下，只是 optimizer states 和 gradients 吃紧，ZeRO-2 往往是更好的折中；若 DDP 已经能稳定高效训练，就没有必要过早复杂化。
+
+\subsubsection*{4. Mixed precision、ZeRO/FSDP、activation checkpointing 分别解决什么？}
+
+Mixed precision 解决每个 tensor 用多少 bytes、算子能不能走低精度高吞吐路径；ZeRO/FSDP 解决参数、梯度和优化器状态在数据并行 rank 上的冗余；activation checkpointing 解决 forward activation 是否全部长期保存。它们优化的是不同桶，所以经常组合使用。
+
+\subsection{十、学到这里后的实践心法}
+
+\begin{summarybox}
+\textbf{阶段性最终结论：}\\
+DDP 是吞吐 baseline；BF16 是默认精度优化；ZeRO/FSDP 是模型状态分片主线；activation checkpointing 是激活显存主线。\\
+真正的工程能力不是知道每个名词，而是能根据 OOM 或性能瓶颈判断：\key{该省哪一桶显存、该牺牲哪一种资源、该组合哪些策略。}\\
+如果只记一句话：\key{先做显存账本，再选最小复杂度的策略；能用简单方案就别上复杂方案，复杂方案一定要用 profiler 和 checkpoint/resume 验证。}
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item PyTorch \texttt{DistributedDataParallel} 文档：DDP 数据并行、梯度同步、参数与输入数据切分语义。\\
+  \url{https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html}
+  \item PyTorch FSDP 文档：FSDP sharding strategy、mixed precision、CPU offload、state dict 等接口说明。\\
+  \url{https://docs.pytorch.org/docs/stable/fsdp.html}
+  \item PyTorch AMP 文档：\texttt{autocast}、\texttt{GradScaler}、FP16/BF16 自动混合精度训练接口说明。\\
+  \url{https://docs.pytorch.org/docs/stable/amp.html}
+  \item PyTorch \texttt{torch.utils.checkpoint} 文档：activation checkpointing 的 recomputation、RNG 状态和 \texttt{use\_reentrant} 行为。\\
+  \url{https://docs.pytorch.org/docs/stable/checkpoint.html}
+  \item DeepSpeed ZeRO Tutorial：ZeRO Stage 1/2/3 对 optimizer states、gradients、parameters 的分片定义。\\
+  \url{https://www.deepspeed.ai/tutorials/zero/}
+  \item DeepSpeed ZeRO-3 Documentation：ZeRO-3、offload、bucket、prefetch 等工程配置说明。\\
+  \url{https://deepspeed.readthedocs.io/en/stable/zero3.html}
+  \item NVIDIA Mixed Precision Training Guide：混合精度训练、FP32 master weights、loss scaling 等实践说明。\\
+  \url{https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html}
+  \item Rajbhandari 等，\emph{ZeRO: Memory Optimizations Toward Training Trillion Parameter Models}, arXiv:1910.02054。\\
+  \url{https://arxiv.org/abs/1910.02054}
+  \item Zhao 等，\emph{PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel}, arXiv:2304.11277。\\
+  \url{https://arxiv.org/abs/2304.11277}
+  \item Micikevicius 等，\emph{Mixed Precision Training}, arXiv:1710.03740。\\
+  \url{https://arxiv.org/abs/1710.03740}
+  \item Chen 等，\emph{Training Deep Nets with Sublinear Memory Cost}, arXiv:1604.06174。\\
+  \url{https://arxiv.org/abs/1604.06174}
+  \item Ren 等，\emph{ZeRO-Offload: Democratizing Billion-Scale Model Training}, arXiv:2101.06840。\\
+  \url{https://arxiv.org/abs/2101.06840}
+\end{itemize}
+\endgroup

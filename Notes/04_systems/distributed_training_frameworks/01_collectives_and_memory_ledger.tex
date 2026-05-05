@@ -1,0 +1,467 @@
+% ============================================================
+% Stage 0：通信原语与显存账本
+% ============================================================
+
+\section{Stage 0：通信原语与显存账本}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 先把后面所有框架都会反复出现的底层对象讲透。你学完这一页，至少要能回答三件事：\\
+1. \key{谁在和谁通信}；\\
+2. \key{一次通信之后，每个 rank 手里拿到什么}；\\
+3. \key{训练显存为什么往往不是“参数大小”那么简单。}
+\end{conceptbox}
+
+\note{补充阅读：更细的 process group 机制见 \texttt{dist\_process\_group.tex}；高层 \texttt{all\_gather} 接口见 \texttt{accelerate\_gather.tex}。这一页把它们放回统一坐标系里。}
+
+\subsection{一、先把“谁在和谁说话”搞清楚}
+
+\begin{center}
+\begin{tabular}{p{3.2cm}p{9.8cm}}
+\hline
+\textbf{名词} & \textbf{含义} \\
+\hline
+\texttt{rank} & 全局进程序号。每张参与分布式训练的卡，都会对应一个全局 rank。 \\
+\texttt{local\_rank} & 当前节点内的本地序号，通常和本机第几张 GPU 对应。 \\
+\texttt{world\_size} & 全局参与训练的进程总数。8 卡训练时，\texttt{world\_size = 8}。 \\
+\texttt{node} / \texttt{node\_rank} & 第几台机器。多机训练时需要区分“机内”和“机间”。 \\
+\texttt{process group} & 通信子集。你可以只让部分 rank 在一个小组里通信，而不是每次都全体通信。 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{一个最实用的直觉：} 分布式训练不是“8 张卡一起跑一个 Python 进程”，而是\key{8 个独立进程}在同一套协议下协作。\\
+所以你看到的 \texttt{broadcast}、\texttt{all\_reduce}、\texttt{all\_gather}，本质上都是“多个进程之间如何交换 tensor”。
+\end{intubox}
+
+假设你有 2 台机器，每台 4 张卡，那么编号通常是：
+
+\begin{center}
+{\small
+\begin{tabular}{cccc}
+\hline
+\textbf{Node} & \textbf{GPU} & \textbf{local\_rank} & \textbf{global rank} \\
+\hline
+0 & GPU0 & 0 & 0 \\
+0 & GPU1 & 1 & 1 \\
+0 & GPU2 & 2 & 2 \\
+0 & GPU3 & 3 & 3 \\
+1 & GPU0 & 0 & 4 \\
+1 & GPU1 & 1 & 5 \\
+1 & GPU2 & 2 & 6 \\
+1 & GPU3 & 3 & 7 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+你后面学 DDP、FSDP、Megatron 时，所有并行策略其实都建立在这套编号系统上。
+
+\subsection{二、最重要的五个通信原语}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.1cm}p{4.1cm}p{5.1cm}}
+\hline
+\textbf{原语} & \textbf{结果语义} & \textbf{训练里常见用途} \\
+\hline
+\texttt{broadcast} & 一个源 rank 把自己的 tensor 发给所有 rank & 同步初始权重、同步配置、同步随机种子 \\
+\texttt{all\_reduce} & 先做归约，再把结果发回所有 rank & DDP 梯度同步 \\
+\texttt{all\_gather} & 收集所有 rank 的局部 tensor，并让所有 rank 都拿到完整结果 & 汇总 logits、reward、参数分片 \\
+\texttt{reduce\_scatter} & 先归约，再把结果切片分发给不同 rank & ZeRO/FSDP 的梯度分片回收 \\
+\texttt{barrier} & 所有 rank 走到这里后一起继续 & 调试、阶段对齐、避免打印乱序 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsubsection*{1. \texttt{broadcast}：一个人说，所有人听}
+
+如果 rank 0 持有 \texttt{[10, 20, 30]}，其余 rank 持有占位张量，执行 \texttt{broadcast(src=0)} 后，所有 rank 都会变成 \texttt{[10, 20, 30]}。
+
+\subsubsection*{2. \texttt{all\_reduce}：大家先合并，再人手一份}
+
+假设 4 个 rank 分别持有标量 \texttt{[1]}、\texttt{[2]}、\texttt{[3]}、\texttt{[4]}，执行 \texttt{all\_reduce(sum)} 后，\key{每个 rank} 都会拿到 \texttt{[10]}。
+
+\begin{warnbox}
+DDP 最关键的同步原语就是 \texttt{all\_reduce}。因为每张卡只算出了\key{自己的局部梯度}，而参数更新前必须让所有副本看到同一个全局梯度。
+\end{warnbox}
+
+\subsubsection*{3. \texttt{all\_gather}：把每个人手里的碎片拼起来}
+
+假设 4 个 rank 分别持有：
+\texttt{[0, 100]}、\texttt{[1, 101]}、\texttt{[2, 102]}、\texttt{[3, 103]}。\\
+执行 \texttt{all\_gather} 后，每个 rank 都能看到完整拼接结果：
+\texttt{[0, 100, 1, 101, 2, 102, 3, 103]}。
+
+这就是为什么做全局 reward 统计、全局日志记录时，经常要先 \texttt{all\_gather}。
+
+\subsubsection*{4. \texttt{reduce\_scatter}：先加总，再每人领自己那一片}
+
+这是后面学 ZeRO/FSDP 时最重要的原语之一。
+
+假设 4 个 rank 都持有长度为 4 的向量：
+\texttt{rank0=[1,1,1,1]}，\texttt{rank1=[2,2,2,2]}，\texttt{rank2=[3,3,3,3]}，\texttt{rank3=[4,4,4,4]}。\\
+先做逐元素求和，得到 \texttt{[10,10,10,10]}；再把它切成 4 片，每个 rank 各拿一片。\\
+最终每个 rank 只保留自己的那一份结果，而不是完整结果。
+
+\begin{intubox}
+\textbf{为什么这个原语重要：} \texttt{all\_reduce} 的结果会复制到所有 rank，显存上比较“浪费”；\texttt{reduce\_scatter} 则天然适合\key{归约后直接分片保存}，这正是 ZeRO/FSDP 的核心思想之一。
+\end{intubox}
+
+\subsubsection*{5. 一个统一记忆法}
+
+你不用死记 API，记下面这个判断就够了：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{是不是只有一个源头往外发？} 是的话，优先想 \texttt{broadcast}。
+  \item \textbf{是不是大家都要拿到完整归约结果？} 是的话，优先想 \texttt{all\_reduce}。
+  \item \textbf{是不是大家都要拿到完整拼接结果？} 是的话，优先想 \texttt{all\_gather}。
+  \item \textbf{是不是归约之后还想顺手分片？} 是的话，优先想 \texttt{reduce\_scatter}。
+\end{itemize}
+
+\subsection{三、这些原语在训练 step 里怎么出现}
+
+以最经典的 DDP 为例，一次训练 step 的主线大致是：
+
+\begin{center}
+\begin{tabular}{p{13.5cm}}
+\hline
+\textbf{前向}：每个 rank 用自己的 mini-batch 独立算 loss \\
+$\downarrow$ \\
+\textbf{反向}：每个 rank 独立算出本地梯度 \\
+$\downarrow$ \\
+\textbf{梯度同步}：对梯度 bucket 做 \texttt{all\_reduce} \\
+$\downarrow$ \\
+\textbf{优化器更新}：每个 rank 用相同的全局梯度更新一份相同的模型副本 \\
+\hline
+\end{tabular}
+\end{center}
+
+这里有一个特别容易误解的点：
+
+\begin{warnbox}
+\textbf{DDP 扩展了吞吐，但没有帮你切掉模型状态冗余。}\\
+参数、梯度、优化器状态在每张卡上仍然是\key{完整复制}的。DDP 解决的是“多卡一起算得更快”，不是“每张卡只存一小部分模型”。
+\end{warnbox}
+
+反过来看 ZeRO/FSDP 的主线，就会变成：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.1cm}p{9.5cm}}
+\hline
+\textbf{阶段} & \textbf{典型通信} \\
+\hline
+前向前拿参数 & \texttt{all\_gather} 参数分片，临时拼出可计算的完整权重 \\
+反向后回收梯度 & \texttt{reduce\_scatter}，把梯度归约后按 rank 分片保存 \\
+checkpoint / 日志 & \texttt{all\_gather}、\texttt{gather} 或对象收集 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+这就是为什么你现在必须先把 \texttt{all\_reduce} / \texttt{all\_gather} / \texttt{reduce\_scatter} 的语义吃透。后面所有框架都只是“围绕这些 primitive 重新组织状态”。
+
+\subsection{四、显存账本：训练显存到底被谁吃掉了}
+
+显存计算最容易乱，是因为很多讲法把三件事混在一起了：\key{每个参数要存多少字节}、\key{每张卡是不是存完整一份}、\key{除了模型状态还有没有激活和临时 buffer}。这一节按这个顺序拆开。
+
+\begin{conceptbox}
+\textbf{先定口径：} 下面公式默认站在\key{单个 rank / 单张 GPU} 的视角。\\
+$N$ 表示全模型 trainable parameter 总数，不是单卡参数数。DDP 里每张卡都有完整 $N$ 个参数；只有 ZeRO/FSDP 这类分片方法才会让每张卡长期只保存一部分状态。
+\end{conceptbox}
+
+\subsubsection*{1. 训练显存先分成两大类}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.4cm}p{4.1cm}p{5.4cm}}
+\hline
+\textbf{类别} & \textbf{是否可以按参数量口算} & \textbf{说明} \\
+\hline
+模型状态（model states） & 可以 & 参数、梯度、优化器状态。它们和 $N$ 基本线性相关，是先做账本时最稳定的一块。 \\
+剩余状态（residual states） & 不好只按 $N$ 算 & 激活、临时 buffer、通信 bucket、CUDA allocator 碎片等。它们更依赖 batch、序列长度、kernel 实现和并行策略。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+所以训练峰值显存更接近：
+
+\[
+M_{\text{peak}}
+\approx
+M_{\text{model states}}
++ M_{\text{act}}
++ M_{\text{temp/comm}}
++ M_{\text{fragment}}
+\]
+
+\begin{warnbox}
+\textbf{不要把“参数大小”当成“训练显存”。}\\
+一个 BF16/FP16 模型做推理时，参数本体大约是 $2N$ bytes；但做 Adam 类训练时，还要给梯度、Adam moments、可能存在的 FP32 master weights 付钱。
+\end{warnbox}
+
+\subsubsection*{2. 先算每个参数要付多少字节}
+
+把每个参数对应的模型状态拆成三项：
+
+\[
+c_{\text{state}} = c_p + c_g + c_o
+\]
+
+其中：
+\begin{itemize}[leftmargin=1.5em]
+  \item $c_p$：参数本体每个元素的字节数。BF16/FP16 通常是 2 bytes。
+  \item $c_g$：梯度每个元素的字节数。低精度训练里常见是 2 bytes，但也可能用 FP32 归约或保存。
+  \item $c_o$：优化器相关状态。Adam/AdamW 通常至少有一阶矩 $m$ 和二阶矩 $v$；若它们是 FP32，就是 $4 + 4 = 8$ bytes / param。若还有 FP32 master weights，再加 4 bytes / param。
+\end{itemize}
+
+于是模型状态的总字节数就是：
+
+\[
+M_{\text{model states, bytes}} = N \times c_{\text{state}}
+\]
+
+换成 GiB 时再除以 $1024^3$：
+
+\[
+M_{\text{model states, GiB}}
+=
+\frac{N \times c_{\text{state}}}{1024^3}
+\]
+
+\begin{intubox}
+\textbf{最该背的是 bytes / param，不是某个固定 GB 数字：}
+\begin{itemize}[leftmargin=1.5em]
+  \item 低精度参数 + 低精度梯度 + FP32 Adam moments，无 FP32 master：$2 + 2 + 8 = \key{12}$ bytes / param。
+  \item FP16 参数 + FP16 梯度 + FP32 Adam moments + FP32 master：$2 + 2 + 8 + 4 = \key{16}$ bytes / param。
+  \item 只做低精度推理，只看参数本体：大约 \key{2} bytes / param。
+\end{itemize}
+如果 optimizer state 被压到 8-bit、被 offload 到 CPU/NVMe，或者框架对 BF16/FP16 master weights 的处理不同，上面的常数就要改。
+\end{intubox}
+
+\subsubsection*{3. 再问：这些状态在每张卡上是完整复制还是分片}
+
+设数据并行组大小为 $D$。先忽略临时 all-gather buffer、bucket、offload、prefetch 等工程细节，只看\key{长期驻留的模型状态}：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.7cm}p{5cm}}
+\hline
+\textbf{训练方式} & \textbf{单 rank 模型状态近似} & \textbf{读法} \\
+\hline
+DDP & $N(c_p + c_g + c_o)$ & 参数、梯度、优化器状态都完整复制；$D$ 不会出现在分母里。 \\
+ZeRO-1 & $N(c_p + c_g + c_o / D)$ & 只分片优化器状态。 \\
+ZeRO-2 & $N(c_p + (c_g + c_o) / D)$ & 分片优化器状态和梯度。 \\
+ZeRO-3 / FSDP FULL\_SHARD & $N(c_p + c_g + c_o) / D$ & 参数、梯度、优化器状态都分片；这是稳态下界，不是峰值保证。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{FSDP/ZeRO-3 的公式要加一句限制：}\\
+每张卡长期只保留分片，但前向/反向计算某一层时，仍然可能通过 \texttt{all\_gather} 临时拼出这一层的完整参数；反向结束后再用 \texttt{reduce\_scatter} 把梯度归约并分片。因此 $/D$ 公式是理解下界，不等于真实峰值显存。
+\end{warnbox}
+
+\subsubsection*{4. 一个 7B 模型的单卡口算}
+
+假设训练 7B 参数模型，采用 BF16 参数、BF16 梯度、FP32 Adam moments，不保留 FP32 master weights。那么每参数成本是：
+
+\[
+c_{\text{state}} = 2 + 2 + 8 = 12 \text{ bytes / param}
+\]
+
+模型状态总量：
+
+\[
+7 \times 10^9 \times 12
+= 84 \times 10^9 \text{ bytes}
+\]
+
+也就是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 参数：$7 \times 10^9 \times 2$ bytes，约 \key{14 GB}，也就是约 \key{13.0 GiB}。
+  \item 梯度：同样约 \key{14 GB}，也就是约 \key{13.0 GiB}。
+  \item Adam moments：$7 \times 10^9 \times 8$ bytes，约 \key{56 GB}，也就是约 \key{52.2 GiB}。
+  \item 仅模型状态合计：约 \key{84 GB}，也就是约 \key{78.2 GiB}。
+\end{itemize}
+
+\begin{warnbox}
+这 78.2 GiB 还\warn{没有}算激活、临时 buffer、通信 bucket 和碎片。\\
+所以单纯 DDP 下，7B + AdamW 在 80GB/80GiB 级别卡上非常紧，实际训练通常撑不住。\\
+如果是 FP16 + FP32 master weights 的 16 bytes / param 口径，模型状态会变成 $7 \times 10^9 \times 16 = 112$ GB，约 \key{104.3 GiB}，单卡更不可能放下。
+\end{warnbox}
+
+如果用 8 卡 ZeRO-3 / FSDP FULL\_SHARD，只看模型状态下界：
+
+\[
+\frac{84 \text{ GB}}{8}
+\approx
+10.5 \text{ GB}
+\approx
+9.8 \text{ GiB / rank}
+\]
+
+这就是分片的价值：它不是让总显存消失，而是把长期驻留的模型状态摊到多个 rank 上。
+
+\subsubsection*{5. 激活为什么不能用同一个 bytes / param 公式}
+
+激活主要由当前 micro-batch 的中间结果决定，而不是只由参数量决定。一个更实用的趋势公式是：
+
+\[
+M_{\text{act}}
+\propto
+B_{\mu} \times S \times H \times L \times c_{\text{impl}}
+\]
+
+其中 $B_{\mu}$ 是\key{单 rank micro-batch size}，$S$ 是序列长度或 token 数，$H$ 是 hidden size，$L$ 是层数，$c_{\text{impl}}$ 是由具体实现决定的常数。朴素 attention 还可能保存和 $S^2$ 有关的中间量；FlashAttention、activation checkpointing、selective recompute 等实现会改变这些常数和峰值位置。
+
+\begin{warnbox}
+\textbf{真正该记住的不是常数，而是趋势：}\\
+序列更长、分辨率更高、视频帧更多、local micro-batch 更大，激活都会迅速变贵。\\
+Gradient accumulation 的步数本身通常不会把激活峰值乘上去，因为 micro-batch 是一个接一个跑；但每个 micro-batch 内部要保存哪些激活，会直接决定峰值。activation checkpointing 的本质就是“\key{少保存一部分激活，反向时再重算}”。
+\end{warnbox}
+
+\subsection{五、把通信和显存放到一张图里看}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.7cm}p{4cm}p{5.4cm}}
+\hline
+\textbf{训练方式} & \textbf{显存特征} & \textbf{核心通信} \\
+\hline
+DDP & 参数、梯度、优化器状态全复制 & \texttt{all\_reduce} 梯度 \\
+ZeRO-1 & 只分片优化器状态 & 优化器相关同步 \\
+ZeRO-2 & 分片优化器状态和梯度 & 常见为 \texttt{reduce\_scatter} + 必要 gather \\
+ZeRO-3 / FSDP FULL\_SHARD & 参数、梯度、优化器状态都分片 & \texttt{all\_gather} 参数，\texttt{reduce\_scatter} 梯度 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+这张表你现在不用背细节，但要记住它背后的因果链：
+
+\begin{summarybox}
+\textbf{统一视角：} 后面的所有框架，本质都在回答同一个问题：\\
+\key{哪些状态必须完整复制，哪些状态可以只让每个 rank 保存一片；如果分片了，需要用什么 collective 在计算前后把它们重新拼起来或归约回去。}
+\end{summarybox}
+
+\subsection{六、配套实例代码}
+
+我已经把这一节配套的两份代码放进实验区：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{experiments/distributed\_training\_frameworks/stage0\_collectives\_demo.py}
+  \item \texttt{experiments/distributed\_training\_frameworks/stage0\_memory\_ledger.py}
+\end{itemize}
+
+第一份代码演示：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{broadcast}
+  \item \texttt{all\_reduce}
+  \item \texttt{all\_gather}
+  \item \texttt{reduce\_scatter}（若当前 backend 支持）
+  \item even / odd 子组上的 \texttt{process group} 通信
+\end{itemize}
+
+第二份代码演示：
+\begin{itemize}[leftmargin=1.5em]
+  \item 按参数量估算参数、梯度、optimizer states 占用
+  \item 给出 DDP 单卡视角下的训练显存基线
+  \item 给出理想 full-shard 下的下界估算，帮助你建立直觉
+\end{itemize}
+
+建议你这样跑：
+
+\begin{lstlisting}
+cd experiments/distributed_training_frameworks
+
+# 先看 collective 语义
+OMP_NUM_THREADS=1 torchrun --standalone --nproc-per-node=2 \
+  stage0_collectives_demo.py \
+  --backend gloo
+
+# 再看 7B 模型的显存账本
+python3 stage0_memory_ledger.py \
+  --num-params-b 7 \
+  --num-gpus 8 \
+  --activation-gib 10
+\end{lstlisting}
+
+\subsubsection*{collective 演示代码的核心片段}
+
+\begin{lstlisting}[language=Python, caption=all\_reduce 和 all\_gather 的最小例子]
+local = torch.tensor([float(rank + 1)], device=device)
+dist.all_reduce(local, op=dist.ReduceOp.SUM)
+# 每个 rank 都会得到同一个和
+
+piece = torch.tensor([float(rank), float(rank + 100)], device=device)
+gathered = [torch.zeros_like(piece) for _ in range(world_size)]
+dist.all_gather(gathered, piece)
+full = torch.cat(gathered)
+# 每个 rank 都能看到完整拼接结果
+\end{lstlisting}
+
+\subsubsection*{显存账本代码的核心片段}
+
+\begin{lstlisting}[language=Python, caption=训练模型状态显存的最小估算]
+num_params = 7_000_000_000
+weight_bytes = 2
+grad_bytes = 2
+optimizer_bytes = 8       # FP32 Adam m/v
+master_weight_bytes = 0   # FP16 mixed precision often uses 4
+
+bytes_per_param = (
+    weight_bytes
+    + grad_bytes
+    + optimizer_bytes
+    + master_weight_bytes
+)
+model_states_gib = num_params * bytes_per_param / (1024 ** 3)
+full_shard_lower_bound_gib = model_states_gib / num_gpus
+\end{lstlisting}
+
+\subsection{七、你学完这一节后应该能立刻回答的问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 为什么 DDP 里最关键的原语是 \texttt{all\_reduce}？
+  \item \texttt{all\_gather} 和 \texttt{reduce\_scatter} 的结果分布到底差在哪？
+  \item 为什么 8 卡 DDP 并不意味着每张卡只存模型的八分之一？
+  \item 为什么 Adam 的 optimizer states 往往比参数本体更贵？
+  \item 为什么 activation checkpointing 被称为“算力换显存”？
+\end{itemize}
+
+\begin{summarybox}
+\textbf{Stage 0 最终结论：}\\
+先不要急着背 ZeRO Stage 1/2/3、FSDP FULL\_SHARD 这些名词。你先把两件事吃透：\\
+1. \key{通信 primitive 的结果语义}；\\
+2. \key{训练显存到底由哪些状态构成。}\\
+后面所有框架，本质都只是围绕这两个问题做不同 trade-off。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item PyTorch DistributedDataParallel 文档：DDP 同步梯度、参数不在进程间广播，且 DDP 不负责把输入或模型状态自动切分到各 GPU。\\
+  \url{https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html}
+  \item PyTorch FullyShardedDataParallel 文档：\texttt{FULL\_SHARD} 会分片参数、梯度和 optimizer states，并在计算前后使用 \texttt{all\_gather} / \texttt{reduce\_scatter}。\\
+  \url{https://docs.pytorch.org/docs/stable/fsdp.html}
+  \item DeepSpeed ZeRO 文档：ZeRO 通过在 data-parallel ranks 之间 partition optimizer states、gradients、parameters 来减少经典数据并行的状态冗余。\\
+  \url{https://deepspeed.readthedocs.io/en/stable/zero3.html}
+  \item ZeRO 论文：Rajbhandari 等，\emph{ZeRO: Memory Optimizations Toward Training Trillion Parameter Models}, arXiv:1910.02054。\\
+  \url{https://arxiv.org/abs/1910.02054}
+  \item NVIDIA Mixed Precision Training Guide：混合精度训练中低精度计算、loss scaling、FP32 master weights 的常见做法。\\
+  \url{https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html}
+  \item PyTorch \texttt{torch.utils.checkpoint} 文档：activation checkpointing 通过反向阶段重算 forward 片段来用计算换显存。\\
+  \url{https://docs.pytorch.org/docs/stable/checkpoint.html}
+\end{itemize}
+\endgroup

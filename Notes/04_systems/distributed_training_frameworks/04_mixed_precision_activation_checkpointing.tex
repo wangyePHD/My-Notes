@@ -1,0 +1,504 @@
+% ============================================================
+% Stage 3：Mixed Precision 与 Activation Checkpointing
+% ============================================================
+
+\section{Stage 3：Mixed Precision 与 Activation Checkpointing}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 把大模型训练里最常见的两类“默认优化”讲清楚：\key{mixed precision} 和 \key{activation checkpointing}。学完这一页，你至少要能回答四件事：\\
+1. \key{FP16、BF16、FP32 的差别到底影响什么}；\\
+2. \key{为什么 FP16 经常需要 loss scaling，而 BF16 通常更省心}；\\
+3. \key{activation checkpointing 为什么是“算力换显存”}；\\
+4. \key{它们和 DDP、ZeRO、FSDP 为什么几乎总是一起出现。}
+\end{conceptbox}
+
+\note{这一节不会深入浮点硬件实现，也不会讨论每个 GPU 架构的 Tensor Core 指令细节。你需要掌握的是工程判断：什么时候用 BF16/FP16，哪些状态会被低精度化，哪些状态仍要保留高精度，以及 activation checkpointing 应该切在哪里。}
+
+\subsection*{资料收集与引用口径}
+
+\begin{conceptbox}
+\textbf{本节先查资料再整理结论。} 这一页主要参考四类资料：\\
+1. \key{PyTorch 官方资料}：\texttt{torch.amp} 文档用于确认 \texttt{autocast}、\texttt{GradScaler}、FP16/BF16 AMP 的接口语义；\texttt{torch.utils.checkpoint} 文档用于确认 checkpoint 的 recomputation、RNG 状态和 reentrant/non-reentrant 行为。\\
+2. \key{NVIDIA 官方资料}：Mixed Precision Training Guide 用于确认混合精度训练的三类关键技术：低精度计算、FP32 master weights、loss scaling。\\
+3. \key{论文资料}：\emph{Mixed Precision Training} 论文用于理解 FP16 训练的稳定性问题；\emph{Training Deep Nets with Sublinear Memory Cost} 用于理解 activation recomputation 的理论来源。\\
+4. \key{工程文档}：DeepSpeed activation checkpointing 文档和 PyTorch activation checkpointing 技术博客用于理解大模型训练里的 checkpoint 分区、CPU checkpointing、选择性 checkpoint 等工程做法。
+\end{conceptbox}
+
+\begin{center}
+{\small
+\begin{tabular}{p{4cm}p{8.7cm}}
+\hline
+\textbf{笔记结论} & \textbf{主要依据} \\
+\hline
+AMP 不是简单把所有 tensor 都改成半精度，而是由 autocast 按算子选择合适 dtype & PyTorch \texttt{torch.amp} 文档。 \\
+FP16 动态范围小，训练中常配合 loss scaling；BF16 动态范围接近 FP32，通常更不容易 underflow & NVIDIA Mixed Precision Training Guide；Mixed Precision Training 论文；PyTorch AMP 文档。 \\
+混合精度常保留 FP32 master weights 或 FP32 optimizer states，以保证优化器更新稳定性 & NVIDIA Mixed Precision Training Guide；Mixed Precision Training 论文。 \\
+Activation checkpointing 保存更少 forward 激活，并在 backward 中重算被省略的 forward 片段 & PyTorch checkpoint 文档；Sublinear Memory Cost 论文。 \\
+Checkpoint 边界会影响显存节省、重算开销、RNG 一致性和调试复杂度 & PyTorch checkpoint 文档；PyTorch activation checkpointing 博客；DeepSpeed activation checkpointing 文档。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{一、为什么这一节放在 ZeRO/FSDP 后面}
+
+前一节的 ZeRO/FSDP 主要解决的是\key{模型状态冗余}：参数、梯度、优化器状态在每张卡上重复保存太多。可是即使你已经用了 ZeRO-3 或 FSDP，训练仍然可能 OOM 或吞吐不够，因为还有两类非常大的成本：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{每个 tensor 的字节数}：同样一个参数，用 FP32 是 4 bytes，用 FP16/BF16 是 2 bytes。
+  \item \textbf{前向中间激活}：长序列、大 micro-batch、多层 Transformer 会保存大量 activation，反向需要用它们算梯度。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{这一节解决两件事：}\\
+Mixed precision 回答：\key{同样的张量，能不能用更少 bytes、更快算子来表示和计算？}\\
+Activation checkpointing 回答：\key{forward 时能不能少存一点 activation，backward 时再重算回来？}
+\end{summarybox}
+
+这两件事都不是新的并行策略，但它们几乎是大模型训练的默认配套：DDP、ZeRO、FSDP、Megatron 都会和它们一起使用。
+
+\subsection{二、Mixed precision 到底是什么}
+
+\begin{summarybox}
+\textbf{一句话定义：}\\
+Mixed precision 是一种\key{训练时的 dtype 分工策略}：把大部分吞吐密集、对数值误差相对不敏感的计算放到 FP16/BF16 里做，以获得更高吞吐和更低显存；同时把容易影响训练稳定性的状态或算子保留在 FP32 或更安全的 dtype 中。
+\end{summarybox}
+
+也就是说，mixed precision 的重点不是“模型属于哪一个 dtype”，而是训练系统会分别回答下面几个问题：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{参数用什么 dtype 参与 forward？} 例如 BF16/FP16 参数副本可以减少显存和带宽压力。
+  \item \textbf{每个算子用什么 dtype 计算？} 例如 matmul/attention 可以走 BF16/FP16 Tensor Core，softmax、norm、loss 等敏感部分可能保留 FP32 或由框架选择更安全的 dtype。
+  \item \textbf{梯度用什么 dtype 保存和通信？} 例如梯度可能以 BF16/FP16 形式产生、bucket、reduce，也可能在某些场景下累积到更高精度。
+  \item \textbf{优化器状态用什么 dtype 更新？} Adam 的一阶/二阶矩通常仍用 FP32，因为优化器更新对数值稳定很敏感。
+  \item \textbf{是否需要额外稳定机制？} FP16 常需要 loss scaling；BF16 因动态范围接近 FP32，通常不需要。
+\end{itemize}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.3cm}p{5cm}}
+\hline
+\textbf{训练方式} & \textbf{直觉} & \textbf{典型状态} \\
+\hline
+纯 FP32 训练 & 全程用高精度，稳定但慢且占显存 & 参数、激活、梯度、优化器状态大多是 FP32。 \\
+错误理解的 half 训练 & 把所有东西都硬转成半精度 & 可能省显存，但容易在 softmax、norm、梯度、优化器更新处数值不稳定。 \\
+Mixed precision 训练 & 低精度负责快，高精度负责稳 & 主计算用 BF16/FP16；敏感算子、optimizer states、必要 master weights 保留 FP32 或安全 dtype。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{更准确的理解：}\\
+Mixed precision 不是一个单独算法，也不是一种并行策略，而是一套\key{精度放置策略}。它的核心 trade-off 是：\key{用低精度吃掉大部分计算和显存成本，用高精度守住训练稳定性。}
+\end{intubox}
+
+\subsection{三、先认识三个核心浮点格式}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.5cm}p{3.1cm}p{3.4cm}p{3.6cm}}
+\hline
+\textbf{格式} & \textbf{位宽结构} & \textbf{核心特点} & \textbf{训练里的直觉} \\
+\hline
+FP32 & 1 sign + 8 exponent + 23 mantissa & 动态范围大、精度高、显存和带宽贵 & 稳定基线，优化器状态常用。 \\
+FP16 & 1 sign + 5 exponent + 10 mantissa & 精度还可以，但动态范围小 & 快、省显存，但容易梯度 underflow，需要 loss scaling。 \\
+BF16 & 1 sign + 8 exponent + 7 mantissa & 动态范围接近 FP32，尾数精度比 FP16 少 & 大模型训练更省心，通常不需要 loss scaling。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{最重要的不是“小数点后几位”，而是动态范围。}\\
+训练里很多梯度非常小。FP16 因为 exponent 位少，能表示的数值范围窄，小梯度更容易变成 0；BF16 的 exponent 位数和 FP32 一样，所以动态范围更大，训练稳定性通常更好。
+\end{intubox}
+
+\subsection{四、Mixed precision 不是“全模型 half”}
+
+混合精度训练常被误解成一句话：“把模型改成 \texttt{half()}”。这很危险。真实的 mixed precision 更像下面这套分工：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4cm}p{4.8cm}}
+\hline
+\textbf{对象} & \textbf{常见 dtype} & \textbf{原因} \\
+\hline
+矩阵乘、卷积、attention 主计算 & FP16/BF16 & 用 Tensor Core 等低精度硬件路径提升吞吐、降低带宽压力。 \\
+某些归约、归一化、softmax 等敏感算子 & FP32 或框架选择的安全 dtype & 避免数值不稳定。 \\
+模型参数参与 forward 的副本 & FP16/BF16 & 降低参数读写和激活相关显存压力。 \\
+优化器状态 & 通常 FP32 & Adam moments 对数值稳定比较敏感。 \\
+Master weights & FP16 训练中常见 FP32 & 用高精度权重做 optimizer update，再 cast 回低精度权重。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{AMP 的核心不是你手动决定每个算子的 dtype。}\\
+PyTorch AMP 的 \texttt{autocast} 会根据算子规则自动选择合适精度；\texttt{GradScaler} 则主要用于 FP16 场景下缓解小梯度 underflow。真正该学的是：\key{哪些东西可以低精度，哪些东西最好保留高精度。}
+\end{summarybox}
+
+\subsection{五、FP16 为什么需要 loss scaling}
+
+FP16 的问题不是“完全不能训练”，而是\key{小梯度容易 underflow}。假设某个梯度真实值是 $10^{-8}$，FP32 可以表示，但 FP16 可能直接舍入为 0。梯度一旦变成 0，对应参数就无法得到有效更新。
+
+Loss scaling 的办法很直接：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item forward 得到 loss；
+  \item 把 loss 乘上一个 scale，比如 $2^{16}$；
+  \item backward 时梯度也整体变大，减少 underflow；
+  \item optimizer step 之前再把梯度除回原来的 scale；
+  \item 如果检测到 overflow，就跳过这次 step 并降低 scale。
+\end{enumerate}
+
+\[
+\nabla(s \cdot L) = s \cdot \nabla L
+\]
+
+所以 unscale 之后，数学上还是原来的梯度：
+
+\[
+\frac{s \cdot \nabla L}{s} = \nabla L
+\]
+
+\begin{warnbox}
+\textbf{loss scaling 不是让模型更准确。}\\
+它主要是为了让 FP16 训练时的小梯度不要因为表示范围太窄而消失。动态 loss scaling 会自动调节 scale：没溢出就可能增大，溢出就减小并跳过异常 step。
+\end{warnbox}
+
+\subsection{六、为什么工业界通常更偏向 BF16}
+
+如果硬件支持 BF16，很多大模型训练会优先选择 BF16，而不是 FP16。核心原因是：\key{BF16 的动态范围接近 FP32，训练稳定性更好，通常不需要 loss scaling。}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.1cm}p{5cm}}
+\hline
+\textbf{维度} & \textbf{FP16} & \textbf{BF16} \\
+\hline
+显存占用 & 2 bytes & 2 bytes。 \\
+动态范围 & 小，容易 underflow/overflow & 接近 FP32，更稳。 \\
+尾数精度 & 比 BF16 多 & 比 FP16 少。 \\
+是否常需 loss scaling & 通常需要 & 通常不需要。 \\
+硬件要求 & 支持范围很广 & 需要较新的 GPU/TPU/加速器支持。 \\
+大模型默认偏好 & 较少作为首选 & 常作为首选。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{一个实用判断：}\\
+如果你的硬件稳定支持 BF16，且训练框架/模型算子也支持，优先尝试 BF16；如果只能用 FP16，就要认真处理 \texttt{GradScaler}、overflow、loss spike 和不稳定算子。
+\end{intubox}
+
+\subsection{七、PyTorch AMP 的最小写法}
+
+\subsubsection*{1. BF16 AMP 写法}
+
+BF16 通常不需要 \texttt{GradScaler}：
+
+\begin{lstlisting}[language=Python, caption=BF16 autocast 训练骨架]
+import torch
+
+
+def train_one_step_bf16(model, batch, optimizer):
+    optimizer.zero_grad(set_to_none=True)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        outputs = model(batch["input_ids"])
+        loss = outputs.loss
+
+    loss.backward()
+    optimizer.step()
+    return loss
+\end{lstlisting}
+
+\subsubsection*{2. FP16 AMP 写法}
+
+FP16 通常搭配 \texttt{GradScaler}：
+
+\begin{lstlisting}[language=Python, caption=FP16 autocast + GradScaler 训练骨架]
+import torch
+
+scaler = torch.amp.GradScaler("cuda")
+
+
+def train_one_step_fp16(model, batch, optimizer):
+    optimizer.zero_grad(set_to_none=True)
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        outputs = model(batch["input_ids"])
+        loss = outputs.loss
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    return loss
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{梯度裁剪的位置很关键。}\\
+如果用了 \texttt{GradScaler}，在 \texttt{clip\_grad\_norm\_} 之前要先 \texttt{unscale\_}，否则你裁剪的是被放大过的梯度，阈值含义会错。
+\end{warnbox}
+
+\subsection{八、Mixed precision 和显存账本}
+
+回到 Stage 0 的每参数账本：
+
+\[
+c_{\text{state}} = c_p + c_g + c_o
+\]
+
+Mixed precision 会直接影响 $c_p$ 和 $c_g$，但不一定让 $c_o$ 降低。以 AdamW 为例：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.2cm}p{4.1cm}p{4.2cm}}
+\hline
+\textbf{训练口径} & \textbf{bytes / param} & \textbf{说明} \\
+\hline
+FP32 参数 + FP32 梯度 + FP32 Adam $m/v$ & $4 + 4 + 8 = 16$ & 稳但贵。 \\
+BF16 参数 + BF16 梯度 + FP32 Adam $m/v$ & $2 + 2 + 8 = 12$ & 大模型常见口径。 \\
+FP16 参数 + FP16 梯度 + FP32 Adam $m/v$ + FP32 master & $2 + 2 + 8 + 4 = 16$ & 省计算和部分激活，但模型状态不一定比 FP32 Adam 口径低。 \\
+BF16/FP16 推理只看权重 & $2$ & 不含梯度和优化器状态。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{不要以为 mixed precision 一定把训练显存减半。}\\
+它能减少参数副本、梯度、激活和某些临时 buffer 的占用，也能提升吞吐；但 Adam optimizer states 很多时候仍是 FP32，所以训练总显存不会简单除以 2。
+\end{warnbox}
+
+\subsection{九、Activation 为什么会成为瓶颈}
+
+反向传播需要 forward 的中间结果。Transformer 里每一层会产生很多 activation，例如 hidden states、attention 中间量、MLP 中间量、dropout mask 等。显存趋势可以粗略记成：
+
+\[
+M_{\text{act}}
+\propto
+B_{\mu} \times S \times H \times L \times c_{\text{impl}}
+\]
+
+其中 $B_{\mu}$ 是单 rank micro-batch size，$S$ 是序列长度，$H$ 是 hidden size，$L$ 是层数。实际常数还受 attention 实现、是否 FlashAttention、是否保存 dropout mask、是否 sequence parallel 等影响。
+
+\begin{intubox}
+\textbf{activation 的特点：}\\
+参数显存主要跟模型大小相关；activation 显存则强烈受 \key{micro-batch size 和 sequence length} 影响。长上下文训练里，activation 往往会变成比参数更难处理的瓶颈。
+\end{intubox}
+
+\subsection{十、Activation checkpointing 的核心思想}
+
+普通训练的做法是：forward 时保存很多中间 activation，backward 直接拿这些 activation 算梯度。
+
+Activation checkpointing 的做法是：forward 时只保存某些边界 tensor，丢掉 checkpoint 区间内部的中间 activation；backward 到这个区间时，重新跑一遍该区间 forward，把需要的 activation 临时重算出来，再继续反向。
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4.4cm}p{4.5cm}}
+\hline
+\textbf{方式} & \textbf{forward 保存什么} & \textbf{backward 做什么} \\
+\hline
+不 checkpoint & 保存大部分中间 activation & 直接使用保存的 activation。 \\
+Activation checkpoint & 只保存 checkpoint 边界和必要状态 & 先重算 forward 片段，再计算 backward。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{一句话：}\\
+Activation checkpointing 用\key{额外 forward 重算}换\key{更低 activation 显存}。所以它通常会降低峰值显存，但增加 step time。
+\end{summarybox}
+
+\subsection{十一、Checkpoint 边界怎么理解}
+
+把一个 Transformer 看成很多 block：
+
+\[
+\text{Embedding} \rightarrow B_1 \rightarrow B_2 \rightarrow \cdots \rightarrow B_L \rightarrow \text{Head}
+\]
+
+最常见的 checkpoint 边界就是按 Transformer block 切：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item forward 进入 $B_i$ 前保存输入；
+  \item $B_i$ 内部 activation 尽量不长期保存；
+  \item backward 需要 $B_i$ 内部 activation 时，用保存的输入重新跑 $B_i$ forward；
+  \item 重算完成后再做 $B_i$ 的 backward。
+\end{itemize}
+
+\begin{intubox}
+\textbf{边界选择的直觉：}\\
+checkpoint 太粗：每次重算很贵，但保存 activation 少；\\
+checkpoint 太细：重算较细，但管理开销增加，显存收益可能不明显；\\
+工程上常按 Transformer block 或若干 block 一组做 checkpoint。
+\end{intubox}
+
+\subsection{十二、PyTorch checkpoint 的最小写法}
+
+\begin{lstlisting}[language=Python, caption=对一个 Transformer block 做 activation checkpoint]
+import torch
+from torch.utils.checkpoint import checkpoint
+
+
+class CheckpointedBlock(torch.nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def forward(self, hidden_states, attention_mask=None):
+        def run_block(hidden_states, attention_mask):
+            return self.block(hidden_states, attention_mask=attention_mask)
+
+        return checkpoint(
+            run_block,
+            hidden_states,
+            attention_mask,
+            use_reentrant=False,
+        )
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{新代码优先显式传 \texttt{use\_reentrant=False}。}\\
+PyTorch 官方文档建议显式传入 \texttt{use\_reentrant}，并说明 non-reentrant 版本通常是推荐路径。学习阶段你先记住：checkpoint 不是无脑包一层，RNG、输入输出结构、autograd 行为都会影响正确性。
+\end{warnbox}
+
+\subsection{十三、RNG、Dropout 和一致性问题}
+
+Checkpointing 会在 backward 里重新执行 forward 片段。如果这个片段里有 dropout，重算时必须处理随机数状态，否则重算的 dropout mask 和第一次 forward 不一致，梯度就可能不对。
+
+PyTorch checkpoint 默认会处理 RNG 状态以保证确定性行为，但这会带来额外开销；如果你明确不需要这种一致性，可以考虑关闭相关设置，但要知道这会改变语义。
+
+\begin{warnbox}
+\textbf{不要把 checkpoint 当成纯显存开关。}\\
+它会改变 backward 时的执行图和执行顺序；如果模型里有 dropout、随机采样、自定义 autograd、缓存副作用或依赖全局状态的逻辑，就要格外小心。
+\end{warnbox}
+
+\subsection{十四、和 FSDP/ZeRO 一起用时要注意什么}
+
+Mixed precision 和 activation checkpointing 经常和 FSDP/ZeRO 一起用，但它们优化的是不同维度：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4.2cm}p{4.8cm}}
+\hline
+\textbf{技术} & \textbf{主要减少什么} & \textbf{主要代价} \\
+\hline
+ZeRO/FSDP & 参数、梯度、优化器状态的冗余 & 通信、checkpoint 和调度复杂度。 \\
+Mixed precision & tensor 字节数、算子带宽和计算时间 & 数值稳定性、dtype 兼容性。 \\
+Activation checkpointing & forward activation 峰值显存 & backward 重算，step time 增加。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+组合时最常见的策略是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 先用 BF16 mixed precision 降低计算和显存压力；
+  \item 如果模型状态太大，再用 ZeRO/FSDP 分片参数、梯度、优化器状态；
+  \item 如果长序列或 micro-batch 导致 activation OOM，再加 activation checkpointing；
+  \item 如果仍然 OOM，再考虑更小 micro-batch、offload、sequence parallel、tensor parallel 等更重方案。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{一个实用排查顺序：}\\
+参数/optimizer states 爆了，优先想 ZeRO/FSDP；\\
+activation 爆了，优先想 activation checkpointing、FlashAttention、减小 micro-batch 或 sequence length；\\
+吞吐不够，优先确认 mixed precision、kernel、通信重叠和数据 IO。
+\end{summarybox}
+
+\subsection{十五、常见坑与排查方向}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.9cm}p{4.7cm}p{4.2cm}}
+\hline
+\textbf{现象} & \textbf{常见原因} & \textbf{排查方向} \\
+\hline
+FP16 loss 变成 NaN/Inf & overflow、scale 过大、敏感算子低精度不稳定 & 使用 GradScaler，检查 loss scale、学习率、norm、softmax/log。 \\
+FP16 训练不收敛 & 小梯度 underflow 或 master weights/optimizer 状态处理不当 & 开启动态 loss scaling，确认 optimizer 状态 dtype。 \\
+BF16 吞吐不如预期 & 硬件或算子没有走高效 BF16 路径 & 检查 GPU 架构、kernel、PyTorch/CUDA 版本。 \\
+加 checkpoint 后变慢很多 & checkpoint 边界太粗或重算区域太大 & 按 block 调整边界，用 profiler 看 recompute 开销。 \\
+加 checkpoint 后结果不一致 & dropout/RNG 或副作用逻辑处理不当 & 检查 RNG preserve、随机算子、自定义 forward 副作用。 \\
+显存仍然不降 & checkpoint 区间不包含主要 activation 或其他状态才是瓶颈 & 用 memory snapshot/profiler 区分 activation、参数、buffer。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{十六、面试版回答}
+
+\subsubsection*{1. Mixed precision 是什么？}
+
+Mixed precision 是训练过程中的\key{精度分工策略}。它不是把整个模型无脑转成 FP16/BF16，而是把不同对象和不同算子放到不同 dtype 上：matmul、attention、MLP 这类吞吐密集计算尽量用 BF16/FP16 来获得更高速度和更低显存；softmax、normalization、loss、optimizer states、必要的 master weights 等数值敏感部分则保留 FP32 或框架选择的安全 dtype。它的目标是在不明显牺牲收敛稳定性的前提下，减少显存、降低带宽压力并利用低精度硬件加速。
+
+\subsubsection*{2. 为什么 FP16 需要 loss scaling？}
+
+FP16 动态范围小，小梯度容易 underflow 成 0。Loss scaling 会先把 loss 放大，使 backward 得到的梯度也放大，减少 underflow；optimizer step 前再把梯度除回去。如果检测到 overflow，就跳过本次更新并降低 scale。
+
+\subsubsection*{3. 为什么大模型训练更偏向 BF16？}
+
+BF16 和 FP16 一样是 2 bytes，但 BF16 的 exponent 位数和 FP32 一样，动态范围接近 FP32，因此更不容易出现 underflow/overflow。虽然 BF16 尾数精度少于 FP16，但大模型训练里动态范围通常比尾数精度更关键，所以 BF16 往往更稳定，也通常不需要 loss scaling。
+
+\subsubsection*{4. Activation checkpointing 为什么省显存？}
+
+普通训练 forward 会保存大量中间 activation 供 backward 使用。Activation checkpointing 只保存 checkpoint 边界上的必要 tensor，丢掉区间内部 activation；backward 时重新执行该区间 forward 来恢复 activation，再计算梯度。因此它用额外计算换更低显存。
+
+\subsubsection*{5. Activation checkpointing 的代价是什么？}
+
+主要代价是 step time 增加，因为 backward 中多了一部分 forward recomputation；此外还会引入 RNG 一致性、dropout、自定义 forward 副作用、checkpoint 边界选择等工程复杂度。
+
+\subsection{十七、学完这一节后的检查清单}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 你能用一句话定义 mixed precision：\key{低精度负责大部分计算和显存效率，高精度负责训练稳定性}。
+  \item 你能区分 mixed precision 和“把模型整体 \texttt{half()}”的区别。
+  \item 你能说清 FP32、FP16、BF16 的动态范围和精度差异。
+  \item 你能解释为什么 FP16 常用 \texttt{GradScaler}，BF16 通常不需要。
+  \item 你知道 mixed precision 不等于所有状态都低精度，optimizer states 常常仍是 FP32。
+  \item 你能写出 PyTorch BF16/FP16 AMP 的最小训练骨架。
+  \item 你能解释 activation checkpointing 为什么会省 activation 显存，以及为什么会变慢。
+  \item 你知道 checkpoint 边界、dropout/RNG 和 \texttt{use\_reentrant} 都可能影响正确性。
+  \item 你能把 ZeRO/FSDP、mixed precision、activation checkpointing 分别对应到模型状态、字节数和 activation 三类问题上。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{Stage 3 最终结论：}\\
+Mixed precision 解决的是\key{每个 tensor 用多少 bytes、算子能不能走更快低精度路径}；activation checkpointing 解决的是\key{forward activation 要不要全部长期保存}。\\
+FP16 的核心问题是动态范围小，所以常配合 loss scaling；BF16 的动态范围接近 FP32，因此大模型训练里通常更省心。\\
+Activation checkpointing 本质是“少存 activation，反向时重算 forward 片段”，它能显著降低峰值显存，但会增加计算时间和工程复杂度。\\
+这两类技术和 ZeRO/FSDP 是互补关系：\key{ZeRO/FSDP 切模型状态，mixed precision 降低 dtype 成本，activation checkpointing 压 activation 峰值。}
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item PyTorch AMP 文档：\texttt{torch.amp.autocast}、\texttt{GradScaler}、FP16/BF16 自动混合精度训练接口说明。\\
+  \url{https://docs.pytorch.org/docs/2.9/amp.html}
+  \item PyTorch \texttt{torch.utils.checkpoint} 文档：activation checkpointing 的 recomputation、RNG 状态处理、\texttt{use\_reentrant} 等行为说明。\\
+  \url{https://docs.pytorch.org/docs/2.9/checkpoint.html}
+  \item NVIDIA Mixed Precision Training Guide：混合精度训练的低精度计算、FP32 master weights、loss scaling 等实践建议。\\
+  \url{https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html}
+  \item Micikevicius 等，\emph{Mixed Precision Training}, arXiv:1710.03740：系统讨论 FP16 混合精度训练、loss scaling 和 FP32 master weights。\\
+  \url{https://arxiv.org/abs/1710.03740}
+  \item Chen 等，\emph{Training Deep Nets with Sublinear Memory Cost}, arXiv:1604.06174：提出通过重算中间激活来降低深度网络训练内存复杂度的思想。\\
+  \url{https://arxiv.org/abs/1604.06174}
+  \item DeepSpeed Activation Checkpointing 文档：分区 activation checkpoint、CPU checkpointing、contiguous checkpointing 等大模型训练工程接口。\\
+  \url{https://deepspeed.readthedocs.io/en/stable/activation-checkpointing.html}
+  \item PyTorch Blog：\emph{Current and New Activation Checkpointing Techniques in PyTorch}，介绍 activation checkpointing 的 trade-off、selective activation checkpoint 和 memory budget API。\\
+  \url{https://pytorch.org/blog/activation-checkpointing-techniques/}
+\end{itemize}
+\endgroup

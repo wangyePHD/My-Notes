@@ -1,0 +1,150 @@
+% ============================================================
+% 工业界大规模分布式训练框架学习路线图
+% ============================================================
+
+\section{学习路线图：工业界大规模分布式训练框架}
+
+\begin{conceptbox}
+\textbf{一句话目标：} 不是只会背 DDP、FSDP、ZeRO 这些名词，而是能回答三件事：\\
+1. \key{为什么需要这个框架}；\\
+2. \key{它切分了什么状态，节省了什么资源}；\\
+3. \key{什么规模、什么网络条件、什么工程目标下该怎么选。}
+\end{conceptbox}
+
+\subsection{一、这块知识到底在解决什么问题？}
+
+\begin{warnbox}
+\textbf{核心矛盾：} 模型参数越来越大、序列越来越长、batch 越来越大，但单卡显存、跨机带宽和 checkpoint 成本都是有限的。\\
+所以工业界训练框架本质上都在做同一件事：\key{在显存、通信、吞吐、复杂度之间找更优 trade-off。}
+\end{warnbox}
+
+最常见的四类瓶颈：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{参数放不下}：模型本体太大，单卡无法容纳完整参数。
+  \item \textbf{激活放不下}：长序列、高分辨率、多帧视频导致前向中间激活爆炸。
+  \item \textbf{优化器状态太大}：Adam 一阶、二阶矩通常比参数本体还贵。
+  \item \textbf{通信太慢}：多机 all-reduce、all-gather、reduce-scatter 成为 step time 主瓶颈。
+\end{itemize}
+
+\subsection{二、工业界主流框架地图}
+
+\begin{center}
+\begin{tabular}{p{4cm}p{4cm}p{5.5cm}}
+\hline
+\textbf{框架 / 抽象} & \textbf{主要解决问题} & \textbf{关键词} \\
+\hline
+DDP & 多卡吞吐扩展 & 全模型复制、梯度 all-reduce \\
+FSDP & 显存冗余过大 & 参数/梯度/优化器状态分片 \\
+DeepSpeed ZeRO & 数据并行显存优化 & Stage 1/2/3、状态分片 \\
+Megatron-LM & 单层过大、模型本体放不下 & Tensor Parallel、Pipeline Parallel \\
+Hybrid Parallel & 超大模型联合扩展 & DP + TP + PP + ZeRO/FSDP \\
+AMP / BF16 & 训练吞吐与显存优化 & mixed precision、loss scaling \\
+Activation Checkpointing & 激活显存压缩 & 重算换显存 \\
+Sharded Checkpoint & 超大模型存储与恢复 & rank-wise state dict \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{三、正式学习顺序（建议执行版）}
+
+\subsubsection*{Stage 0：通信原语与显存账本}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} \key{rank / world\_size / process group}、all-reduce、all-gather、reduce-scatter、broadcast、global batch size，以及 \key{参数 / 梯度 / 优化器状态 / 激活} 四类显存开销。
+  \item \textbf{为什么先学：} 如果这一层不清楚，后面的 ZeRO、FSDP、TP、PP 都会变成黑盒名词。
+  \item \textbf{完成标志：} 你能手画一遍 DDP 反向同步时序，并能口算一次训练 step 的主要显存去向。
+\end{itemize}
+
+\note{当前可直接复用的先修笔记：\code{dist\_process\_group.tex}、\code{accelerate\_gather.tex}。}
+
+\subsubsection*{Stage 1：DDP 作为基线框架}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} DDP、distributed sampler、梯度 all-reduce、grad accumulation、global batch size、吞吐扩展。
+  \item \textbf{为什么第二步学它：} DDP 是所有大规模训练框架的参考基线。只有先弄懂 DDP，你才知道 ZeRO/FSDP 到底优化掉了什么冗余。
+  \item \textbf{完成标志：} 你能清楚解释“为什么 DDP 扩吞吐很强，但显存扩展性差”。
+\end{itemize}
+
+\subsubsection*{Stage 2：ZeRO 与 FSDP 这条工业主线}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} ZeRO Stage 1/2/3，FSDP 的 FULL\_SHARD、SHARD\_GRAD\_OP、HYBRID\_SHARD，state dict、CPU offload、auto wrap policy。
+  \item \textbf{为什么第三步学它：} 这是工业界最常见的\key{显存优化主线}，很多团队实际就是在 ZeRO/FSDP 路线里做权衡，而不是一上来就走复杂模型并行。
+  \item \textbf{完成标志：} 你能回答什么时候用 ZeRO-2、什么时候上 ZeRO-3、什么时候更适合 FSDP。
+\end{itemize}
+
+\subsubsection*{Stage 3：Mixed Precision 与 Activation Checkpointing}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} BF16/FP16、loss scaling、master weights、activation recomputation、checkpoint 边界。
+  \item \textbf{为什么放在这里：} 这两类技术几乎总是和 FSDP/ZeRO 一起出现，是大模型训练的默认配套优化。
+  \item \textbf{完成标志：} 你能解释为什么工业界通常偏向 BF16，以及为什么 activation checkpointing 是“算力换显存”。
+\end{itemize}
+
+\subsubsection*{Stage 4：Megatron-LM 与模型并行}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} tensor parallel、pipeline parallel、sequence parallel、micro-batch、pipeline bubble。
+  \item \textbf{为什么第四步学：} 当你已经理解状态分片后，再去看“模型本体如何切开”会更清楚，否则很容易把数据并行优化和模型并行混在一起。
+  \item \textbf{完成标志：} 你能解释单层矩阵为什么需要 tensor parallel，以及 pipeline parallel 为什么会引入 bubble 和调度复杂度。
+\end{itemize}
+
+\subsubsection*{Stage 5：混合并行设计}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} DP + TP + PP + ZeRO/FSDP 的组合方式，节点内 NVLink、跨节点 InfiniBand、HYBRID\_SHARD 的网络拓扑含义。
+  \item \textbf{为什么这一步关键：} 真正的工业训练几乎都不是单一并行策略，而是\key{混合并行}。
+  \item \textbf{完成标志：} 给你 8 卡、64 卡、256 卡三种资源规模时，你能说出一个合理的并行配置思路。
+\end{itemize}
+
+\subsubsection*{Stage 6：工程落地与运维调试}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{学什么：} sharded checkpoint、full checkpoint、resume、一致性校验、NCCL timeout、OOM、dataloader stall、step time / tokens per second / MFU 监控。
+  \item \textbf{为什么最后学：} 前面是“能训练起来”，这一层是“能稳定、可恢复、可观测地训练很久”。
+  \item \textbf{完成标志：} 你能定位一次训练变慢到底是通信、IO、显存、数据还是 checkpoint 路径出了问题。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{我给你的最终顺序：}\\
+不是“先看 Megatron，再看 ZeRO”，而是 \key{通信原语 $\rightarrow$ DDP 基线 $\rightarrow$ ZeRO/FSDP $\rightarrow$ mixed precision / activation checkpointing $\rightarrow$ Megatron 模型并行 $\rightarrow$ 混合并行 $\rightarrow$ 工程调试}。\\
+原因很简单：\key{先学基线，再学优化；先学状态分片，再学模型切分；最后再学系统组合。}
+\end{summarybox}
+
+\subsection{四、建议固化的笔记树}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{00\_learning\_roadmap.tex}：这页总路线图。
+  \item \texttt{01\_collectives\_and\_memory\_ledger.tex}：collective 通信原语 + 显存账本。
+  \item \texttt{02\_ddp\_basics.tex}：DDP、distributed sampler、梯度同步、global batch。
+  \item \texttt{03\_zero\_fsdp\_overview.tex}：ZeRO Stage 1/2/3 与 FSDP 的统一视角。
+  \item \texttt{04\_mixed\_precision\_activation\_checkpointing.tex}：BF16/FP16、loss scaling、activation checkpointing。
+  \item \texttt{04a\_practical\_memory\_strategy\_summary.tex}：显存优化、OOM 排查与策略组合的阶段性实践总结。
+  \item \texttt{05\_megatron\_parallelism.tex}：tensor parallel、pipeline parallel、sequence parallel。
+  \item \texttt{06\_hybrid\_parallel\_strategy.tex}：不同资源规模下的混合并行设计。
+  \item \texttt{07\_checkpoint\_resume\_debugging.tex}：checkpoint、resume、监控与故障排查。
+\end{itemize}
+
+\subsection{五、如果你现在就开始，我建议的第一轮学习节奏}
+
+\begin{summarybox}
+\textbf{最优起步顺序：}\\
+1. 先补 Stage 0，把 process group、gather、all-reduce 和显存账本搞清楚；\\
+2. 然后学 DDP，把它当作所有框架的对照组；\\
+3. 第三步直接进入 ZeRO/FSDP，这会成为你后面最常用的主线知识；\\
+4. 等你已经能算清楚显存和通信，再去学 Megatron 和混合并行。\\
+换句话说，\key{先把“为什么显存不够、为什么通信慢”弄明白，再去学框架名词。}
+\end{summarybox}
+
+\subsection{六、后续你学习时我会怎么配合}
+
+我建议你后面按下面节奏推进：
+\begin{itemize}[leftmargin=1.5em]
+  \item 你指定一个主题，例如“先学 FSDP”。
+  \item 我帮你做一页结构化学习笔记，包含原理、图示、公式、工程配置、常见坑和面试答法。
+  \item 学完一页后，再把它接到这个专区里，形成完整知识树。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{当前状态：} 学习顺序已经持久化到专区里。接下来最合理的第一课仍然是 \key{DDP vs ZeRO vs FSDP 的统一总览}，因为它能把后续所有框架放进同一个坐标系里。
+\end{summarybox}

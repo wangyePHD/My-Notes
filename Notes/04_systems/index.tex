@@ -1,0 +1,16 @@
+% Systems note zone.
+
+\part*{系统与分布式训练}
+\phantomsection
+\addcontentsline{toc}{part}{系统与分布式训练}
+
+\begin{conceptbox}
+\textbf{用途：} 这里放工业界大规模训练与推理系统笔记，重点不是零散 API，而是把\key{分布式原理、框架抽象、显存优化、通信代价、工程 trade-off} 串起来。\\
+\textbf{当前接入：} 已建立「工业界大规模分布式训练框架」与「FlashAttention / FlexAttention」学习专区，并保留已有的 process group、gather、KV cache 等系统基础笔记。
+\end{conceptbox}
+
+\input{Notes/04_systems/distributed_training_frameworks/index}
+\input{Notes/04_systems/efficient_attention/index}
+\input{Notes/04_systems/kv_cache}
+\input{Notes/04_systems/accelerate_gather}
+\input{Notes/04_systems/dist_process_group}

@@ -1,0 +1,12 @@
+data: /path/to/images
+image_size: 1024
+bridge_size: 256
+patch_size: 16
+dim: 768
+depth: 12
+heads: 12
+batch_size: 1
+grad_accum: 8
+steps: 200000
+cascade_ratio: 0.5
+predict_residual: true

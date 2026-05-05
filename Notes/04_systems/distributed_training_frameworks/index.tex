@@ -1,0 +1,17 @@
+% Distributed training frameworks study zone.
+
+\section*{工业界大规模分布式训练框架}
+\phantomsection
+\addcontentsline{toc}{section}{工业界大规模分布式训练框架}
+
+\begin{conceptbox}
+\textbf{学习目标：} 系统掌握工业界训练超大模型时最常见的框架与抽象，包括 \key{DDP、FSDP、DeepSpeed ZeRO、Megatron-LM、混合并行、checkpoint、通信优化}。\\
+\textbf{当前主线：} 按 \key{通信原语与显存账本 $\rightarrow$ DDP $\rightarrow$ ZeRO/FSDP $\rightarrow$ mixed precision 与 activation checkpointing $\rightarrow$ Megatron 模型并行 $\rightarrow$ 混合并行与工程落地} 的顺序推进。
+\end{conceptbox}
+
+\input{Notes/04_systems/distributed_training_frameworks/00_learning_roadmap}
+\input{Notes/04_systems/distributed_training_frameworks/01_collectives_and_memory_ledger}
+\input{Notes/04_systems/distributed_training_frameworks/02_ddp_basics}
+\input{Notes/04_systems/distributed_training_frameworks/03_zero_fsdp_overview}
+\input{Notes/04_systems/distributed_training_frameworks/04_mixed_precision_activation_checkpointing}
+\input{Notes/04_systems/distributed_training_frameworks/04a_practical_memory_strategy_summary}

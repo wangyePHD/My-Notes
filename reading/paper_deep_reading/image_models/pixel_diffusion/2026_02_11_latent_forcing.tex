@@ -1,0 +1,175 @@
+% ============================================================
+% Paper deep reading: Latent Forcing
+% ============================================================
+
+\subsection{论文精读：Latent Forcing}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2602.11401}{Latent Forcing: Reordering the Diffusion Trajectory for Pixel-Space Image Generation}\\
+\textbf{作者/机构：} Alan Baade, Eric Ryan Chan, Kyle Sargent, Changan Chen, Justin Johnson, Ehsan Adeli, Li Fei-Fei；Stanford University \& University of Michigan\\
+\textbf{时间：} arXiv v1, 2026-02-11；阅读日期：2026-04-30\\
+\textbf{代码：} \href{https://github.com/AlanBaade/LatentForcing}{github.com/AlanBaade/LatentForcing}\\
+\textbf{方向标签：} Pixel-Space Diffusion、DiT、Tokenizer-Generation Tradeoff、Multi-Schedule Diffusion、REPA、JiT
+\end{conceptbox}
+
+% ------------------------------------------------------------
+\subsubsection{前置背景速览}
+% ------------------------------------------------------------
+
+在读 Latent Forcing 之前，需要对以下五个工作有基本印象。它们构成了这篇论文的直接上下文。
+
+\paragraph{① DDPM / Flow Matching——扩散模型的两种基础形式}
+
+\textbf{DDPM}（Ho et al., 2020）定义了扩散模型的标准训练范式：向数据逐步加噪，训练神经网络预测噪声，推理时反向去噪。\textbf{Flow Matching}（Liu et al., 2022）是更简洁的替代：直接在数据和噪声之间拟合一条直线轨迹（rectified flow），训练目标是预测速度场 $v = x - \epsilon$，推理时沿速度场积分。Latent Forcing 使用的是 Flow Matching 框架，时间 $t=1$ 表示纯数据，$t=0$ 表示纯噪声。
+
+\paragraph{② LDM——Latent Diffusion 范式的确立}
+
+\textbf{LDM}（Rombach et al., 2021，即 Stable Diffusion 的前身）把扩散模型从 pixel-space 搬到了 latent space：先用 KL-VAE 把图像压缩到低维 latent（通常下采样 8×），再在 latent 上训练扩散模型，推理时用 decoder 还原图像。这个设计极大降低了计算量，成为此后几乎所有主流图像生成模型的基础范式。但它的代价是：encoder 会丢弃高频信息，decoder 需要单独训练，整个管线不是端到端的。
+
+\paragraph{③ DiT——把 Transformer 引入扩散模型}
+
+\textbf{DiT}（Peebles \& Xie, 2023）把 U-Net 替换为 Vision Transformer（ViT），用 adaLN-Zero 把时间步和类别条件注入每个 Transformer block，在 ImageNet 上验证了扩散模型的 scaling law。DiT 是 Latent Forcing 的直接架构基础，Latent Forcing 对 DiT 的改动极小（仅增加第二个时间 MLP 和可选的 output expert 层）。
+
+\paragraph{④ REPA——用预训练表示对齐加速 DiT 训练}
+
+\textbf{REPA}（Yu et al., 2025）发现：在 DiT 的中间层加一个辅助损失，让中间特征对齐 DINOv2 的 patch 特征，可以显著加速训练收敛（在相同 epoch 下 FID 大幅下降）。直觉是：DINOv2 已经学到了丰富的语义结构，让扩散模型的中间表示向它靠拢，相当于给模型一个"语义锚点"，让它更快学会先生成结构再生成细节。Latent Forcing 的核心论点之一就是：REPA 的收益本质上来自于隐式的生成顺序调整，而非蒸馏本身。
+
+\paragraph{⑤ JiT——证明 DiT 可以直接在 pixel-space 工作}
+
+\textbf{JiT}（Li \& He, 2025，"Back to Basics"）是 Latent Forcing 最直接的前作。它的核心发现是：标准扩散模型在高维 pixel-space 训练失败，根本原因是预测目标（噪声 $\epsilon$ 或速度 $v$）在低噪声时刻的信息容量不足以表达高维输出。解决方案是改用 \textbf{x-prediction with v-loss weighting}：预测目标改为去噪后的干净图像 $x$，但损失函数用 v-loss 的权重来平衡不同噪声水平的梯度贡献。这一改动让标准 ViT/L 架构可以直接在 256×256 pixel-space 上训练，无需 tokenizer，成为 Latent Forcing 的 pixel-space 基础。
+
+\begin{conceptbox}
+\textbf{五个前作的关系一览：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Flow Matching} 提供训练框架和时间变量记号；
+  \item \textbf{LDM} 定义了 Latent Forcing 要挑战的范式（tokenizer + diffusion 两阶段）；
+  \item \textbf{DiT} 提供架构，Latent Forcing 在其上做极小改动；
+  \item \textbf{REPA} 提供了"语义表示有助于生成"的实证，Latent Forcing 给出了更深的解释；
+  \item \textbf{JiT} 解决了 pixel-space 训练的技术障碍，Latent Forcing 在 JiT 基础上加入 latent 分支。
+\end{itemize}
+\end{conceptbox}
+
+% ------------------------------------------------------------
+\subsubsection{0. 一句话结论}
+
+Latent Forcing 的核心贡献是：在 pixel-space 做端到端扩散生成的同时，通过引入多个时间变量让 latent（DINOv2 特征）先于 pixel 去噪，使 latent 充当"草稿本"（scratchpad）来引导高频像素细节的生成，从而在不损失任何信息的前提下，获得接近 latent diffusion 的收敛效率。
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇论文的价值在于它把一个直觉（先生成语义结构，再生成细节）形式化为多时间变量扩散框架，并用它统一解释了 REPA 的有效性、conditional vs unconditional 的差异、以及 tokenizer 压缩率与 diffusability 的关系。核心 insight 是：重建-生成 tradeoff 不是必然的，关键在于生成顺序而非压缩率本身。值得精读，尤其是 Section 3（ordering 的理论分析）和 Section 5.5（distillation vs ordering 的对比）。
+\end{summarybox}
+
+\subsubsection{1. 为什么读这篇}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{和当前主线的关系：} 这篇论文直接挑战了 latent diffusion 的核心假设——"tokenizer 压缩是必要的"，提出了一条 pixel-space 端到端的替代路线。
+  \item \textbf{它可能补上的知识缺口：} 为什么 REPA 有效？为什么 tokenizer PSNR 越低生成越好？这篇从"生成顺序"的视角给出了统一解释。
+  \item \textbf{我希望读完回答的问题：} 多时间变量扩散是如何实现的？latent 先行的理论依据是什么？与 REPA 的本质区别在哪里？
+\end{itemize}
+
+\subsubsection{2. 背景：Latent Diffusion 的两难困境}
+
+当前主流的图像生成范式是 Latent Diffusion（LDM）：先用 tokenizer（KL-VAE 或 VQGAN）把图像压缩到低维 latent space，再在 latent space 上训练扩散模型。这个设计有两个核心优势：
+\begin{enumerate}[leftmargin=1.8em]
+  \item 低维空间让扩散模型收敛更快；
+  \item 语义 latent 让模型更容易学到高层结构。
+\end{enumerate}
+
+但它也带来了三个根本性问题：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{信息丢失：} encoder 在压缩时不可避免地丢弃高频细节（文字、纹理、人脸）；
+  \item \textbf{两阶段解耦：} decoder 需要单独训练，生成管线不是端到端的；
+  \item \textbf{重建-生成 tradeoff：} tokenizer PSNR 越高（越保真），扩散模型越难训练（FID 越差）；PSNR 越低（越压缩），生成质量越好但重建越差。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉版：} Latent Diffusion 的问题本质上是"把两件事强行分开了"——tokenizer 负责压缩，diffusion 负责生成。Latent Forcing 的想法是：不压缩，但让模型先生成语义草稿（latent），再用草稿引导像素细节的生成。这样既保留了端到端的优势，又获得了 latent 引导的收敛效率。
+\end{intubox}
+
+\subsubsection{3. 方法拆解}
+
+\paragraph{3.1 核心思想：多时间变量扩散}
+
+Latent Forcing 的关键修改是：在同一个扩散模型中，对 pixel 和 latent 分别维护独立的时间变量 $t_{\text{pixel}}$ 和 $t_{\text{latent}}$，并在训练和推理时让 latent 先于 pixel 去噪。
+
+标准 Flow-Based Diffusion 的 noised latent 为：
+$$z_t = t \cdot x + (1-t) \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+其中 $t=1$ 表示纯数据，$t=0$ 表示纯噪声。
+
+对于 $k$ 个模态（这里 $k=2$，pixel 和 latent），训练目标为：
+$$\mathcal{L} = \sum_{i=1}^{k} \lambda_i \mathbb{E} \left\| v_{\theta,i}(z_{1,t_1}, \ldots, z_{k,t_k}, t_1, \ldots, t_k) - (x_i - \epsilon_i) \right\|^2$$
+
+推理时，定义全局时间 $t_{\text{global}}$，每个模态的时间为 $t_i = f_i(t_{\text{global}})$，要求 $f_i$ 单调递增且 $f_i(0)=0, f_i(1)=1$。
+
+\paragraph{3.2 生成顺序的理论依据：SNR 视角}
+
+论文用 SNR（Signal-to-Noise Ratio）来定义生成顺序。每个模态在时刻 $t_{\text{global}}$ 的 SNR 为：
+$$\text{SNR}_i(t_{\text{global}}) = \frac{f_i(t_{\text{global}})^2 \cdot \text{Var}[x_i]}{(1 - f_i(t_{\text{global}}))^2}$$
+
+生成顺序定义为各模态 SNR 的轨迹 $O(t_{\text{global}}) = \{\text{SNR}_i(t_{\text{global}})\}_{i=1}^k$，它是信息在生成过程中被揭示的速率的代理指标。
+
+\begin{warnbox}
+\textbf{关键发现：} 实验表明，latent（DINOv2 特征）应该先于 pixel 去噪（即 $t_{\text{latent}} > t_{\text{pixel}}$ 在大部分时间段内）。这与直觉一致：先生成语义结构，再生成像素细节。
+\end{warnbox}
+
+\paragraph{3.3 时间调度：Variance Shift}
+
+为了在不引入额外时间变量的情况下实现顺序调度，论文利用了一个等价关系：对 latent $x$ 乘以标量 $\alpha$ 等价于对时间做如下 shift：
+$$f_{\alpha\text{-shift}}(t) = \frac{\alpha t}{1 + (\alpha - 1)t}$$
+
+这意味着，只需调整 latent 的方差（即缩放 latent 特征），就可以隐式地改变生成顺序，而无需修改时间变量本身。
+
+\paragraph{3.4 架构修改（极简）}
+
+Latent Forcing 对标准 DiT 的修改非常小：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{输入：} pixel patch embedding 和 latent patch embedding 直接相加（token 数量不变，速度几乎不变）；
+  \item \textbf{时间条件：} adaLN 中增加第二个时间 MLP（参数量增加约 0.5\%）；
+  \item \textbf{输出（可选）：} 最后 4 层 Transformer 分成两组 2 层的 output expert，分别预测 pixel 和 latent（不增加参数，FLOPs 不变）；
+  \item \textbf{预测目标：} 沿用 JiT 的 x-prediction with v-loss weighting，避免高维空间的信息容量约束。
+\end{itemize}
+
+\subsubsection{4. 关键实验结论}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{顺序至关重要：} Multi-Schedule Model 实验（Table 1）表明，latent 先行（$\alpha > 1$）比 pixel 先行（$\alpha < 1$）在 FID 上有显著优势，且这一结论对 DINOv2、Data2Vec2、64×64 downsampled pixels 等多种 latent 空间均成立。
+  \item \textbf{Ordering vs Distillation（Table 9）：} LF-DiT（DINOv2）在 FID-50K 上比 JiT+REPA 低 1.9×（unguided），比 JiT 低 2.5×，证明顺序带来的收益独立于 REPA 风格的蒸馏。
+  \item \textbf{无损重建：} LF-DiT 的 tokenizer PSNR 为 $\infty$（pixel-space，无信息损失），但 FID 优于所有 PSNR $< 32$ 的 latent diffusion 模型（Table 11）。
+  \item \textbf{Cascaded schedule 最优：} 完全级联（latent 全部去噪完再开始 pixel）比 variance shift 和 linear offset 效果更好（Table 8）。
+\end{itemize}
+
+\subsubsection{5. 对 REPA 的重新解读}
+
+这是论文最有洞察力的部分之一。REPA 通过在 diffusion model 中加入对 DINOv2 特征的对齐损失来加速训练，但论文指出：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item REPA 的收益本质上是让模型在早期 timestep 就能获得语义信息，这等价于一种隐式的"latent 先行"；
+  \item 但 REPA 是一次性的训练加速，在后期训练中效果会减弱（Wang et al., 2025）；
+  \item Latent Forcing 则是把这种顺序显式地编码进生成轨迹，效果更持久，且在 unconditional generation 中优势更明显（Table 10，guided FID 降低 1.8×）。
+\end{itemize}
+
+\subsubsection{6. 局限与待解问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{只在 ImageNet 256×256 验证：} 没有文生图实验，不清楚在 text-conditioned 高分辨率生成中的表现；
+  \item \textbf{Latent 的选择：} 目前只用了 DINOv2 和 Data2Vec2，对 CLIP、SigLIP 等 text-aligned 特征的效果未知；
+  \item \textbf{Cascaded error：} 级联生成存在误差传播问题，论文通过在 pixel 步骤中给 latent 加少量噪声来缓解，但这只是 workaround；
+  \item \textbf{扩展到视频：} 多时间变量框架理论上可以扩展到视频生成（时序 latent 先行），但尚未验证。
+\end{itemize}
+
+\subsubsection{7. 与前作的关系}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{JiT（Li \& He, 2025）：} Latent Forcing 直接建立在 JiT 之上，沿用其 x-prediction with v-loss 的训练目标，并在 JiT 的 pixel-space DiT 基础上增加 latent 分支。
+  \item \textbf{REPA（Yu et al., 2025）：} Latent Forcing 可以看作是 REPA 思想的"显式化"——REPA 用蒸馏损失隐式引入语义顺序，Latent Forcing 用多时间变量显式控制生成顺序。
+  \item \textbf{Diffusion Forcing（Chen et al., 2025）：} 同样使用多时间变量，但针对自回归时序数据，仍需 tokenization；Latent Forcing 是非自回归的，且完全无损。
+  \item \textbf{RAE（Zheng et al., 2025）：} RAE 把 DINOv2 latent 融入 tokenizer 的编解码，仍是两阶段；Latent Forcing 把 latent 作为生成过程中的中间变量，最终丢弃，完全端到端。
+\end{itemize}
+
+\subsubsection{8. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item JiT（Li \& He, 2025）的 x-prediction with v-loss 具体是怎么设计的？为什么它能解决高维空间的信息容量约束？
+  \item REPA（Yu et al., 2025）的对齐损失具体加在哪一层？为什么后期训练效果会减弱？
+  \item Variance shift $f_{\alpha\text{-shift}}$ 的推导：为什么对 latent 乘以 $\alpha$ 等价于时间 shift？
+  \item Latent Forcing 在 text-to-image 场景下，text condition 应该如何与 latent 的生成顺序协同？
+\end{itemize}

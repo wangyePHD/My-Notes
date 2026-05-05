@@ -1,0 +1,598 @@
+% ============================================================
+% Paper deep reading: OP-GRPO
+% Source: https://arxiv.org/html/2604.04142v1
+% ============================================================
+
+\section{论文精读：OP-GRPO}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2604.04142}{OP-GRPO: Efficient Off-Policy GRPO for Flow-Matching Models}\\
+\textbf{简称：} OP-GRPO。\\
+\textbf{版本：} arXiv 2604.04142v1。\\
+\textbf{方向标签：} Flow Matching、GRPO、Off-policy RL、Replay Buffer、Sample Efficiency、Image / Video Generation。\\
+\textbf{阅读日期：} 2026-05-04。\\
+\textbf{阅读口径：} 这篇不是前面 DenseGRPO / Chunk-GRPO / PCPO 那条 ``credit assignment'' 主线，而是 \textbf{sample efficiency / off-policy reuse} 主线：核心问题不是 reward 该分给哪一步，而是 \textbf{已经采出来的好轨迹能不能安全地重复利用}。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+OP-GRPO 的核心不是单独加一个 replay buffer，而是把 Flow-GRPO 里 ``采一次、用一次、立刻丢掉'' 的流程，改成了下面这个三段式：
+
+\[
+\begin{aligned}
+\text{OP-GRPO}
+&= \text{高质量轨迹复用}\\
+&\quad + \text{sequence-level 分布纠偏}\\
+&\quad + \text{late-step truncation}
+\end{aligned}
+\]
+
+最后效果是：在 image 和 video 上，它都能用明显更少的训练步数达到 Flow-GRPO 的最终水平，而且最好结果还略高。
+
+\begin{summarybox}
+\textbf{我的判断：} 这是视觉生成里 ``GRPO 样本效率'' 方向非常值得读的第一篇。它不是只说 ``把旧样本拿回来再训''，而是把真正会导致失败的三个点都正面处理了：\key{怎么存}、\key{怎么纠偏}、\key{哪些 off-policy steps 根本不该用}。
+\end{summarybox}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{opgrpo/fig1_framework.png}
+  \caption{OP-GRPO 总体框架，包括 rollout 和 training 两部分。蓝色区域表示来自 replay buffer 的样本，绿色区域表示直接来自数据集的新样本。图源：arXiv HTML。}
+  \label{fig:opgrpo-framework}
+\end{figure}
+
+\subsection{1. 它为什么重要}
+
+Flow-GRPO 已经证明了：GRPO 可以有效地接到 flow-matching 的图像/视频生成后训练上。但它有一个非常直接的工程问题：\textbf{完全 on-policy}。
+
+这意味着每一轮训练都要重新生成一整组 denoising trajectories，而上一轮里那些已经算过 reward、甚至已经发现很高质量结果的 trajectories，更新完以后就被丢掉。
+
+对 LLM 来说，丢掉历史 token rollout 已经很可惜；对图像和视频生成来说，这个代价更高，因为一次样本不只是一个 response，而是一整条 denoising trajectory：
+
+\[
+z_T \rightarrow z_{T-1} \rightarrow \cdots \rightarrow z_1 \rightarrow z_0 .
+\]
+
+每条轨迹都带着多步 transition log-probability、一次 reward model 打分、以及相当昂贵的采样成本。所以视觉生成里的 on-policy 浪费，比语言模型里更刺眼。
+
+\begin{warnbox}
+\textbf{但这件事不能直接照搬 LLM 的 replay buffer。} Flow-matching 模型的 off-policy 难点在于：不同 denoising steps 的 transition log-probability 数值尺度并不均匀，尤其在低噪声区域会变得非常尖锐。这使得 ``旧轨迹重放'' 在这里不只是一个数据管道问题，而是一个 objective 稳定性问题。
+\end{warnbox}
+
+所以 OP-GRPO 真正回答的是：
+
+\begin{quote}
+如果我想把历史高质量 trajectory 重新用起来，那么怎样做才能既提高 sample efficiency，又不把 GRPO 的 clipping 语义和训练稳定性搞坏？
+\end{quote}
+
+\subsection{2. 标准 Flow-GRPO 的样本效率问题}
+
+论文先沿用标准 flow-matching / Flow-GRPO 的基本设定。
+
+\subsubsection{2.1 生成过程本质上是一条 trajectory}
+
+Flow model 学习一个速度场：
+
+\[
+\frac{d x_t}{dt} = v_{\theta}(x,t), \qquad t \in [0,1].
+\]
+
+推理时通常用 Euler 形式离散化：
+
+\[
+x_{k-1} = x_k + \Delta t \, v_{\theta}(x_k, t_k).
+\]
+
+一旦把 deterministic flow sampling 改写成可计算 transition probability 的 rollout diffusion policy，每条 latent trajectory 的对数概率就可以按时间步分解：
+
+\[
+\log p(z_{0:T} \mid c)
+=
+\sum_{t=1}^{T}
+\log p(z_{t-1} \mid z_t, c).
+\]
+
+这一步很关键，因为后面所有 GRPO / PPO 风格的比值和 off-policy 校正都建立在这条分解上。
+
+\subsubsection{2.2 标准 GRPO 的 advantage 仍然是 terminal reward}
+
+给定同一个 prompt \(c\)，模型采样一个 group，最终只对终点样本 \(x_0^i\) 打 reward：
+
+\[
+\hat{A}^i
+=
+\frac{
+R(x_0^i,c)-\mathrm{mean}\{R(x_0^j,c)\}_{j=1}^{G}
+}{
+\mathrm{std}\{R(x_0^j,c)\}_{j=1}^{G}
+}.
+\]
+
+然后每个 denoising step 都拿这个同一个 trajectory-level advantage 去做 clipped GRPO update。
+
+这一点在 OP-GRPO 里并没有被改掉。也就是说，这篇不是 DenseGRPO 那样去改 reward density；它默认还是 Flow-GRPO 的 reward 设定，只改 \textbf{样本复用机制}。
+
+\subsubsection{2.3 真正低效的地方：现采现用}
+
+标准 Flow-GRPO 的训练可以概括成：
+
+\[
+\text{采一批新 trajectories}
+\rightarrow
+\text{算 reward / advantage}
+\rightarrow
+\text{更新一次}
+\rightarrow
+\text{全部丢弃}.
+\]
+
+这里的问题不是 ``没有探索''，而是 ``探索出来的好东西留不住''。尤其当任务较难时，模型偶尔碰到高质量样本，但如果只用一次，那条 beneficial trajectory 对后续训练几乎没有持续影响。
+
+\begin{intubox}
+\textbf{直觉：} Flow-GRPO 更像 ``今天找到一条好路，走一次就忘了''；OP-GRPO 想做的是 ``把这条好路先记下来，但只在安全的时候拿出来重复参考''。
+\end{intubox}
+
+\subsubsection{2.4 为什么 naive off-policy 会失败}
+
+如果只是把旧 trajectory 硬塞回训练，会遇到两个结构性问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 这些样本不是当前 rollout policy \(\pi_{\mathrm{old}}\) 采出来的，直接优化会有偏。
+  \item 在 flow-matching 的 late denoising steps，off-policy ratio 会因为低噪声数值病态而变得极不稳定。
+\end{enumerate}
+
+所以 OP-GRPO 后面三个模块，正好一一对应这三个问题：
+
+\[
+\begin{aligned}
+\text{replay buffer} &\rightarrow \text{如何存},\\
+\text{sequence correction} &\rightarrow \text{如何纠偏},\\
+\text{truncation} &\rightarrow \text{哪些步不要复用}.
+\end{aligned}
+\]
+
+\subsection{3. 方法一：High-quality Replay Buffer}
+
+\subsubsection{3.1 它存什么}
+
+对每条被保留的 trajectory，OP-GRPO 在 buffer 里存的是：
+
+\[
+x = \big(c, z_{0:T}, \log p_{\mathrm{off}}(z_{0:T}\mid c), R\big).
+\]
+
+也就是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 条件输入 \(c\)；
+  \item 整条 latent trajectory \(z_{0:T}\)；
+  \item 这条轨迹在旧策略下的 trajectory log-probability；
+  \item 最终 reward \(R\)。
+\end{itemize}
+
+这说明它不是只存最后一张图，而是把后面做 sequence-level correction 所需的信息一起存下来。
+
+\subsubsection{3.2 它怎么选样本}
+
+论文的 replay 策略很克制，不是无脑把所有历史数据都放进去，而是只保留 \textbf{高质量且相对新鲜} 的轨迹。
+
+具体规则有三条：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 每个 sampled group 里，只挑 reward 最高的 trajectory 作为候选进入 buffer。
+  \item 新候选会和 buffer 里当前最低 reward 的项比较，只有更好才替换。
+  \item 对同一个 conditioning input \(c\)，buffer 最多保留一条 trajectory。
+\end{enumerate}
+
+第三条很重要。它意味着 replay buffer 的目标不是把某个 prompt 的高分样本堆很多份，而是保证跨 prompt 的覆盖和多样性，避免 buffer collapse 成几个反复出现的 trivial prompt-template。
+
+\begin{summarybox}
+\textbf{这一步的设计思路很清楚：} OP-GRPO 不是想把训练慢慢变成离线 RL，而是想拿到一小批 ``最值得再看一眼'' 的历史轨迹。因此它主动牺牲了 buffer 容量上的贪心，换来更小的 off-policy 偏移和更好的多样性。
+\end{summarybox}
+
+\subsubsection{3.3 为什么还要做 stepwise decay}
+
+旧轨迹越老，就越 off-policy。论文因此对 buffer 中轨迹的 reward 做 stepwise decay，让旧样本自然更容易被新样本替换。
+
+这相当于在 replay buffer 里手动加入一个 ``时间衰减''：
+
+\[
+\text{同样 reward 的旧轨迹，比新轨迹更不值得保留。}
+\]
+
+这一步没有复杂理论，但非常符合这里的问题结构，因为 OP-GRPO 并不追求长期长期的离线数据复用，反而追求 ``历史样本足够近，能帮当前 policy 提速，但又别离得太远''。
+
+\subsubsection{3.4 训练时怎么混用 on-policy 和 off-policy}
+
+OP-GRPO 不会让一个 group 全部由旧样本组成。它采用 hybrid rollout：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 对直接来自原始数据集的 prompt，像普通 Flow-GRPO 一样生成 \(G\) 条新 trajectories。
+  \item 对来自 replay buffer 的 prompt，只生成 \((G-1)\) 条新的 on-policy trajectories，再把 buffer 里的那一条旧 trajectory 补进来。
+\end{itemize}
+
+也就是：
+
+\[
+\mathcal{G}(c)
+=
+\Big\{z_i^{\mathrm{on}} \sim p_{\mathrm{old}}(\cdot\mid c)\Big\}_{i=1}^{G-1}
+\cup
+\Big\{z^{\mathrm{off}} \sim \mathcal{B}_{\mathrm{off}}\Big\}.
+\]
+
+这个设计很巧，因为它没有破坏 GRPO 的 group-relative 结构。每个 buffer prompt 仍然在和 \textbf{当前策略 freshly sampled 的同 prompt 轨迹} 一起做相对比较，只是组里多了一条 ``历史参考''。
+
+\begin{intubox}
+\textbf{可以把它理解成：} OP-GRPO 不是拿旧数据单独训一个 batch，而是把旧轨迹插回它熟悉的 prompt 语境里，让它继续参加 group competition。这样既复用了旧经验，又保留了 GRPO 最核心的组内相对排序。
+\end{intubox}
+
+\subsection{4. 方法二：Sequence-level Importance Sampling Correction}
+
+这是整篇论文最关键的数学部分。
+
+\subsubsection{4.1 为什么直接把 off-policy correction 塞进 per-step ratio 是错的}
+
+假设我们已经拿到一条旧策略 \(\pi_{\mathrm{off}}\) 采出的轨迹。一个看似自然的做法，是把分布偏移直接并到每个 timestep 的 importance ratio 里。
+
+但这样一来，原本 PPO / GRPO 中非常重要的参考策略 \(p_{\mathrm{old}}\) 会被约掉：
+
+\[
+r_t^i(\theta)
+=
+\frac{p_{\theta_{\mathrm{old}}}(z_{t-1}^i\mid z_t^i,c)}{p_{\theta_{\mathrm{off}}}(z_{t-1}^i\mid z_t^i,c)}
+\times
+\frac{p_{\theta}(z_{t-1}^i\mid z_t^i,c)}{p_{\theta_{\mathrm{old}}}(z_{t-1}^i\mid z_t^i,c)}
+=
+\frac{p_{\theta}(z_{t-1}^i\mid z_t^i,c)}{p_{\theta_{\mathrm{off}}}(z_{t-1}^i\mid z_t^i,c)}.
+\]
+
+问题在于，clipping 的本意是约束：
+
+\[
+\text{当前更新后的策略 } p_{\theta}
+\quad \text{相对} \quad
+\text{当前更新起点 } p_{\mathrm{old}}
+\quad \text{不要走太远。}
+\]
+
+如果 ratio 变成 \(p_{\theta}/p_{\mathrm{off}}\)，那 clipping 监控的就不再是 ``本轮更新幅度''，而变成了 ``当前策略离某个更老的历史策略有多远''。这会直接破坏 PPO / GRPO 的近端更新语义。
+
+论文实证上也观察到：这种 naive substitution 会让 \textbf{超过 40\%} 的 off-policy samples 被 clip 掉。
+
+\begin{warnbox}
+\textbf{这里一定要抓住：} OP-GRPO 的重点不是 ``要不要 importance sampling''，而是 ``importance sampling 应该加在什么层级''。如果加错层级，虽然形式上也在纠偏，但已经把 GRPO 的 clipping reference 搞坏了。
+\end{warnbox}
+
+\subsubsection{4.2 正确做法：保留 step ratio，额外乘一个 sequence-level correction}
+
+OP-GRPO 的解决方案是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 每个 timestep 内部，仍然保留原来那个 \(p_{\theta}/p_{\mathrm{old}}\) 的 step ratio，让 clipping 继续对准当前 update 的起点。
+  \item 在整个 loss 外层，再乘一个 trajectory-level 的分布修正因子，补偿 \(\pi_{\mathrm{off}}\) 和 \(\pi_{\mathrm{old}}\) 的采样分布差异。
+\end{enumerate}
+
+它的目标写成：
+
+\[
+\mathcal{J}_{\mathrm{OP\mbox{-}GRPO}}(\theta)
+=
+\mathbb{E}
+\left[
+\frac{P_{\pi_{\mathrm{old}}}(\tau)}{P_{\pi_{\mathrm{off}}}(\tau)}
+\cdot
+f(r, \hat{A}, \theta, \epsilon, \beta)
+\right],
+\]
+
+其中 sequence-level correction 是：
+
+\[
+\frac{P_{\pi_{\mathrm{old}}}(\tau)}{P_{\pi_{\mathrm{off}}}(\tau)}
+=
+\prod_{t=1}^{T}
+\frac{p_{\theta_{\mathrm{old}}}(z_{t-1}^i \mid z_t^i, c)}{p_{\theta_{\mathrm{off}}}(z_{t-1}^i \mid z_t^i, c)}.
+\]
+
+这里的 \(f(r,\hat{A},\theta,\epsilon,\beta)\) 就是普通 GRPO 那个 clipped objective。
+
+\subsubsection{4.3 这个设计为什么成立}
+
+这个式子有两个非常直观的好处。
+
+第一，\textbf{clipping 的语义被保住了}。因为 step-level ratio 还是比较 \(p_{\theta}\) 和 \(p_{\mathrm{old}}\)，所以 clipped / unclipped 仍然准确表示 ``本轮 update 是否太激进''。
+
+第二，\textbf{off-policy correction 只有在样本没有被 clip 掉时才真正发挥作用}。这就像一个 ``先过安全检查，再纠偏'' 的机制：
+
+\[
+\text{先确认更新幅度不过激}
+\rightarrow
+\text{再让历史轨迹参与无偏校正}.
+\]
+
+结果是，论文报告被 clip 的 off-policy 样本比例从 over 40\% 降到 \textbf{11.8\%}。
+
+\begin{summarybox}
+\textbf{我认为这是本文最聪明的一点：} 它不是把 off-policy 问题粗暴地塞进每个 timestep，而是承认 ``当前 update 稳不稳定'' 和 ``历史分布偏不偏'' 是两个层级不同的问题，所以分别在 step-level 和 sequence-level 处理。
+\end{summarybox}
+
+\subsection{5. 方法三：Late-step Trajectory Truncation}
+
+即便有了 sequence-level correction，论文仍然观察到一个严重现象：late denoising steps 的 off-policy ratio 依旧会出问题。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.96\linewidth]{opgrpo/fig2_logprob_truncation.png}
+  \caption{On-policy 和 off-policy 样本在不同 denoising steps 上的 log-probability 变化。虚线表示 truncation 的起始位置。图源：arXiv HTML。}
+  \label{fig:opgrpo-logprob-truncation}
+\end{figure}
+
+\subsubsection{5.1 经验现象：最后几步会出现 cliff-like drop}
+
+论文把 on-policy 和 off-policy 样本沿着 denoising trajectory 的 log-probability 画出来，发现 off-policy 曲线在大多数 steps 都还相对平稳，但到了最后几个低噪声 steps，会出现非常陡的 cliff-like drop。
+
+这意味着问题不是 ``整条轨迹 uniformly off-policy''，而是 \textbf{late steps 特别病态}。
+
+\subsubsection{5.2 理论原因：当噪声趋近于 0 时 transition 近乎 deterministic}
+
+论文把 transition log-probability 写成显式 Gaussian 形式：
+
+\[
+\log p_{\theta}(z_{t-1}^i \mid z_t^i, c)
+=
+\log \mathcal{N}(z_{t-1}^i; \mu_t, \sigma_t)
+=
+-\frac{(z_{t-1}^i-\mu_t)^2}{2\sigma_t^2}
+-\log \sigma_t
+-\frac{1}{2}\log(2\pi).
+\]
+
+当 \(\sigma \to 0\) 时，transition variance \(\sigma_t^2\) 迅速变小，过程越来越接近 deterministic。此时上式里那个除以 \(\sigma_t^2\) 的二次项会变得极其敏感，任何一点离散化误差、policy mismatch、数值波动，都会被放大成巨大的 log-probability 差异。
+
+所以这里的问题不是普通意义上的 ``history sample 有点旧''，而是：
+
+\[
+\text{flow model 在低噪声尾部的 transition 本来就极尖锐，}
+\text{off-policy mismatch 在这里会被数值上放大。}
+\]
+
+\subsubsection{5.3 解法：只复用前半段 off-policy 轨迹，后半段重新采样}
+
+OP-GRPO 直接采用 truncation：只使用 off-policy trajectory 到某个截断步 \(t_{\mathrm{off}}\)，之后剩余的 late steps 由当前策略重新生成：
+
+\[
+\tau_m
+=
+\Big\{z_i^{\mathrm{off}}\Big\}_{i=T}^{t_{\mathrm{off}}}
+\cup
+\Big\{z_j\Big\}_{j=t_{\mathrm{off}}}^{0}.
+\]
+
+也就是说，这条 mixed-policy trajectory 的前半段来自历史轨迹，后半段换成当前 policy 接着走。
+
+这个设计有两个含义：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 早中期的高价值语义结构仍然被复用了。
+  \item 最数值病态的低噪声尾部，不再强行做 off-policy correction。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{直觉版：} OP-GRPO 的态度不是 ``整条旧轨迹都可信''，而是 ``旧轨迹在高噪声到中噪声阶段大体还值得借鉴，但越到最后越应该交还给当前 policy 自己完成''。
+\end{intubox}
+
+论文进一步主张：late denoising steps 对最终感知质量的边际贡献相对更小，所以把 off-policy 使用截在这里，对质量影响很有限，但对稳定性帮助很大。
+
+\subsection{6. 实验设置}
+
+\subsubsection{6.1 模型}
+
+论文在两个 backbone 上评估：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Stable-Diffusion-3.5-medium}（SD3.5-M），用于图像生成实验。
+  \item \textbf{Wan2.1-1.4B}，用于视频生成实验。
+\end{itemize}
+
+\subsubsection{6.2 任务}
+
+图像部分有三类任务：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Compositional Image Generation：} 关注对象数量、颜色、空间关系等组合约束，主要指标是 EvalGen / GenEval。
+  \item \textbf{Visual Text Rendering：} 关注图中显式文字渲染能力，主要指标是 OCR 规则识别准确率。
+  \item \textbf{Human Preference Alignment：} 关注和人类审美偏好的对齐，训练 reward 用 PickScore。
+\end{enumerate}
+
+视频部分则在 \textbf{visual text generation / OCR} 任务上测试可扩展性。
+
+\subsubsection{6.3 泛化评测}
+
+为了验证它不是只会刷单一 reward，论文还汇报了多个 unseen metrics：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 图像质量：Aesthetic Predictor、DeQA。
+  \item 偏好打分：ImageReward、PickScore、UnifiedReward。
+\end{itemize}
+
+这点很重要，因为 off-policy replay 很容易被担心会过拟合当前 reward model；作者专门用 cross-task / cross-metric 评测来回应这个问题。
+
+\subsection{7. 主要结果：效率、图像、视频、泛化}
+
+\subsubsection{7.1 训练效率是最强结论}
+
+论文最核心的 headline result 是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item OP-GRPO 总训练步数是 1150，而 Flow-GRPO 是 1600。
+  \item OP-GRPO 平均只需要 \textbf{34.2\%} 的训练步，就能达到 Flow-GRPO 的最终性能。
+  \item 最终性能平均还比 Flow-GRPO 高 \textbf{1.17\%}。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{opgrpo/fig3_training_curves.png}
+  \caption{OP-GRPO 与 Flow-GRPO 的训练曲线。论文用这张图展示在三个图像任务和一个视频任务上，OP-GRPO 都能更快达到基线最终性能。图源：arXiv HTML。}
+  \label{fig:opgrpo-training-curves}
+\end{figure}
+
+这说明 replay buffer 在这里不是只带来一点点方差下降，而是真的让 \textbf{达到同一目标所需的探索-优化回合数} 明显减少了。
+
+\subsubsection{7.2 图像任务：中期收益尤其明显}
+
+我把最重要的 task metric 单独摘出来看，会更清楚：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+\textbf{任务} & \textbf{Flow 中间} & \textbf{OP 中间} & \textbf{Flow 最好} & \textbf{OP 最好}\\
+\midrule
+Compositional Image Generation & 0.68 @ 1020 & 0.88 @ 1020 & 0.95 & 0.96\\
+Visual Text Rendering & 0.70 @ 720 & 0.81 @ 720 & 0.92 & 0.93\\
+Human Preference Alignment & 22.19 @ 720 & 23.27 @ 720 & 23.32 & 23.64\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+从这张表能直接看出两个模式：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{中间 checkpoint 提前拉开差距。} 这最符合 sample efficiency 的主张，因为 OP-GRPO 在训练还没跑完时就已经更强。
+  \item \textbf{最好结果基本不掉，甚至略涨。} 这说明 off-policy reuse 没有用效率换上限。
+\end{enumerate}
+
+更细一点地看，三项任务的中期收益都相当大：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 组合生成从 0.68 提到 0.88，提升非常明显，说明 buffer 对 ``稀有但高质量的 compositional success case'' 特别有帮助。
+  \item 文本渲染从 0.70 提到 0.81，说明 replay 对视觉文字这种难任务也有增益。
+  \item 偏好对齐从 22.19 提到 23.27，连 Aesthetic、DeQA、ImageReward 等 cross-metric 也同步上升，说明不是只把 PickScore 刷高了。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{opgrpo/fig4_image_results.png}
+  \caption{SD3.5-M 上三类图像任务的质性结果。论文用这些案例说明 OP-GRPO 在组合约束、可读文本和偏好质量上都更早表现出优势。图源：arXiv HTML。}
+  \label{fig:opgrpo-image-results}
+\end{figure}
+
+质性图也和定量结论一致：组合任务里对象数量和属性更准，文字渲染更清楚，人类偏好任务里细节和整体语义一致性更好。
+
+\subsubsection{7.3 泛化：不像 reward hacking}
+
+如果 off-policy replay 只是帮助模型更快记住当前 reward 的漏洞，我们通常会看到 task metric 上升，但 unseen metrics 下降。
+
+而这篇的结果不是这样。以组合生成任务为例，在 1020 step 时，虽然 OP-GRPO 的主指标比 Flow-GRPO 高很多（0.88 vs. 0.68），但 Aesthetic、DeQA、PickScore、UnifiedReward 也整体保持竞争力，最好 checkpoint 下 UnifiedReward 还从 3.51 提到 3.57。
+
+作者还在更难的 \textbf{T2I-CompBench++} 上做了扩展验证：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 中间 checkpoint average：Flow-GRPO 0.520，OP-GRPO \textbf{0.567}。
+  \item 最好 checkpoint average：Flow-GRPO 0.573，OP-GRPO \textbf{0.579}。
+\end{itemize}
+
+这个结果我会更看重中间值，因为它更直接体现 ``更快学会组合约束''，而不是只在训练末期略微抬高 ceiling。
+
+\subsubsection{7.4 视频任务：难任务上收益更明显}
+
+视频实验更能说明问题，因为它更难、成本更高、也更依赖 bootstrap。
+
+论文在 Wan2.1-1.4B 的 OCR 任务上报告：OP-GRPO 只用 \textbf{30.1\%} 的训练时间，就达到 Flow-GRPO 的最终性能，而且最终质量还更好。
+
+作者给出的解释也很合理：难任务下，纯 on-policy 方法经常是 ``偶尔撞到一次高质量样本，但马上丢掉''，所以很难持续强化正确模式；而 off-policy replay 恰好能把这些稀有但关键的 trajectories 留下来反复利用。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{opgrpo/fig5_video_results.png}
+  \caption{Wan2.1-1.4B 上视频 OCR 任务的质性结果。论文用这些例子展示 OP-GRPO 在更困难的视频文字生成上也能明显优于 Flow-GRPO。图源：arXiv HTML。}
+  \label{fig:opgrpo-video-results}
+\end{figure}
+
+\subsection{8. Ablation 与我的判断}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{opgrpo/fig6_ablation.png}
+  \caption{OP-GRPO 的消融实验。左图比较去掉 sequence correction 或 truncation 后的稳定性，右图比较不同 off-policy 比例下的收敛速度与稳定性。图源：arXiv HTML。}
+  \label{fig:opgrpo-ablation}
+\end{figure}
+
+\subsubsection{8.1 三个模块不是独立加分项，而是相互依赖}
+
+消融最值得记住的结论是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 去掉 \textbf{sequence correction}，训练会明显不稳定，甚至发散。
+  \item 去掉 \textbf{truncation}，同样会出现显著 instability。
+\end{itemize}
+
+这说明 replay buffer 本身并不神奇。真正让它可用的是：
+
+\[
+\text{replay}
+\quad + \quad
+\text{distribution correction}
+\quad + \quad
+\text{late-step stabilization}
+\]
+
+也就是说，这篇论文不是 ``buffer matters'' 那种单点工程 tweak，而是一个完整的 off-policy recipe。
+
+\subsubsection{8.2 off-policy 比例不是越高越好}
+
+作者还测了 off-policy sample proportion 的影响：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 5\% 的 off-policy 比例也能带来 \textbf{23.1\%} 的收敛加速。
+  \item 更高比例会更快，但也更不稳定，甚至可能发散。
+\end{itemize}
+
+这和方法设计完全一致。因为 off-policy 的收益来自复用高价值样本，但风险也来自分布偏移；所以最好的区间一定是一个折中，而不是 ``越多 replay 越好''。
+
+\begin{summarybox}
+\textbf{我的判断：} OP-GRPO 真正揭示的是一个 ``可用的 off-policy 窗口''。buffer 太弱，收益不明显；buffer 太强，distribution shift 和 late-step numeric issue 会反噬训练。它通过 decay、sequence correction 和 truncation，把这个窗口撑开到一个工程上可用的范围。
+\end{summarybox}
+
+\subsubsection{8.3 我认为它的局限}
+
+这篇工作很强，但也有边界：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 它的 buffer prioritization 基本只看 reward，高 reward 不一定等于最有训练价值。
+  \item 同一个 prompt 最多保留一条 trajectory，这保证了多样性，但也可能损失 ``同 prompt 下多条不同成功模式'' 的复用机会。
+  \item truncation 在这篇的 image/video 任务上成立，但如果未来任务更依赖最终精细局部控制，\(t_{\mathrm{off}}\) 可能需要重新调。
+  \item 论文目前只验证到 image / video；扩展到 audio、3D、长程世界模型还没有证据。
+\end{enumerate}
+
+\subsection{9. 它和 Flow-GRPO / DenseGRPO / PCPO 的关系}
+
+可以把几篇论文放在一张图里理解：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lll}
+\toprule
+\textbf{论文} & \textbf{主要改哪里} & \textbf{核心问题}\\
+\midrule
+Flow-GRPO & on-policy GRPO baseline & 让 flow model 能做 GRPO 后训练\\
+DenseGRPO & advantage / reward side & 最终 reward 应该怎样分给不同 steps\\
+PCPO & ratio / objective scale side & step ratio 是否隐式偏向某些 timesteps\\
+OP-GRPO & data reuse / off-policy correction side & 历史高质量轨迹能否安全复用\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+它们之间的关系我会这样记：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{和 Flow-GRPO：} OP-GRPO 直接建立在 Flow-GRPO 上，reward 形式、group-relative advantage 和 clipped GRPO 骨架都没变，变的是数据来源和分布校正。
+  \item \textbf{和 DenseGRPO：} DenseGRPO 回答 ``同一条 trajectory 里，哪个 step 贡献大''；OP-GRPO 回答 ``旧 trajectory 能不能再用''。两者是明显正交的，理论上完全可以组合。
+  \item \textbf{和 PCPO：} PCPO 研究的是 on-policy 情况下，flow SDE ratio 自带的 timestep weight 是否失衡；OP-GRPO 研究的是 off-policy 情况下，ratio / logprob 在 late steps 为什么会数值病态，以及如何校正。两篇都碰 ratio side，但关心的问题不同。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{我最后会这样概括：} DenseGRPO / PCPO 更像是在问 ``同样一批样本，怎么学得更准''；OP-GRPO 问的是 ``已经花大代价采出来的样本，能不能别只学一次''。如果后面要继续看 E-GRPO、MaskFocus、LeapAlign，这篇就是整条 ``采样效率'' 支线的第一个支点。
+\end{summarybox}

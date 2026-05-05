@@ -1,0 +1,288 @@
+\subsection*{Idea：Latent Forcing 如何加速高分辨率 Pixel Diffusion}
+\phantomsection
+\addcontentsline{toc}{subsection}{Idea：Latent Forcing 如何加速高分辨率 Pixel Diffusion}
+
+\begin{conceptbox}
+\textbf{核心问题：} 能不能利用 deterministic representation latents 加速 $1K+$ pixel diffusion 的训练，但最终仍然直接生成 raw pixels，不依赖 VAE decoder，也不走低分辨率到高分辨率的 cascade？\\
+\textbf{当前判断：} 这个方向真正要抓的是 \textbf{generation order}，不是 resolution pyramid。Latent Forcing 的价值在于：把 representation latent 放进 diffusion trajectory，让模型先生成更容易的结构化表示，再生成高维像素细节。latent 是 inference-time scratchpad，最后丢掉。
+\end{conceptbox}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\linewidth]{latent_forcing/fig1_concept.jpg}
+  \caption{Latent Forcing 的核心直觉。横轴是 pixel timestep，纵轴是 latent timestep，图里比较的不是“低分辨率图到高分辨率图”，而是不同变量在 diffusion trajectory 里变 clean 的顺序。绿色轨迹先让 latent 变得有信息，再让 pixels 生成细节；红色轨迹是纯 pixel diffusion，模型要直接从像素噪声里学结构。图源：arXiv HTML。}
+\end{figure}
+
+\subsubsection*{1. 先把问题摆正}
+
+这个 idea 不是“先生成低分辨率图，再生成高分辨率图”。这条路已经有很多工作做过，比如 cascaded diffusion、Matryoshka Diffusion Models、PixelFlow 里的 cascade flow，以及各种 high-resolution pixel-space architecture。它们解决的是高分辨率生成的分解问题：先低频、后高频；先小图、后大图；先全局、后局部。
+
+我真正想研究的是另一个问题：\textbf{pixel diffusion 直接在 $1K$ 甚至更高分辨率 raw pixels 上训练时，能不能借助 representation latents 改善优化轨迹，让训练更快、更稳？}
+
+也就是说，最终输出仍然是 pixels：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+final output: raw pixels
+not output: VAE latent decoded by a decoder
+not output: low-res image upsampled / refined to high-res
+\end{lstlisting}
+
+latent 的角色不是图像压缩格式，而是中间计算变量：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+x = high-resolution raw pixels
+y = f(x), deterministic representation latent
+
+train joint diffusion over (x, y)
+generate y earlier than x
+discard y at the end
+\end{lstlisting}
+
+所以这张图对我的 idea 很重要：它把“加速”画成了\textbf{轨迹难度下降}，不是把图像空间换成低维 latent space。最终图像仍然由 pixel branch 产生；latent 只是让模型在早期先拿到更稳定的结构坐标。
+
+\subsubsection*{2. 过往工作怎么走到 Latent Forcing}
+
+\textbf{Latent Diffusion / VAE tokenizer 路线。}
+
+Latent Diffusion 的基本逻辑是：先用 VAE/VQ tokenizer 把图像压到 latent space，在 latent space 训练 diffusion，最后通过 decoder 回到 pixel。它的优势很明显：token 数少、训练便宜、收敛快。但代价也很明显：encoder 会丢信息，decoder 是单独训练的，模型最终优化的是辅助 latent distribution，不是 raw image distribution。
+
+这个路线长期存在一个 reconstruction-generation tradeoff：tokenizer 越保真，latent 越难生成；tokenizer 越 lossy，diffusion 越容易，但图像上限被 decoder 和重建误差限制。小字、人脸、高频纹理、透明边界这类细节特别容易被 tokenizer 阶段提前牺牲。
+
+\textbf{Pixel Diffusion 回归路线。}
+
+Pixel diffusion 想绕开这个问题：不压缩，不解码，直接在 raw pixels 上建模。过去它难，是因为像素空间维度太高，训练容易失败，尤其是 Transformer 直接预测 noise 或 velocity 时，目标不在自然图像流形上。
+
+JiT 的关键贡献是把目标改成 clean data prediction，也就是让模型直接预测 denoised image，再用 v-loss weighting 平衡训练。这样 plain Transformer 可以直接在 pixel space 工作。PixelFlow、Matryoshka Diffusion、HDiT、SiD2 等工作则从不同角度证明：pixel-space generation 不是不可行，关键在 architecture、schedule 和训练目标。
+
+\textbf{Representation Alignment 路线。}
+
+REPA 提供了另一个重要线索：diffusion model 训练慢，部分原因是它要自己学出好的 visual representation。REPA 用 DINOv2 等 pretrained visual encoder 的 clean representation 去对齐 diffusion hidden states，大幅提升训练效率。
+
+但 REPA 的 representation 主要是 training-time auxiliary signal。推理时，模型并不会显式生成这些 representation。换句话说，REPA 告诉模型“训练时你应该像 DINO 那样组织特征”，但没有把 representation 放进生成轨迹本身。
+
+\textbf{RAE / REG / Latent Forcing 的位置。}
+
+RAE 把 pretrained representation encoder 和 decoder 组成新的 autoencoder，让 diffusion 在更语义化的 latent space 里训练。它比传统 VAE 更强，但仍然需要 decoder，所以仍是 latent diffusion 家族。
+
+REG 更进一步，把高层语义 token 放进 denoising，让 semantic token 在推理时也参与生成。Latent Forcing 则更系统地把这个想法写成 multi-time diffusion：pixels 和 representation latents 同时作为 diffusion variables，每个变量有自己的 time schedule。
+
+\Needspace{18\baselineskip}
+\begin{intubox}
+这条线可以这样理解：REPA 是 training-time representation alignment；RAE 是 representation autoencoding；REG 是 semantic token entanglement；Latent Forcing 是 trajectory-level representation generation。
+\end{intubox}
+
+\subsubsection*{3. Latent Forcing 的核心机制}
+
+Latent Forcing 设定里有两个变量：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+x = pixels
+y = f(x), e.g. DINOv2 / Data2Vec2 representation
+\end{lstlisting}
+
+注意，$y$ 是从 $x$ 确定性算出来的，不是人工标签，也不是另一个生成模型采样得到的东西。因此联合建模 $(x,y)$ 并没有改变最终目标分布。最后只要保留 $x$，丢掉 $y$，模型仍然是在生成 raw pixels。
+
+训练时分别对两种变量加噪：
+\[
+x_{t_x} = t_x x + (1-t_x)\epsilon_x,
+\qquad
+y_{t_y} = t_y y + (1-t_y)\epsilon_y .
+\]
+
+模型输入是：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+noised pixels, noised latents, pixel timestep, latent timestep
+\end{lstlisting}
+
+模型输出则同时预测 clean pixels 和 clean latents。关键不是“多一个 loss”，而是 $t_x$ 和 $t_y$ 可以不同。Latent Forcing 让 representation latent 比 pixels 更早 denoise：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+early trajectory:   latent becomes informative first
+later trajectory:   pixels use latent structure to generate detail
+final:              discard latent, keep pixels
+\end{lstlisting}
+
+这就是它和 REPA 的根本区别。REPA 是把 representation 当监督信号；Latent Forcing 是把 representation 当生成过程的一部分。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.94\linewidth]{latent_forcing/fig2_architecture.jpg}
+  \caption{Latent Forcing 对 DiT 的改动其实很克制。左侧把 noised pixels 和 noised latents 都 patchify、embed，然后把同位置的 embedding 相加，所以 transformer token 数没有翻倍；中间把 $t_{\text{pixel}}$ 和 $t_{\text{latent}}$ 一起送入 adaLN；右侧可以把最后几层拆成 pixel output expert 和 latent output expert。图源：arXiv HTML。}
+\end{figure}
+
+这张架构图也解释了为什么它适合作为 high-resolution pixel diffusion 的加速思路：它不是额外接一个大 decoder，也不是在 latent space 里替代 pixel generation，而是在同一个 DiT 里把 representation latent 作为一个额外的生成变量。对高分辨率版本来说，真正需要重新设计的地方会是 latent resolution、patch 对齐方式、两个 timestep 的 schedule，以及 output head / expert 是否足够承载 pixel 和 latent 两个预测目标。
+
+\subsubsection*{4. 为什么这可能加速高分辨率 Pixel Diffusion}
+
+$1K+$ pixel diffusion 的难点不是模型不能表达像素，而是优化路径太难。早期 timestep 里，模型面对的是巨大维度的 pixel noise。它既要猜全局布局，又要猜对象结构，还要学局部纹理和高频细节。直接从 raw pixel noise 中学出语义结构，样本效率很低。
+
+representation latent 的优势是：它通常更接近结构化语义空间。比如 DINOv2 patch tokens 会保留对象、部件和空间结构；SigLIP 更贴近 text-image alignment；MAE 或 reconstruction-oriented features 可能更保留局部结构。Latent Forcing 的想法是先让这些 representation 变得 informative，再让 pixel branch 生成细节。
+
+这里的关键不是降低 pixel 分辨率，而是改变信息出现顺序：
+\[
+\text{semantic/spatial representation first}
+\quad \rightarrow \quad
+\text{raw pixels later}.
+\]
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.94\linewidth]{latent_forcing/fig4_same_psnr.jpg}
+  \caption{同样的 pixel PSNR 下，DINOv2 latent 预测比 pixel-only 预测更早保住了对象轮廓和空间结构。上排 pixel reconstruction 在低 PSNR 时更像局部颜色块；下排 DINO reconstruction 即使模糊，也能更早呈现狗的姿态和脸部位置。图源：arXiv HTML。}
+\end{figure}
+
+\Needspace{18\baselineskip}
+\begin{intubox}
+\textbf{PSNR 是什么。} PSNR 全称是 Peak Signal-to-Noise Ratio，通常用来衡量一张重建图 $\hat{x}$ 和真实图 $x$ 的 pixel-level reconstruction fidelity。先算均方误差：
+\[
+\operatorname{MSE}(x,\hat{x})
+=
+\frac{1}{N}\sum_{i=1}^{N}(x_i-\hat{x}_i)^2 .
+\]
+再把误差转成对数尺度：
+\[
+\operatorname{PSNR}
+=
+10\log_{10}\frac{\operatorname{MAX}^2}{\operatorname{MSE}}
+=
+20\log_{10}\operatorname{MAX}-10\log_{10}\operatorname{MSE}.
+\]
+如果图像归一化到 $[0,1]$，通常 $\operatorname{MAX}=1$。PSNR 越高，说明 pixel MSE 越小。但它不直接衡量语义结构：两张图可以有相同 PSNR，一张保住对象轮廓，另一张只是局部颜色更接近。所以上面这张图的重点是：\textbf{同样 pixel 误差水平下，DINO latent 更早保住了结构信息。}
+\end{intubox}
+
+从 optimization 角度看，这会把 pixel branch 的任务从“在纯噪声中自己发现结构”，变成“在已经形成的 representation structure 上生成像素”。这就是我认为它能加速 high-resolution pixel diffusion training 的原因。
+
+\begin{warnbox}
+不能把这个 idea 讲成 coarse-to-fine resolution training。正确说法是：\textbf{用 representation latents 重排 diffusion trajectory 中的信息揭示顺序，从而降低 high-dimensional pixel denoising 的优化难度。}
+\end{warnbox}
+
+\subsubsection*{5. 可以做创新的几个切口}
+
+\textbf{第一，什么 latent 最适合加速 pixel diffusion？}
+
+Latent Forcing 默认用 DINOv2，也试了 Data2Vec2 和 downsampled pixels。但如果目标是 $1K+$ pixel diffusion，latent 不一定越语义越好。iREPA 这类工作提醒我们，generation 里很重要的可能不是 global semantic accuracy，而是 patch-level spatial structure。
+
+所以可以系统比较：
+\begin{itemize}[leftmargin=1.5em]
+  \item DINOv2 deep features：强对象语义和空间结构；
+  \item SigLIP features：更适合 text-conditioned generation；
+  \item MAE features：更偏 reconstruction，可能更适合局部结构；
+  \item shallow / mid / deep 多层 features：把边缘、部件、语义拆开；
+  \item spatial-structure-preserving features：不追求分类强，而追求 patch relation 稳定。
+\end{itemize}
+
+\textbf{第二，schedule 不应该照搬 256 ImageNet。}
+
+Latent Forcing 主要验证在 ImageNet $256$。到 $1K$ 以后，pixel dimension、patch token 数、低频/高频比例、文本条件复杂度都变了。可能需要重新设计：
+\begin{itemize}[leftmargin=1.5em]
+  \item latent 要提前多少；
+  \item 是否完全 cascaded；
+  \item latent 和 pixel 是否需要 overlap；
+  \item 多层 latent 是否应该有不同 schedule；
+  \item 高分辨率细节阶段是否还需要 latent dropout / latent noise。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.94\linewidth]{latent_forcing/fig3_trajectories.jpg}
+  \caption{不同 $t_{\text{DINO}}$ 与 $t_{\text{pixel}}$ 轨迹的 FID-10K。颜色越黄 FID 越低；图里表现好的路径都有一个共同点：DINO latent 走在 pixel 前面，先变 clean。左图像 variance-shifted schedule，右图像 linear-offset schedule。图源：arXiv HTML。}
+\end{figure}
+
+\begin{intubox}
+\textbf{FID 是什么。} FID 全称是 Fréchet Inception Distance，用来比较生成图像集合和真实图像集合的 distribution-level distance。做法不是逐张图对齐，而是先用一个固定的 Inception 网络把真实图和生成图都映射到 feature space，然后分别估计两个高斯分布：
+\[
+(\mu_r,\Sigma_r)
+\quad\text{and}\quad
+(\mu_g,\Sigma_g).
+\]
+FID 定义为：
+\[
+\operatorname{FID}
+=
+\|\mu_r-\mu_g\|_2^2
++
+\operatorname{Tr}\left(
+\Sigma_r+\Sigma_g-2(\Sigma_r\Sigma_g)^{1/2}
+\right).
+\]
+FID 越低，说明生成分布在 Inception feature space 里越接近真实分布。FID-10K 通常表示用 $10K$ 张生成样本来估计这个距离。它比 PSNR 更适合看 generative quality，但也不是完美指标：它依赖 feature extractor、样本数和真实集统计，而且不能解释某一张图为什么好或坏。
+\end{intubox}
+
+这张图给我的启发是：schedule 不是形式问题，而是方法本体。Latent Forcing 的收益不只是“加了 DINO loss”，而是让模型在采样轨迹中先形成 DINO 结构，再让 pixel 追上来。因此做 $1K+$ 时，最值得系统扫的不是单个 latent 类型，而是 latent 提前量、overlap 区间、以及 pixel 什么时候开始强依赖 latent。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.94\linewidth]{latent_forcing/fig5_psnr_heatmap.jpg}
+  \caption{PSNR heatmap 用来观察两个变量互相提供信息的区域。一个值得注意的细节是：pixel 信息几乎总能帮助 DINO latent 预测；但当 pixel 已经比较 clean 时，DINO 对 pixel 的额外帮助会变小。这提示 high-res 版本不一定要让 latent 一直强控到最后，后段可能应该逐步把自由度还给 pixels。图源：arXiv HTML。}
+\end{figure}
+
+\textbf{第三，把 REPA 从 auxiliary loss 推到 trajectory variable。}
+
+可以设计一个很清楚的对照：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+Baseline:        pure pixel diffusion
+REPA:            pixel diffusion + training-time representation alignment
+Latent Forcing:  pixel diffusion + generated representation latent
+Hybrid:          generated representation latent + light REPA alignment
+\end{lstlisting}
+
+如果 Latent Forcing 在同等 compute 下比 REPA 更持久地加速，说明 representation 不只是训练监督，而是应该进入生成轨迹。
+
+\textbf{第四，多层 representation ordering。}
+
+单一 DINOv2 latent 可能太粗。更自然的 high-res 版本是：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+deep semantic latent      denoise earliest
+mid-level structure       denoise next
+local/spatial latent      denoise next
+raw pixels                denoise last
+\end{lstlisting}
+
+这不是 image pyramid，因为每一层不是不同分辨率图像，而是不同抽象层级的 representation。它更像 continuous latent chain-of-thought for image generation。
+
+\subsubsection*{6. 最小实验设计}
+
+我觉得第一步不该直接冲 $1K$ 大模型，而是先证明机制：
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item 在 ImageNet $256$ 或一个小规模高质量数据集上复现 JiT-style pixel diffusion baseline；
+  \item 加 REPA，得到 training-time alignment baseline；
+  \item 加 Latent Forcing：DINOv2 latent 作为 generated variable，latent 先于 pixel denoise；
+  \item 比较 convergence speed：同等 step 下 FID / IS / precision-recall；
+  \item 比较结构指标：对象布局、patch relation、低频结构稳定性；
+  \item 再把分辨率推到 $512$，看收益是否更明显；
+  \item 最后再到 $1K$，重点观察 sample efficiency 和高频细节质量。
+\end{enumerate}
+
+如果资源有限，先做一个很小的消融也有价值：
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+DINOv2 latent earlier
+DINOv2 latent same schedule as pixels
+DINOv2 latent later than pixels
+REPA only
+no latent / pure pixel
+\end{lstlisting}
+
+这组实验能直接回答：收益到底来自 representation 本身，还是来自 ordering。
+
+\subsubsection*{7. 当前最清晰的研究假设}
+
+\begin{summarybox}
+在 $1K+$ pixel-space diffusion 中，显式生成 deterministic representation latents，并让这些 latents 在 diffusion trajectory 中先于 raw pixels 变得 informative，可以在不引入 VAE decoder 和 reconstruction ceiling 的前提下，加速 pixel diffusion 训练，并提升结构一致性。
+\end{summarybox}
+
+这个方向可以暂时命名为：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Representation-Ordered Pixel Diffusion}
+  \item \textbf{High-Resolution Latent Forcing}
+  \item \textbf{Trajectory-Level Representation Guidance}
+\end{itemize}
+
+\subsubsection*{8. 相关论文}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \href{https://arxiv.org/abs/2602.11401}{Latent Forcing: Reordering the Diffusion Trajectory for Pixel-Space Image Generation}
+  \item \href{https://arxiv.org/abs/2511.13720}{JiT / Back to Basics: Let Denoising Generative Models Denoise}
+  \item \href{https://arxiv.org/abs/2410.06940}{REPA: Representation Alignment for Generation}
+  \item \href{https://arxiv.org/abs/2510.11690}{Diffusion Transformers with Representation Autoencoders}
+  \item \href{https://arxiv.org/abs/2512.10794}{What matters for Representation Alignment: Global Information or Spatial Structure?}
+  \item \href{https://arxiv.org/abs/2507.01467}{Representation Entanglement for Generation}
+  \item \href{https://arxiv.org/abs/2310.15111}{Matryoshka Diffusion Models}
+  \item \href{https://arxiv.org/abs/2504.07963}{PixelFlow: Pixel-Space Generative Models with Flow}
+\end{itemize}
