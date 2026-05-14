@@ -1,0 +1,355 @@
+% ============================================================
+% Paper deep reading: POPO
+% Source: https://arxiv.org/abs/2605.06650
+% ============================================================
+
+\section{论文精读：POPO}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2605.06650}{Beyond Negative Rollouts: Positive-Only Policy Optimization with Implicit Negative Gradients}\\
+\textbf{作者/机构：} Mingwei Xu, Hao Fang（共同一作，University of Washington, Seattle）\\
+\textbf{简称：} POPO。\\
+\textbf{版本：} arXiv 2605.06650v1，COLM 2026 投稿版。\\
+\textbf{代码：} \href{https://github.com/momo1443/colm2026-POPO}{momo1443/colm2026-POPO}。\\
+\textbf{方向标签：} RLVR、LLM Reasoning、GRPO、Positive-Only Optimization、Implicit Negative Gradient、Siamese Policy、EMA。\\
+\textbf{阅读日期：} 2026-05-09。\\
+\textbf{阅读口径：} 这篇不在 Flow-GRPO 视觉生成主线上，但和 \key{egrpo / opgrpo / densegrpo} 共享一个上层问题——\textbf{RL 信号到底从哪里来、由谁来惩罚错误轨迹}。POPO 给的答案非常激进：在 RLVR 里干脆 \textbf{不显式使用负样本}，让负梯度从 softmax 概率守恒中自动涌现。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+POPO 的核心判断是：在二值可验证奖励（RLVR）下，GRPO 显式拿负 rollout 去算 advantage，其实是在用一个 \key{严重欠采样、且本身没有失败程度区分} 的负样本集合制造梯度噪声。它选择的替代路线是：
+
+\[
+\begin{aligned}
+\text{POPO}
+&= \text{仅在正 rollout 上做有界重要性采样}\\
+&\quad + \text{Siamese 策略 + EMA 动量更新}\\
+&\quad + \text{表征空间余弦相似度惩罚（替代 KL）}.
+\end{aligned}
+\]
+
+它在 Qwen-Math、R1-Distill 1.5B/7B 和 Llama-3.1-8B 上都打过 GRPO/DAPO/Dr.~GRPO/SAPO，AIME 2025 在 Qwen-Math-7B 上从 30.00\% 提到 36.67\%（绝对 +6.67 pp，相对 +22\%）。
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇值得精读。它的真正贡献不是 ``少采点负样本省钱'' 这种工程优化，而是 \key{从 softmax Jacobian 出发证明：只要在正样本集合内自归一化，负 logit 的梯度就严格为正}。换句话说，``罚错误'' 这件事并不需要显式去采错误样本，而是 softmax 概率守恒的直接副产品。这一点和 NGRPO 的 ``加强负样本'' 路线正好相反，但又在数学上自洽。
+\end{summarybox}
+
+\subsection{1. 为什么读这篇}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{和当前主线的关系：} 我在 post-training 主线上已经记了 DenseGRPO（reward 怎么分到每一步）、OP-GRPO（旧轨迹复用）、E-GRPO（哪些 step 值得探索）。POPO 是 \key{rollout 侧} 的另一个极端问题：到底要不要显式用错的 rollout？
+  \item \textbf{它可能补上的知识缺口：} 之前我对 GRPO 的负样本一直有个隐约的疑问——失败答案的语义空间巨大，组内随机采到的几条 wrong rollouts 真的能代表 ``错误方向''吗？POPO 直接给了一个 ``根本不需要它们'' 的回答，并且配了证明。
+  \item \textbf{我希望读完回答的问题：}
+  \begin{itemize}[leftmargin=1.5em]
+    \item 仅靠正样本，负方向梯度从哪里来？
+    \item 没有 KL 怎么防 policy drift？
+    \item 它和 NGRPO/SAPO/DAPO 这些 ``强化负样本'' 方法是不是真矛盾？
+  \end{itemize}
+\end{itemize}
+
+\subsection{2. 问题定义与背景}
+
+\textbf{问题：} RLVR 设定下，奖励是二值的（验证器判对/错），训练目标是用 RL 提升 LLM 在数学推理等任务上的 pass@k。
+
+\textbf{输入/输出：} 输入是 prompt $x$，模型采样 $G$ 条 rollout $y_1,\ldots,y_G$，每条得到一个二值奖励 $R(x,y)\in\{0,1\}$；目标是更新 $\pi_\theta$。
+
+\textbf{前作限制：} 论文重点批评了 GRPO 风格的负样本机制：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{失败程度无差异：} 二值奖励下 ``算错一步'' 和 ``完全跑题'' 都是 $R=0$，组内 advantage 把它们当成同一种负反馈。
+  \item \textbf{负样本空间组合爆炸：} 错的 reasoning chain 数量远多于对的，组内 $G$ 条采样能覆盖的负方向极其稀疏。
+  \item \textbf{KL 散度的副作用：} 在 token 概率空间约束 policy drift 会限制 exploration，且和 reasoning 这种 ``长 chain 多分支'' 任务不太契合。
+\end{itemize}
+
+\begin{intubox}
+\textbf{直觉版：} GRPO 的负梯度是 ``我抽了几条错答案，告诉模型别像它们''。POPO 的逻辑是：``我只告诉模型对答案长什么样，softmax 自己会把概率从其它所有地方挪过来——这本身就是对错答案的惩罚，而且覆盖了所有错的方向，不只是我采到的那几条''。
+\end{intubox}
+
+\subsection{3. 方法拆解}
+
+\subsubsection{3.1 总体框架}
+
+POPO 维护两份策略：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{在线策略 $\pi_\theta$：} 接收梯度更新，负责采样和被优化。
+  \item \textbf{Siamese 策略 $\pi_\xi$：} 不接收梯度，靠 EMA 动量更新，作为 ``自身锚点'' 用来做表征对齐。
+\end{itemize}
+
+每个 prompt $x$ 的 rollout 集合按奖励切成两半：
+
+\[
+\mathcal{S}^{+}(x)=\{y:R(x,y)=1\},
+\qquad
+\mathcal{S}^{-}(x)=\{y:R(x,y)=0\}.
+\]
+
+POPO 的全部训练梯度只来自 $\mathcal{S}^{+}(x)$；$\mathcal{S}^{-}(x)$ 中的样本不进入显式损失项，但论文会证明它们的 logit 仍然在被压低。
+
+\subsubsection{3.2 关键机制}
+
+\paragraph{机制一：有界重要性采样（bounded importance sampling）。}
+不是和 PPO/GRPO 一样用 $\pi_\theta/\pi_{\theta_{\text{old}}}$ 这种跨 iteration 的 ratio，而是在当前正样本集合内自归一化：
+
+\[
+w_\theta(y\mid x)=\frac{\pi_\theta(y\mid x)}{Z^{+}(x)},
+\qquad
+Z^{+}(x)=\sum_{y'\in\mathcal{S}^{+}(x)}\pi_\theta(y'\mid x).
+\]
+
+满足 $\sum_{y\in\mathcal{S}^{+}}w_\theta(y\mid x)=1$。它有两个直接后果：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 高概率正样本得到更大权重，形成正样本之间的 ``自竞争''；
+  \item 权重归一化让负 logit 的梯度行为变得干净（见 §3.3 的导数推导）。
+\end{itemize}
+
+\paragraph{机制二：Siamese 策略 + EMA 动量。}
+Siamese 策略 $\pi_\xi$ 不参与梯度计算，只做指数滑动：
+
+\[
+\xi\leftarrow\tau\,\xi + (1-\tau)\,\theta,\qquad \tau=0.999.
+\]
+
+它的角色是给 ``当前策略不要漂得太远'' 提供一个稳定的参考点。
+
+\paragraph{机制三：表征空间相似度惩罚替代 KL。}
+论文不再用 token 概率空间的 KL，而是定义一个 BYOL/SimSiam 风格的不对称表征对齐损失：
+
+\[
+\mathcal{L}_{\text{sim}}(\theta,\phi,\xi)
+=
+-\mathbb{E}_x\!\!\sum_{y\in\mathcal{S}^{+}(x)}\!\!w_\theta(y\mid x)\,
+\cos\!\Big(h_\phi\big(f_\theta(x,y)\big),\;\mathrm{sg}\big(f_\xi(x,y)+\epsilon\big)\Big),
+\]
+
+其中 $f_\theta,f_\xi$ 是两边网络的隐藏表征，$h_\phi$ 是只挂在 online 一侧的 2 层 MLP（hidden=4096）predictor，$\mathrm{sg}$ 是 stop-gradient，$\epsilon\sim\mathcal{N}(0,\sigma^2 I),\sigma=0.02$ 用来防表征塌缩。
+
+\begin{warnbox}
+\textbf{为什么不能 symmetric：} 如果两边都加 predictor、都要梯度，会塌缩到平凡解 $f_\theta\equiv f_\xi\equiv\text{const}$。BYOL/SimSiam 这条经验在这里被直接搬过来：\textbf{不对称 + stop-gradient + EMA target 才有非平凡解}。
+\end{warnbox}
+
+\subsubsection{3.3 关键公式与隐式负梯度证明}
+
+\paragraph{总损失（Equation 5）。}
+\[
+\mathcal{L}_{\text{POPO}}(\theta)
+=
+-\mathbb{E}_{x}\!\!\sum_{y\in\mathcal{S}^{+}(x)}\!\!w_\theta(y\mid x)\log\pi_\theta(y\mid x)
+\;+\;\alpha\,\mathcal{L}_{\text{sim}}
+\;+\;\beta\,\mathcal{L}_{\text{ent}},
+\]
+
+其中 $\mathcal{L}_{\text{ent}}=-\mathbb{E}_x\,H(\pi_\theta(\cdot\mid x))$ 是熵正则化项。
+
+注意：第一项是加权 NLL，但权重 $w_\theta$ 自己也是 $\theta$ 的函数。
+
+\paragraph{核心定理（Theorem 3.1）：负 logit 的梯度严格为正。}
+对任意错误响应 $y'\in\mathcal{S}^{-}(x)$，关于其 logit $z_{y'}$ 的梯度为：
+
+\[
+\frac{\partial \mathcal{L}_{\text{POPO}}}{\partial z_{y'}}
+=
+\pi_\theta(y'\mid x)\Big[1+\beta\big(\log\pi_\theta(y'\mid x)+H(\pi_\theta(\cdot\mid x))\big)\Big].
+\]
+
+当 $\pi_\theta(y'\mid x)>\exp\!\bigl(-\tfrac{1}{\beta}-H(\pi_\theta(\cdot\mid x))\bigr)$ 时，整体严格为正，即 \key{该负样本的 logit 一定被往下压}。
+
+\paragraph{推导骨架（Appendix B.1）。}
+关键步骤如下：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Softmax Jacobian：因为 $y\in\mathcal{S}^{+},\,y'\in\mathcal{S}^{-}$ 不相交，$\delta_{y,y'}=0$，所以
+  \[
+  \frac{\partial \log\pi_\theta(y\mid x)}{\partial z_{y'}}=-\pi_\theta(y'\mid x).
+  \]
+  \item 权重 $w_\theta(y\mid x)$ 对负 logit 的偏导是 0：用商法则配合 $\partial Z^{+}/\partial z_{y'}=-\pi_\theta(y'\mid x)\,Z^{+}$，分子分母的因子精确抵消。\textbf{这是有界重要性采样的关键性质}：归一化不会削弱或扭曲负方向的隐式梯度。
+  \item NLL 梯度（利用 $\sum_{y\in\mathcal{S}^{+}}w_\theta=1$）：
+  \[
+  \frac{\partial \mathcal{L}_{\text{NLL}}}{\partial z_{y'}}
+  =\pi_\theta(y'\mid x)\cdot\sum_{y\in\mathcal{S}^{+}}w_\theta(y\mid x)
+  =\pi_\theta(y'\mid x).
+  \]
+  论文把它叫做 \key{``概率税''}：无条件压低所有错答 logit，且 logit 越大压得越多。
+  \item 熵项贡献 $\pi_\theta(y'\mid x)[\log\pi_\theta(y'\mid x)+H(\pi_\theta)]$：对高概率错答（$\log\pi$ 越大于 $-H$）施加最强抑制，自然偏向 ``打击当前最容易错下去的那条路''。
+  \item $\mathcal{L}_{\text{sim}}$ 不依赖输出 logit，因此对 $z_{y'}$ 没有贡献。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{直觉：} softmax 是个零和游戏 $\sum_y \pi_\theta(y\mid x)=1$。任何对正样本概率的提升必然要从其它地方搬概率过来——而 $\mathcal{S}^{+}$ 之外的所有 token 序列就是被搬概率的 ``其它地方''。POPO 不需要点名打击某条具体的错答，softmax 自己会等比例打击所有错答，并且对当前最高概率的那条错答打得最狠。
+\end{intubox}
+
+\paragraph{EMA 参数有界性（Lemma 3.2）。}
+在 $\|\nabla_\theta\mathcal{L}_{\text{POPO}}\|\le G_{\max}$ 的条件下，稳态时
+
+\[
+\|\theta_t-\xi_t\|\le \frac{\tau\eta G_{\max}}{1-\tau}.
+\]
+
+代入论文设定 $\tau=0.999,\,\eta=10^{-6},\,G_{\max}=1$，得 $\|\delta\|<10^{-3}$。这是论文 \key{放心去掉 KL 惩罚} 的依据：表征对齐 + EMA 动量已经在参数空间提供了一个有界 drift 保证，不需要再在 token 概率层面加 KL。
+
+\begin{warnbox}
+\textbf{这一步在数学上其实很关键：} 它把 ``policy 不能漂太远'' 这个约束从 \key{每条 token 概率都不能动太多}（KL）放松到了 \key{两份策略参数距离有上界}。前者把每一个分支都锁住，后者允许策略在任意单条序列上自由演化、只要整体行为不偏离 EMA 锚点。这对 long-chain reasoning 显然更友好。
+\end{warnbox}
+
+\subsection{4. 实验与证据}
+
+\subsubsection{4.1 训练与评测设定}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{训练数据：} DeepScaleR-Preview-Dataset（约 40K 数学题，覆盖 AIME 1984--2023、AMC、Omni-MATH、Still）。
+  \item \textbf{基础模型：} Qwen-Math-1.5B / 7B、R1-Distill-Qwen 1.5B / 7B、Llama-3.1-8B、DeepSeek-Math-7B。
+  \item \textbf{评测：} MATH-500、AMC 2023、AIME 2024、AIME 2025、OlympiadBench；Pass@8（$n=128$ 样本）；temperature 0.7，top-p 0.95，max output 4096。
+  \item \textbf{对比方法：} GRPO、Dr.~GRPO、DAPO、SAPO（同样是 RLVR 后训练，但都显式使用负 rollout 或非对称 ratio）。
+  \item \textbf{POPO 关键超参：} $\tau=0.999$，$\alpha=0.1$，$\beta=0.01$，$\sigma=0.02$，predictor 2 层 $\times$ 4096 维。
+  \item \textbf{硬件：} 4 $\times$ A100 80GB，1.5B 约 11h/epoch，7B 约 24h/epoch。
+\end{itemize}
+
+\subsubsection{4.2 主结果：数学专用与蒸馏模型}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llcccccc}
+\toprule
+\textbf{Base} & \textbf{Algo} & \textbf{MATH-500} & \textbf{AMC 23} & \textbf{AIME 24} & \textbf{AIME 25} & \textbf{Olympiad} & \textbf{Avg.}\\
+\midrule
+Qwen-Math-1.5B & GRPO     & 86.20 & 75.00 & 23.33 & 16.25 & 50.30 & 50.22\\
+               & SAPO     & 86.20 & 76.17 & 23.33 & 17.11 & 50.74 & 50.71\\
+               & Dr.~GRPO & 86.00 & 76.62 & 25.18 & 17.39 & 50.89 & 51.22\\
+               & DAPO     & 86.40 & 75.28 & 22.85 & 16.67 & 50.59 & 50.36\\
+               & \textbf{POPO} & \textbf{86.60} & \textbf{77.50} & \textbf{26.67} & \textbf{23.33} & \textbf{51.19} & \textbf{53.06}\\
+\midrule
+R1-Distill-1.5B & GRPO    & 90.20 & 80.00 & 30.00 & 26.32 & 58.61 & 57.03\\
+               & Dr.~GRPO & 90.40 & 83.46 & 33.33 & 25.84 & 58.90 & 58.39\\
+               & \textbf{POPO} & \textbf{90.80} & \textbf{85.24} & \textbf{36.67} & \textbf{27.86} & 59.05 & \textbf{59.92}\\
+\midrule
+Qwen-Math-7B   & GRPO     & 90.80 & 85.50 & 43.33 & 30.00 & 56.38 & 61.20\\
+               & DAPO     & \textbf{91.40} & 85.97 & 44.76 & 32.31 & 56.53 & 62.19\\
+               & \textbf{POPO} & 90.80 & 85.75 & 45.13 & \textbf{36.67} & \textbf{57.27} & \textbf{63.12}\\
+\midrule
+R1-Distill-7B  & GRPO     & 93.60 & 87.50 & 46.67 & 33.33 & 66.91 & 65.60\\
+               & SAPO     & \textbf{94.20} & \textbf{88.21} & 46.71 & 35.00 & 67.06 & \textbf{66.24}\\
+               & \textbf{POPO} & 93.20 & 87.25 & 47.22 & \textbf{36.67} & 66.76 & 66.22\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{关键观察：} 任务越难，POPO 相对 GRPO 的相对提升越大——MATH-500 上只有 ~1.7\% 相对提升，到 AIME 2025 上就有 \textbf{17.6\%} 相对提升。这和论文的核心主张一致：\key{越是答案空间稀疏、负样本越无信息量的任务，POPO 的 ``不显式用负样本'' 策略收益越明显}。R1-Distill-7B 上 POPO 略低于 SAPO，作者归因于蒸馏后 base policy 的熵已经很低，on-policy 探索受限。
+\end{summarybox}
+
+\subsubsection{4.3 通用文本 LLM 上 POPO 也可迁移}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llcccccc}
+\toprule
+\textbf{Base} & \textbf{Algo} & \textbf{MATH-500} & \textbf{AMC 23} & \textbf{AIME 24} & \textbf{AIME 25} & \textbf{Olympiad} & \textbf{Avg.}\\
+\midrule
+Llama-3.1-8B    & GRPO  & 56.40 & 35.22 & 10.00 & 6.67  & 25.32 & 26.72\\
+                & \textbf{POPO}  & \textbf{59.80} & \textbf{37.78} & \textbf{13.33} & \textbf{10.00} & \textbf{28.29} & \textbf{29.84}\\
+DeepSeek-Math-7B & GRPO & 80.20 & 73.38 & 20.00 & 16.67 & 48.81 & 47.81\\
+                & \textbf{POPO}  & \textbf{82.60} & \textbf{74.53} & \textbf{23.33} & \textbf{20.00} & \textbf{50.29} & \textbf{50.15}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+POPO 在两个非数学专用 base 上对 GRPO 都是全面胜出，说明 ``正样本归一化 + 隐式负梯度'' 不依赖于特定 base 是否经过数学预训练。
+
+\subsubsection{4.4 关键消融：哪一部分真的重要}
+
+\paragraph{(a) Importance sampling 与权重再分配（Qwen-Math-1.5B）。}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+\textbf{配置} & \textbf{AIME 25} & \textbf{Olympiad} & \textbf{Avg.}\\
+\midrule
+POPO（无负样本 + 再分配权重） & \textbf{23.33} & \textbf{51.19} & \textbf{37.26}\\
+无负样本 + 均匀权重           & 16.67 & 49.11 & 32.89\\
+有负样本 + 无再分配权重       & 13.33 & 48.07 & 30.70\\
+有负样本 + 均匀权重           & 6.67  & 39.32 & 23.00\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+\textbf{这组消融最值得记：} 单独 ``扔掉负样本''（无负样本 + 均匀权重）已经能从 23 涨到 33；再加 \key{有界重要性采样的权重再分配}，又从 33 涨到 37。这说明 POPO 的性能不全靠 ``少损害''，而是真的来自 \key{$w_\theta=\pi_\theta/Z^{+}$ 这个归一化引入的隐式负梯度结构}——这个证明在 §3.3 已经做过了。
+\end{warnbox}
+
+\paragraph{(b) Siamese 动量与表征对齐。}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+\textbf{配置} & \textbf{AIME 25} & \textbf{Olympiad} & \textbf{Avg.}\\
+\midrule
+POPO（完整）            & \textbf{23.33} & \textbf{51.19} & \textbf{37.26}\\
+无动量（静态锚 $\xi$）   & 13.33 & 48.37 & 30.85\\
+无表征对齐（去掉 $\mathcal{L}_{\text{sim}}$） & 13.33 & 50.15 & 31.74\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+去掉 EMA 或去掉表征对齐都会掉约 6 个点，二者都是 ``在没有 KL 的情况下保持训练稳定'' 必需的两个支柱。
+
+\paragraph{(c) Predictor 与动量的超参扫描。}
+2 层 predictor 优于 3/4 层，hidden=4096 优于 1024/2048，$\tau=0.999$ 是最佳动量值（0.99 太短导致漂移，0.9999 太慢失去自适应能力）。
+
+\subsubsection{4.5 实验是否充分支撑论点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item ``正样本归一化引入隐式负梯度'' 既有 Theorem 3.1 的证明，也有消融 (a) 的数值支撑——\textbf{支撑充分}。
+  \item ``EMA + 表征对齐能替代 KL'' 有 Lemma 3.2 的有界性 + 消融 (b) 的下降幅度——\textbf{支撑较强}。
+  \item ``难任务收益更大'' 是论文最强的实证现象之一（AIME 25 比 MATH-500 提升大一个数量级）——\textbf{支撑显著}。
+  \item 但 ``为什么 R1-Distill-7B 上反而打不过 SAPO''，作者只给了 ``蒸馏模型熵低、on-policy 探索受限'' 的解释，没有更深入的实验验证。
+\end{itemize}
+
+\subsection{5. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{需要正样本存在：} 如果某个 prompt 的所有 $G$ 条 rollout 都失败（$\mathcal{S}^{+}=\emptyset$），整条梯度就消失。论文没有像 DAPO 那样专门处理 ``全错 group''——在更难的任务（IMO 级别）上这是真实风险。
+  \item \textbf{熵下降模型不友好：} R1-Distill 系列已经被蒸馏得很 ``确定'' 了，正样本采样多样性不够，POPO 的 ``正样本之间自竞争'' 就退化成 ``一条主导路径吃掉全部权重''。这正是 R1-Distill-7B 上 POPO 略输 SAPO 的根因。
+  \item \textbf{表征空间相似度的语义对齐性未必稳：} $\mathcal{L}_{\text{sim}}$ 用的是隐藏表征上的 cosine，而不是 token 概率上的 KL。这意味着 ``policy 没怎么变'' 是在表征几何上判断的，对于真正决定输出分布的最后几层 logit 头，约束相对宽松——可能在某些边角任务上表现为输出分布偏离较大但 sim 损失不报警。
+  \item \textbf{只验证了数学推理：} 没有 code、agent、安全对齐这些 RLHF/RLVR 常见赛道上的实验，所以 ``正样本 + 隐式负梯度'' 是否在 reward 不那么稀疏二值的设置下还成立，仍然待证。
+\end{itemize}
+
+\subsection{6. 与已有工作的关系}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{直接前作：} GRPO（DeepSeek-Math 提出的组相对优势），以及它的几个后续 Dr.~GRPO、DAPO、SAPO。POPO 把 ``如何用好负样本'' 这条主线整体翻面，说 ``可以不用''。
+  \item \textbf{相反路线：} NGRPO（Negative-enhanced GRPO，arXiv 2509.18851）走的是另一个极端——\key{加大对负样本的利用}。两篇都直觉上有合理性，差异在于：NGRPO 假设负样本含有 ``避免某类错误'' 的额外信息，POPO 假设这些信息在 softmax 守恒下已经被免费提供。
+  \item \textbf{相近自监督思想：} Siamese + EMA + stop-gradient + predictor 几乎照搬 BYOL/SimSiam 的 anti-collapse 设计。POPO 的贡献不是发明这个结构，而是\key{发现它能用作 RLVR 里的 KL 替代品}。
+  \item \textbf{真正差异：} 大部分 ``positive-only'' 工作（包括 PODPO、SAPO 中的 positive 加权变体）依赖正样本的绝对优势或某种锚点对比；POPO 的特别之处是把它直接还原成 \key{有界 importance sampling 的归一化结构}，并给出了负 logit 严格被压低的解析证明。
+\end{itemize}
+
+\subsection{7. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{可复用 idea 1（视觉生成版 POPO）：} 在 Flow-GRPO / DanceGRPO 这类视觉 RL 里，``坏图'' 的语义空间同样巨大且无差异（一张全是噪点的图和一张轻微 misalign 的图都给 reward 0）。能不能在视觉 RL 里也只对 high-reward trajectory 做 $w_\theta=\pi_\theta/Z^{+}$ 自归一？这个想法值得放进 \key{post\_training/index} 的 ideas 列表。
+  \item \textbf{可复用 idea 2（KL 替代）：} 表征空间余弦对齐 + EMA 动量，作为 KL 替代项，可能比 token-level KL 更适合 long horizon 视频生成 RL，因为视频策略更适合 ``整体行为别漂'' 而不是 ``每一帧概率别动''。
+  \item \textbf{可复用证明套路：} Theorem 3.1 的 softmax Jacobian + 商法则证明负梯度涌现，是一种很干净的 ``利用 softmax 守恒导出隐式约束'' 范式。我以后写 implicit gradient / implicit constraint 类的论文可以借用这种结构。
+  \item \textbf{可复用实验设计：} 4 个 base 模型 $\times$ 5 个 benchmark 的方阵 + 2 张消融表覆盖了 ``算什么 vs 怎么算''，结构非常工整，是 RLVR 类论文写法的好模板。
+  \item \textbf{值得追的 follow-up：} POPO + DAPO 的全错 group 处理；POPO 在 code RL 上是否仍然成立；POPO 与 OP-GRPO 风格 replay 的兼容性（``只复用旧的正轨迹'' 是不是天然就是 POPO 的特例）。
+\end{itemize}
+
+\subsection{8. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Theorem 3.1 中 ``$\pi_\theta(y'\mid x)>\exp(-1/\beta-H(\pi_\theta))$ 时严格为正'' 这个条件在训练后期会不会失效？特别是当 $H$ 随训练下降时，它会反过来抬高门槛。
+  \item 论文用 Pass@8（n=128）来评测，但训练时 group size 只有 8。Pass@8 评测是否对方法间公平？是否有 Pass@1 的对比？
+  \item EMA $\tau=0.999$ + lr=$10^{-7}$ 的组合非常具体，换一个数据集量级（比如 100K+ 训练）后 Lemma 3.2 的 bound $\tau\eta G_{\max}/(1-\tau)$ 还能否保证训练稳定？
+  \item POPO 在 R1-Distill-7B 上略输 SAPO，那是否意味着 ``越是 SFT/distill 后熵低的模型，越需要显式负样本''？如果是，POPO 的适用区间就比论文标题暗示的窄。
+\end{itemize}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文主页：} \href{https://arxiv.org/abs/2605.06650}{Beyond Negative Rollouts: Positive-Only Policy Optimization with Implicit Negative Gradients}。
+  \item \textbf{arXiv HTML：} \href{https://arxiv.org/html/2605.06650v1}{arXiv HTML version}（Theorem 3.1、Lemma 3.2、Equations 5--8 和全部消融表均来自此版本）。
+  \item \textbf{代码仓库：} \href{https://github.com/momo1443/colm2026-POPO}{momo1443/colm2026-POPO}。
+  \item \textbf{对照阅读：} NGRPO（arXiv 2509.18851，反向路线）、SAPO / DAPO / Dr.~GRPO（GRPO 的负样本改良路线）。
+\end{itemize}

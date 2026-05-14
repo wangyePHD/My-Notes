@@ -1,0 +1,195 @@
+% ============================================================
+% SenseNova-U1 / NEO-Unify 源码学习路线图
+% ============================================================
+
+\section{学习路线图：SenseNova-U1 / NEO-Unify 源码阅读}
+
+\begin{conceptbox}
+\textbf{一句话定位：} SenseNova-U1 代表的是当前统一多模态模型里很值得跟的一条路线：\key{用一个原生多模态架构统一理解、推理与生成，而不是把视觉编码器、LLM、扩散生成器通过 adapter 松散拼起来。}\\
+\textbf{源码阅读目标：} 先不急着钻每个模块实现，而是先读懂\key{公开仓库里有哪些入口、四类推理任务如何调用同一个模型、understanding / generation pathway 如何分工、MoT 与 flow-matching 相关模块在代码里如何落位}。
+\end{conceptbox}
+
+\subsection*{资料收集与引用口径}
+
+\begin{warnbox}
+\textbf{当前资料状态：} 截至本笔记创建时，官方仓库 README 标注 arXiv / technical report 为 Coming，ToDo 中也写明训练代码和最终版权重/技术报告尚未完全公开。因此这一阶段的笔记只基于\key{官方仓库、官方中文 README、Hugging Face 模型集合、NEO-Unify 官方博客入口、公开推理示例与参数分解文档}建立学习地图，不把未公开论文细节当成既定事实。
+\end{warnbox}
+
+这一页主要综合以下公开资料：
+\begin{itemize}[leftmargin=1.5em]
+  \item OpenSenseNova 官方仓库：确认 SenseNova-U1 的项目定位、开源模型列表、公开代码范围和仓库目录。
+  \item 官方中文 README：确认 NEO-Unify 的核心表述、模型规格、训练阶段描述、发布时间线与 ToDo 状态。
+  \item \texttt{examples/README\_CN.md}：确认当前公开推理脚本覆盖 \texttt{t2i}、\texttt{editing}、\texttt{interleave}、\texttt{vqa} 四类任务。
+  \item \texttt{docs/parameter\_breakdown\_CN.md}：确认 \texttt{SenseNova-U1-8B-MoT} 的参数拆分方式：understanding transformer、generation transformer 与 shared 文本输入输出层。
+  \item Hugging Face 模型集合与 NEO-Unify 官方博客入口：作为模型权重、路线介绍和后续资料更新入口。
+\end{itemize}
+
+\subsection{一、为什么要单独建这个专区}
+
+\begin{conceptbox}
+\textbf{原因：} SenseNova-U1 不只是一个“文生图模型”或“VQA 模型”，而是一个\key{统一理解与生成}项目。它横跨模型架构、推理代码、图文交错生成、图像编辑、VQA、flow matching、MoT/MoE、prompt enhancement 和后续 RL 训练，因此更适合独立成“论文源码阅读”专区，而不是塞进某个单一主题目录。
+\end{conceptbox}
+
+从学习价值看，它至少连接了四条主线：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{模型架构主线：} 如何用 monolithic / native multimodal architecture 统一视觉理解与视觉生成。
+  \item \textbf{生成建模主线：} 生成侧不再只是传统 diffusion pipeline，而是和语言/视觉 token、flow-matching head 等模块结合。
+  \item \textbf{工程源码主线：} 公开仓库首先释放的是推理代码，因此最适合从 inference path 开始读。
+  \item \textbf{后训练主线：} README 提到 SFT 模型经过理解预热、生成预训练、统一中期训练、统一 SFT，最终模型又经过一轮 T2I RL；这部分等技术报告或训练代码公开后再深入。
+\end{itemize}
+
+\subsection{二、当前公开信息里的核心口径}
+
+\begin{summarybox}
+\textbf{先记住这句话：} SenseNova-U1 想解决的不是“给 LLM 外挂一个图像生成器”，而是\key{让理解、推理和生成在一个原生多模态模型里发生}。官方对 NEO-Unify 的核心描述是：不依赖传统视觉编码器（VE）和变分自编码器（VAE）的模态翻译式拼接，而是端到端建模语言与视觉信息。
+\end{summarybox}
+
+需要暂时分清三层说法：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{官方 claim：} 统一多模态理解、推理与生成；从 modality integration 走向 true unification。
+  \item \textbf{源码可验证部分：} 公开推理脚本、模型加载、任务入口、参数分组、generation / understanding pathway 的调用关系。
+  \item \textbf{暂不展开部分：} 训练细节、完整技术报告、训练代码和最终版权重仍需等待官方进一步公开。
+\end{itemize}
+
+\subsection{三、仓库地图：先知道从哪里读}
+
+当前仓库顶层结构可以先按功能理解：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{9.3cm}}
+\hline
+\textbf{路径} & \textbf{源码阅读意义} \\
+\hline
+\texttt{README.md / README\_CN.md} & 项目定位、模型列表、公开状态、能力展示和后续 ToDo。 \\
+\texttt{examples/} & 当前最重要的入口；包含文生图、图像编辑、图文交错生成、VQA 的参考推理脚本。 \\
+\texttt{src/} & 模型与包代码主体；后续需要重点追模型类、processor、generation / understanding pathway、flow-matching 相关模块。 \\
+\texttt{docs/} & 参数分解、prompt enhancement、base vs distill 等说明文档。 \\
+\texttt{evaluation/} & 评测相关代码或配置；后续用于理解官方如何验证理解/生成能力。 \\
+\texttt{scripts/} & 辅助脚本，例如参数统计脚本，是理解模型结构命名的好入口。 \\
+\texttt{pyproject.toml / uv.lock} & Python 包依赖、项目安装与环境约束。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{源码阅读顺序不要反：} 第一轮不要直接冲进 \texttt{src/} 深处找所有 class。更稳的路线是：先从 \texttt{examples/} 的任务脚本看模型怎么被调用，再顺着调用链进入 \texttt{src/}，最后回头看参数分组和模块命名。
+\end{intubox}
+
+\subsection{四、第一轮源码阅读问题地图}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{4.7cm}p{5.0cm}}
+\hline
+\textbf{核心问题} & \textbf{为什么重要} & \textbf{第一轮应该看哪里} \\
+\hline
+模型如何加载 & 所有任务都从这里开始，决定 processor、dtype、device、权重结构如何进入运行态 & \texttt{examples/*/inference.py}，再追到 \texttt{src/} 中的模型加载代码 \\
+文生图怎么跑 & 这是生成侧主路径，能看到 prompt、CFG、timestep shift、num steps、输出分辨率等关键参数 & \texttt{examples/t2i/inference.py} \\
+图像编辑怎么跑 & 这是图像条件生成路径，能看到输入图像 resize、image CFG、多图参考等工程逻辑 & \texttt{examples/editing/inference.py} \\
+图文交错怎么跑 & 这是最能体现“统一理解与生成”的路径：一次响应里既有文本又有图像 & \texttt{examples/interleave/inference.py} \\
+VQA 怎么跑 & 这是理解侧主路径，适合对照 generation pathway 看差异 & \texttt{examples/vqa/inference.py} \\
+参数如何分组 & 帮助把名字里的 \texttt{understanding}、\texttt{generation}、\texttt{shared} 对上真实参数 & \texttt{docs/parameter\_breakdown\_CN.md} 与 \texttt{scripts/inspect\_model\_params.py} \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{五、任务入口先验：四类推理脚本}
+
+\subsubsection*{1. Text-to-Image：生成侧主路径}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{入口：} \texttt{examples/t2i/inference.py}
+  \item \textbf{关键词：} \texttt{prompt}、\texttt{width}、\texttt{height}、\texttt{cfg\_scale}、\texttt{cfg\_norm}、\texttt{timestep\_shift}、\texttt{num\_steps}、\texttt{think}
+  \item \textbf{学习重点：} 文本 prompt 如何进入模型，什么时候先生成 \texttt{<think>...</think>}，生成图像时哪些参数控制采样/去噪过程。
+\end{itemize}
+
+\subsubsection*{2. Image Editing：图像条件生成路径}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{入口：} \texttt{examples/editing/inference.py}
+  \item \textbf{关键词：} \texttt{image}、\texttt{img\_cfg\_scale}、\texttt{input\_max\_pixels}、\texttt{target\_pixels}、\texttt{smart\_resize}
+  \item \textbf{学习重点：} 输入图像如何预处理到模型可接受的尺寸，图像条件和文本条件如何共同影响生成。
+\end{itemize}
+
+\subsubsection*{3. Interleave：统一能力最值得看的路径}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{入口：} \texttt{examples/interleave/inference.py}
+  \item \textbf{关键词：} \texttt{model.interleave\_gen}、\texttt{<think>}、文本输出、图像输出、JSONL 批量输入
+  \item \textbf{学习重点：} 单次响应中如何交错地产生文本和图像；这是后面理解“native multimodal”最关键的源码路径。
+\end{itemize}
+
+\subsubsection*{4. VQA：理解侧主路径}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{入口：} \texttt{examples/vqa/inference.py}
+  \item \textbf{关键词：} \texttt{image}、\texttt{question}、\texttt{max\_new\_tokens}、\texttt{do\_sample}、\texttt{temperature}、\texttt{top\_p}
+  \item \textbf{学习重点：} 图像如何进入 understanding pathway，回答文本如何解码，和生成图像路径相比少了哪些 flow / denoising 逻辑。
+\end{itemize}
+
+\subsection{六、参数分解：先建立模型结构直觉}
+
+\begin{summarybox}
+\textbf{官方参数分解口径：} \texttt{SenseNova-U1-8B-MoT} 总参数约 17.552B；互斥分组包括 \texttt{generation\_transformer} 约 8.186B、\texttt{understanding\_transformer} 约 8.121B、\texttt{shared} 约 1.245B。由于 \texttt{embed\_tokens} 与 \texttt{lm\_head} 被两条 pathway 共用，所以从 forward pathway 视角看，理解路径约 9.366B，生成路径约 9.431B。
+\end{summarybox}
+
+这给源码阅读一个非常重要的直觉：
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{understanding pathway：} 更接近图像理解 / VQA 路线，图像与文本进入理解侧模块，最后输出文本 token。
+  \item \textbf{generation pathway：} 更接近图像生成 / 图文交错路线，会涉及生成侧视觉模块、flow-matching head、timestep / noise embedders 等。
+  \item \textbf{shared：} 文本 token 的输入输出层是两条路径的公共部件，这也是为什么 \texttt{lm\_head} 不能简单理解为只属于“理解侧”。
+\end{itemize}
+
+\begin{intubox}
+\textbf{读代码时的抓手：} 看到参数名或模块名里出现 \texttt{\_mot\_gen}、\texttt{fm\_modules}、\texttt{vision\_model\_mot\_gen}、\texttt{fm\_head}，优先联想到 generation pathway；看到不带生成后缀的视觉/语言模块，优先联想到 understanding pathway。
+\end{intubox}
+
+\subsection{七、建议后续拆成的笔记树}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{00\_learning\_roadmap.tex}：这页，先建立学习地图与公开资料口径。
+  \item \texttt{02\_inference\_entrypoints.tex}：四个推理脚本的共同模式与差异。
+  \item \texttt{03\_model\_loading\_and\_processor.tex}：模型加载、processor、token/image 输入格式。
+  \item \texttt{04\_understanding\_pathway.tex}：VQA / understanding pathway 源码阅读。
+  \item \texttt{05\_generation\_pathway.tex}：T2I / editing / flow-matching generation pathway 源码阅读。
+  \item \texttt{06\_interleaved\_generation.tex}：图文交错生成，重点看 \texttt{interleave\_gen}。
+  \item \texttt{07\_parameter\_and\_module\_map.tex}：参数命名、模块分组、MoT/MoE 相关结构。
+  \item \texttt{08\_training\_and\_rl\_notes.tex}：等待官方 technical report / training code 后再补。
+\end{itemize}
+
+\subsection{八、阶段性学习目标}
+
+\begin{summarybox}
+\textbf{第一阶段不追求复现训练，只追求读懂推理代码。} 完成后你应该能做到：\\
+1. 说清楚 SenseNova-U1 为什么是统一多模态路线，而不只是一个图像生成 pipeline；\\
+2. 说清楚公开仓库里四类推理任务分别从哪里进入；\\
+3. 根据参数分解解释 understanding pathway、generation pathway 和 shared 的区别；\\
+4. 顺着一个样例脚本追到模型调用处，并知道下一步该读哪个模块；\\
+5. 知道哪些内容目前公开资料还不足，不能过早下结论。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item OpenSenseNova，\emph{SenseNova-U1: Unifying Multimodal Understanding and Generation with NEO-Unify Architecture}，官方 GitHub 仓库。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1}
+  \item OpenSenseNova，\emph{SenseNova-U1 中文 README}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/README_CN.md}
+  \item OpenSenseNova，\emph{SenseNova-U1 examples README：公开推理脚本说明}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/README_CN.md}
+  \item OpenSenseNova，\emph{SenseNova-U1 模型参数分解}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/docs/parameter_breakdown_CN.md}
+  \item SenseNova，\emph{SenseNova-U1 Hugging Face 模型集合}。\\
+  \url{https://huggingface.co/collections/sensenova/sensenova-u1}
+  \item SenseNova，\emph{NEO-Unify 官方博客入口}。\\
+  \url{https://huggingface.co/blog/sensenova/neo-unify}
+\end{itemize}
+\endgroup

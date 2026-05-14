@@ -1,0 +1,449 @@
+\subsection*{Idea 调研：Flow Matching 的后续科研发展走向}
+\phantomsection
+\addcontentsline{toc}{subsection}{Idea 调研：Flow Matching 的后续科研发展走向}
+
+\begin{conceptbox}
+\textbf{调研日期：} 2026-05-11。\\
+\textbf{核心结论：} Flow Matching 已经从“新生成范式”进入 \key{基础设施阶段}：图像、视频、编辑、统一多模态、离散数据和后训练都已有强 baseline。下一步不建议做泛泛的 ``Flow Matching for X''、``再比较 diffusion 和 flow''、或 ``普通 GRPO for flow''。更有论文空间的是把 Flow Matching 看成 \key{可训练、可控、可对齐的生成动力系统}，研究 trajectory 的信用分配、路径/调度的任务自适应、少步采样下的对齐保持、长视频/世界模型的时空状态维护，以及离散/连续混合 flow 的统一后训练。\\
+\textbf{最推荐方向：} 做 \key{credit-calibrated flow post-training}：同时校准 reward side 的 step / chunk / branch credit 和 policy side 的 ratio / logprob scale，让 Flow Matching 后训练从“最终 reward 广播到整条轨迹”推进到“知道哪一段轨迹真正改变了结构、语义、文字、运动或偏好”。
+\end{conceptbox}
+
+\subsubsection*{1. Idea 重写}
+
+\textbf{用户原始 idea：}
+
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+借助 research idea investigation skill，
+看一下 Flow Matching 的后续科研发展走向。
+\end{lstlisting}
+
+\textbf{更准确的问题定义：}
+
+\href{https://arxiv.org/abs/2209.03003}{Rectified Flow} 和 \href{https://arxiv.org/abs/2210.02747}{Flow Matching} 已经把连续生成模型从传统 diffusion chain 推到更直接的向量场 / ODE 视角；\href{https://arxiv.org/abs/2403.03206}{Stable Diffusion 3}、\href{https://arxiv.org/abs/2506.15742}{FLUX.1 Kontext}、\href{https://arxiv.org/abs/2412.03603}{HunyuanVideo}、\href{https://arxiv.org/abs/2505.14683}{BAGEL}、\href{https://arxiv.org/abs/2604.24763}{Tuna-2} 等说明 flow 已经成为图像、视频和统一多模态生成的重要底座。因此下一步真正的问题不是：
+
+\begin{quote}
+Flow Matching 能不能生成高质量样本？
+\end{quote}
+
+而是：
+
+\begin{quote}
+当 Flow Matching 成为大规模生成底座后，如何让它的生成轨迹更短、更稳、更可控、更可对齐，并能扩展到长视频、图像编辑、离散 token 和统一多模态系统？
+\end{quote}
+
+\textbf{本质变量：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{Path geometry}：从噪声到数据的路径是否短、直、低曲率、低 stiffness，并适合少步积分。
+  \item \key{Temporal credit assignment}：最终 reward 到底该归因给早期布局、中期对象关系、后期细节，还是某个局部分支。
+  \item \key{Policy ratio calibration}：ODE-to-SDE 后，每个 timestep 的 logprob / ratio scale 是否改变了真实更新强度。
+  \item \key{Solver and distillation budget}：少步采样、蒸馏和后训练是否同时保留质量、对齐和可控性。
+  \item \key{State consistency}：长视频、多轮编辑、多参考生成和世界模型中，flow trajectory 是否维护跨帧/跨步状态。
+  \item \key{Discrete-continuous unification}：语言、图像 token、连续 latent、像素和动作是否能用统一的 flow / probability path 描述。
+\end{itemize}
+
+\subsubsection*{2. 趋势判断}
+
+\textbf{方向很重要，但已经不是空白。}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{基础范式已经成立。} Flow Matching 提供 simulation-free CNF 训练框架，Rectified Flow 强调直线传输、粗步积分和 reflow。
+  \item \textbf{工业级图像模型已采用 rectified / flow 路线。} Stable Diffusion 3 的 MMDiT + rectified flow 让 flow 成为高分辨率 T2I 的主流候选。
+  \item \textbf{视频和编辑也在向 flow 靠拢。} HunyuanVideo、FLUX.1 Kontext、Flowception 等说明 flow 不只是单图生成范式。
+  \item \textbf{后训练 baseline 已经出现。} \href{https://arxiv.org/abs/2505.05470}{Flow-GRPO} 把 deterministic ODE 转成可采样、可算 logprob 的 SDE，并用 GRPO 做 online RL；后续 TempFlow-GRPO、Chunk-GRPO、DenseGRPO、OP-GRPO、LeapAlign 都在修它的不同痛点。
+  \item \textbf{离散 flow 正在兴起。} \href{https://arxiv.org/abs/2407.15595}{Discrete Flow Matching}、\href{https://arxiv.org/abs/2504.10283}{$\alpha$-Flow}、\href{https://arxiv.org/abs/2602.12233}{Categorical Flow Maps} 把 flow 从连续图像/视频推向语言、蛋白、图、离散视觉 token。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{趋势判断：}\\
+Flow Matching 后续值得做，但不能再把“使用 flow”当贡献。真正的贡献应落在二阶问题：\key{轨迹信用分配、路径几何学习、少步对齐保持、长时空状态、离散/连续统一、可控编辑与逆问题、统一多模态 flow head 的训练稳定性}。
+\end{summarybox}
+
+\subsubsection*{3. 本质判断}
+
+Flow Matching 的表面形式是学习一个速度场：
+
+\[
+\frac{dx_t}{dt} = v_\theta(x_t,t,c).
+\]
+
+但当它进入大模型和后训练阶段，核心不再只是拟合速度场，而是管理一条生成轨迹：
+
+\[
+x_1 \rightarrow x_{t_k} \rightarrow \cdots \rightarrow x_0.
+\]
+
+这条轨迹同时承担四件事：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 从噪声传输到数据分布；
+  \item 在有限步数里做数值积分；
+  \item 在不同 timestep 形成布局、对象、关系、文字、纹理和运动；
+  \item 在后训练中接收 reward、preference、constraint 和 safety 信号。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{关键转变：}\\
+早期 Flow Matching 研究的是“怎样学一个好向量场”；后续研究要问的是“怎样让这条向量场轨迹在任务、reward、solver、长上下文和多模态约束下可控”。如果只停留在 loss 或 sampler 的小改动，很容易被强 baseline 淹没。
+\end{warnbox}
+
+\subsubsection*{4. 供需判断}
+
+\textbf{需求：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 工业系统需要更少采样步数、更低延迟和更稳定质量；
+  \item 图像/视频/编辑模型需要偏好对齐、文字准确、对象关系正确、局部控制和安全约束；
+  \item 长视频、世界模型和机器人动作生成需要长时域状态一致性；
+  \item 统一多模态模型需要把文本 token、图像 latent、像素、视频和动作放到可共同训练的生成框架里；
+  \item 研究社区需要解释为什么某些 timestep、路径和 solver 在后训练中更关键。
+\end{itemize}
+
+\textbf{现有供给：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 有基础理论和大规模图像/video baseline；
+  \item 有 Flow-GRPO 这类 RL 接口；
+  \item 有 DenseGRPO / TempFlow-GRPO / Chunk-GRPO 等 credit assignment 变体；
+  \item 有 LeapAlign 这类 direct-gradient 路线；
+  \item 有离散 Flow Matching 和 categorical flow map 的初步框架。
+\end{itemize}
+
+\textbf{供给不足：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 仍缺少统一的 trajectory-level 诊断指标：哪个阶段决定语义、哪个阶段决定细节、哪个阶段造成 reward hacking；
+  \item 后训练工作多在修单点问题，缺少同时处理 advantage side、ratio side、sample efficiency 和 solver cost 的统一框架；
+  \item 少步蒸馏常优化速度，但不保证人类偏好、编辑局部性和复杂约束保真；
+  \item 长视频/世界模型中的 flow path 还没有充分解决 drift、memory、variable length 和 temporal credit；
+  \item 离散 flow 还没有达到 AR LLM 的成熟度，也缺少成熟的 RLHF / GRPO 后训练 recipe。
+\end{itemize}
+
+\subsubsection*{5. 领域时间线}
+
+{\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{longtable}{p{0.08\linewidth} p{0.20\linewidth} p{0.16\linewidth} p{0.33\linewidth} p{0.14\linewidth}}
+\toprule
+\textbf{时间} & \textbf{工作} & \textbf{阶段} & \textbf{主要贡献} & \textbf{对当前 idea 的影响} \\
+\midrule
+2022 &
+\href{https://arxiv.org/abs/2209.03003}{Rectified Flow} &
+Paradigm &
+用 ODE 学习两个分布之间尽量直的传输路径，并强调粗步采样和 reflow。 &
+路径几何是一阶核心变量。 \\
+\midrule
+2022 &
+\href{https://arxiv.org/abs/2210.02747}{Flow Matching} &
+General framework &
+提出 simulation-free CNF 训练，支持 diffusion path、OT path 等一般概率路径。 &
+Flow 已是基础框架，不是新点。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2403.03206}{Stable Diffusion 3} &
+Industrial-scale image baseline &
+用 rectified flow transformer 做高分辨率文生图，并研究噪声采样和 scaling。 &
+图像底座已成熟。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2407.15595}{Discrete Flow Matching} &
+Discrete extension &
+把 flow matching 扩展到高维离散数据，探索非自回归语言/代码生成。 &
+离散 flow 是新分支。 \\
+\midrule
+2024--2025 &
+\href{https://arxiv.org/abs/2412.03603}{HunyuanVideo} &
+Video foundation model &
+开放大规模视频生成框架，强调数据、架构、训练和推理系统。 &
+视频 flow/DiT 成为主战场。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2505.05470}{Flow-GRPO} &
+Post-training baseline &
+通过 ODE-to-SDE 让 flow transition 可采样、可算 logprob，再做 online GRPO。 &
+普通 flow RL 已是 baseline。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2506.15742}{FLUX.1 Kontext} &
+In-context generation / editing &
+在 latent flow matching 框架下做 in-context image generation and editing。 &
+编辑和条件生成已进入强 baseline 阶段。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2508.04324}{TempFlow-GRPO} &
+Temporal credit &
+用 trajectory branching 和 noise-aware weighting 处理 flow GRPO 的时间信用分配。 &
+credit assignment 成为后训练主线。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2510.21583}{Chunk-GRPO} &
+Chunk-level optimization &
+把 step-level 优化改为 chunk-level，缓解 step 粒度噪声和时间结构忽略。 &
+优化粒度本身是研究变量。 \\
+\midrule
+2025--2026 &
+\href{https://arxiv.org/abs/2512.11438}{Flowception} &
+Long video / variable length &
+把离散帧插入和连续 denoising 结合，支持非自回归、可变长度视频生成。 &
+长视频需要新的 probability path。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2601.20218}{DenseGRPO} &
+Dense reward &
+用 ODE readout 估计 step-wise reward gain，并按 reward 校准探索噪声。 &
+终局 reward 广播不够。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2602.12233}{Categorical Flow Maps} &
+Few-step discrete flow &
+面向 categorical data 的 few-step flow map 和 endpoint consistency。 &
+离散 flow 的加速/控制空间打开。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2604.04142}{OP-GRPO} &
+Sample efficiency &
+用 replay buffer、sequence-level correction 和 late-step truncation 做 off-policy flow GRPO。 &
+样本效率是硬问题。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2604.15311}{LeapAlign} &
+Direct-gradient alignment &
+用 two-step leap trajectory 缩短反传路径，使 reward gradient 能更新任意 generation step。 &
+direct gradient 是 GRPO 之外的重要路线。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2604.24763}{Tuna-2} &
+Pixel-space UMM &
+用 encoder-free pixel embedding 和 pixel-space flow head 做统一理解、生成和编辑。 &
+flow head 正在进入统一多模态模型内部。 \\
+\bottomrule
+\end{longtable}
+}
+
+\subsubsection*{6. Baseline 判断}
+
+\textbf{当前 baseline 已经包括：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{基础建模：} Flow Matching、Rectified Flow、OT path、reflow、noise schedule / time sampling。
+  \item \textbf{图像底座：} SD3 / MMDiT、FLUX / Kontext、Qwen-Image 等 flow / rectified-flow 系模型。
+  \item \textbf{视频底座：} HunyuanVideo、Flowception，以及各种 flow / DiT 视频生成系统。
+  \item \textbf{后训练：} Flow-GRPO、TempFlow-GRPO、Chunk-GRPO、DenseGRPO、OP-GRPO、LeapAlign。
+  \item \textbf{离散扩展：} Discrete Flow Matching、$\alpha$-Flow、Categorical Flow Maps、FUDOKI 等。
+  \item \textbf{统一多模态：} BAGEL、BLIP3-o、Tuna-2 等把 flow head 接入统一理解生成框架。
+\end{itemize}
+
+\textbf{不建议作为主创新的方向：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 又做一个 ``Flow Matching for image / video / editing''，但没有新的路径、reward 或系统瓶颈；
+  \item 只比较 diffusion 和 flow 的生成质量；
+  \item 只把 GRPO 套到 flow model 上，不解决 ODE-to-SDE、credit、ratio 或样本效率；
+  \item 只做少步蒸馏，但不验证人类偏好、复杂约束、编辑局部性和长时域一致性；
+  \item 只做一个新 scheduler，没有解释 path geometry、solver error 和下游 reward 的关系。
+\end{itemize}
+
+\subsubsection*{7. 下一步科研切口排序}
+
+{\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{longtable}{p{0.21\linewidth} p{0.32\linewidth} p{0.26\linewidth} p{0.10\linewidth}}
+\toprule
+\textbf{方向} & \textbf{核心问题} & \textbf{为什么现在值得做} & \textbf{推荐度} \\
+\midrule
+\key{Credit-calibrated flow post-training} &
+同时处理 step/chunk/branch reward credit 和 policy ratio / logprob scale，避免终局 reward 粗暴广播。 &
+Flow-GRPO 后大量工作都在修 credit，但仍缺统一框架。 &
+\textbf{最高} \\
+\midrule
+\key{Task-adaptive probability path} &
+不同任务是否需要不同 path：T2I、编辑、视频、文字渲染、动作生成的关键 timestep 不同。 &
+现有 path 多为固定设计；后训练信号可以反过来指导路径几何。 &
+\textbf{最高} \\
+\midrule
+\key{Few-step alignment-preserving distillation} &
+少步/单步生成如何同时保留质量、人类偏好、文字准确和可控编辑。 &
+速度是工业硬需求，但普通蒸馏常牺牲对齐和控制。 &
+高 \\
+\midrule
+\key{Long-horizon video / world flow} &
+长视频和世界模型中，如何处理可变长度、跨帧状态、误差漂移和 temporal credit。 &
+视频模型已强，但长时域一致性仍是瓶颈。 &
+高 \\
+\midrule
+\key{Discrete-continuous hybrid flow} &
+语言 token、视觉 token、连续 latent 和动作如何用统一 flow 训练和后训练。 &
+离散 flow 开始接近 AR，但后训练和 scaling recipe 仍不成熟。 &
+高 \\
+\midrule
+\key{Flow-based editing and inverse control} &
+在 flow trajectory 中定位和约束局部区域、身份、文字、布局和物理约束。 &
+编辑/控制是 flow 可微轨迹的自然应用，但 reward 边界难。 &
+中高 \\
+\midrule
+\key{Pixel-space unified flow head} &
+统一多模态模型能否不依赖 VAE / vision encoder，直接用 pixel flow head 统一理解生成。 &
+Tuna-2 说明方向可行，但训练稳定性、token 成本和 loss balance 未解决。 &
+中高 \\
+\bottomrule
+\end{longtable}
+}
+
+\subsubsection*{8. 最推荐论文方向}
+
+\begin{summarybox}
+\textbf{建议题目：}\\
+\textit{Credit-Calibrated Post-Training for Flow Matching Models}\\
+\textbf{一句话：}\\
+把 Flow Matching 后训练从 terminal reward + uniform timestep update，推进到同时校准 trajectory credit、policy ratio scale 和 solver / readout cost 的统一框架。
+\end{summarybox}
+
+\textbf{核心假设：}
+
+\[
+\text{实际更新强度}
+\approx
+\underbrace{\text{reward credit}}_{\text{advantage side}}
+\times
+\underbrace{\text{ratio / logprob scale}}_{\text{policy side}}
+\times
+\underbrace{\text{solver / readout budget}}_{\text{cost side}}.
+\]
+
+现有工作往往只改其中一项：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item DenseGRPO 修 step-wise reward gain；
+  \item TempFlow-GRPO 用 branching 做局部反事实；
+  \item Chunk-GRPO 修优化粒度；
+  \item OP-GRPO 修样本复用；
+  \item LeapAlign 走 direct-gradient 短轨迹。
+\end{itemize}
+
+下一步可以把这些问题统一成：
+
+\[
+\begin{aligned}
+&\text{给定一条 flow trajectory，}\\
+&\text{怎样决定哪些 steps 值得更新、更新多强、}\\
+&\text{用哪种信号、花多少额外采样成本？}
+\end{aligned}
+\]
+
+\textbf{方法草图：}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Trajectory diagnostics：} 对每个 timestep / chunk 估计 reward sensitivity、latent change、entropy、ratio condition number 和 solver error。
+  \item \textbf{Hybrid credit estimator：} 早期结构阶段用 branch counterfactual，中期对象关系用 chunk readout，后期细节阶段用 cheap ODE readout 或 verifier。
+  \item \textbf{Ratio-side calibration：} 根据 ODE-to-SDE 的 transition variance、logprob scale 和 late-step ill-conditioning 动态调 clipping / weighting。
+  \item \textbf{Cost-aware schedule：} 不对所有 step 做昂贵 readout，只在高 sensitivity / 高 entropy / 高 reward uncertainty 的位置分配额外预算。
+  \item \textbf{Unified objective：}
+  \[
+  \sum_t
+  w_t^\text{credit}
+  w_t^\text{ratio}
+  w_t^\text{cost}
+  \cdot
+  \mathcal{L}_t^\text{GRPO / DPO / direct-gradient}.
+  \]
+\end{enumerate}
+
+\textbf{最小可行实验：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 底座：SD3.5 / FLUX / Qwen-Image 等可复现 flow model；
+  \item 任务：GenEval compositionality、OCR / text rendering、人类偏好、复杂图像编辑或短视频 VBench 子集；
+  \item 对比：Flow-GRPO、TempFlow-GRPO、DenseGRPO、OP-GRPO、LeapAlign-style direct-gradient；
+  \item 指标：reward gain、human preference、GenEval / OCR、diversity、reward hacking、训练采样成本、每个 timestep 的有效更新强度；
+  \item 关键图：timestep sensitivity、ratio scale、credit weight 和最终质量之间的相关性。
+\end{itemize}
+
+\textbf{为什么这个方向比“再做一个 GRPO 变体”更强：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它不是只改 reward，也不是只改 sampler，而是把 Flow Matching 后训练的三个结构性瓶颈放到一个框架里；
+  \item 它能解释已有方法为什么有效：DenseGRPO 是 reward side，OP-GRPO 是 sample efficiency / ratio stability，LeapAlign 是 direct-gradient cost path；
+  \item 它可以自然扩展到编辑、视频和统一多模态，因为这些任务都需要知道“轨迹的哪一段决定了哪种能力”。
+\end{itemize}
+
+\subsubsection*{9. 备选高价值方向}
+
+\textbf{方向 A：Reward-aware probability path learning。}
+
+不是固定用线性插值或某个手工 scheduler，而是学习一条对下游 reward / constraint 更友好的 path：
+
+\[
+\min_{\phi,\theta}
+\mathbb{E}
+\left[
+\mathcal{L}_\text{FM}(\theta;\text{path}_\phi)
++
+\lambda \mathcal{C}_\text{solver}
+-
+\beta R(x_0,c)
+\right].
+\]
+
+论文故事：现有 path 主要为生成似然/质量设计，但后训练关心 composition、OCR、preference、editing preservation；路径几何应该和任务 reward 共同优化。
+
+\textbf{方向 B：Few-step flow with alignment guarantees。}
+
+少步模型不能只看 FID / CLIP。应该验证：
+
+\[
+\begin{aligned}
+&\text{few-step quality}
+\quad
+\text{few-step controllability}\\
+&\text{few-step preference}
+\quad
+\text{few-step edit preservation}
+\end{aligned}
+\]
+
+论文故事：工业部署需要 1--4 step 采样，但普通蒸馏容易把复杂约束和人类偏好蒸掉。可做 endpoint consistency + preference preservation + verifier-based distillation。
+
+\textbf{方向 C：Discrete flow post-training。}
+
+离散 flow 的一阶建模已经出现，但还没有像 LLM 那样成熟的 instruction tuning / RLHF / GRPO 框架。可研究：
+
+\[
+\begin{aligned}
+&\text{non-AR discrete generation}
+\quad
+\text{parallel refinement}\\
+&\text{reward-guided editing}
+\quad
+\text{test-time compute scaling}
+\end{aligned}
+\]
+
+论文故事：AR token policy 有天然 logprob；discrete flow 有并行修正和双向推理潜力，但 reward credit、trajectory likelihood 和 sampling control 还不成熟。
+
+\subsubsection*{10. 风险与规避}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{风险：方向过宽。} 规避：主论文只选 flow post-training credit calibration，不同时覆盖离散 flow、视频和统一多模态。
+  \item \textbf{风险：和 DenseGRPO / TempFlow-GRPO 太像。} 规避：强调统一诊断和 ratio-side / cost-side calibration，而不是只提出一种 dense reward。
+  \item \textbf{风险：额外 readout 成本太高。} 规避：做 cost-aware step selection，只对高敏感 timestep 计算昂贵信号。
+  \item \textbf{风险：reward model 不可靠。} 规避：同时报告自动 reward、人类偏好、小规模人工验证和 reward hacking 指标。
+  \item \textbf{风险：底座模型训练成本大。} 规避：先做 LoRA / adapter / limited-step post-training，并用开源 flow model 复现。
+\end{itemize}
+
+\subsubsection*{11. 论文故事}
+
+\begin{quote}
+Flow Matching 已成为图像、视频和统一多模态生成的主流底座，但现有后训练方法仍把复杂生成轨迹简化成最终 reward 和近似均匀的 timestep 更新。这个简化忽略了两个事实：不同阶段对布局、对象关系、文字和细节的贡献不同；ODE-to-SDE 后每个 timestep 的 logprob / ratio scale 也会改变真实更新强度。我们提出 credit-calibrated flow post-training，通过轨迹诊断、混合式 credit estimator、ratio-side calibration 和 cost-aware readout，把终局偏好信号分配到真正有贡献的 flow segments。实验表明，该方法在 compositional generation、OCR、preference alignment 和编辑/视频扩展任务上，用更少无效更新获得更稳定的质量提升，并减少 reward hacking 与背景/细节破坏。
+\end{quote}
+
+\subsubsection*{12. 最终判断}
+
+\begin{conceptbox}
+\textbf{可以做，但题面要升级。}\\
+不要写成“Flow Matching 后续研究”或“GRPO for Flow Matching”。更好的题面是：\key{Flow trajectory as a controllable and alignable computation process}。\\
+\textbf{最小论文切口：} flow post-training 的 credit calibration。\\
+\textbf{核心贡献：} trajectory diagnostics、hybrid credit estimator、ratio-side calibration、cost-aware readout。\\
+\textbf{目标指标：} 不只看最终 reward，还要看每个 timestep 的有效更新、训练成本、reward hacking、diversity、human preference、复杂约束和跨任务泛化。
+\end{conceptbox}

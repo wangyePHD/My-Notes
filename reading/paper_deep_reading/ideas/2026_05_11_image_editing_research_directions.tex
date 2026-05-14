@@ -1,0 +1,409 @@
+\subsection*{Idea 调研：图像编辑领域的下一步科研走向}
+\phantomsection
+\addcontentsline{toc}{subsection}{Idea 调研：图像编辑领域的下一步科研走向}
+
+\begin{conceptbox}
+\textbf{调研日期：} 2026-05-11。\\
+\textbf{核心结论：} 图像编辑已经从 ``instruction editing 能不能做'' 进入 \key{强基础编辑器 + 大规模编辑数据 + 专用 reward / RL + 人类偏好评测} 阶段。下一步不建议做泛泛的 ``再收一个编辑数据集''、``用 CLIP / PickScore 做编辑 reward''、或 ``GRPO for image editing''。更有价值的方向是：把图像编辑建模为 \key{source image 上的可验证状态转移}，让模型显式知道 \key{哪里该变、哪里不能变、变化是否完成、偏好是否符合真实用户}。\\
+\textbf{最推荐方向：} 做 \key{state-aware image editing post-training}：用结构化编辑状态、区域级保持约束、过程级/反事实 reward 和少量真实偏好数据，解决复杂指令、多轮编辑、多参考编辑中的 wrong target、over-edit、identity drift 和 preference mismatch。
+\end{conceptbox}
+
+\subsubsection*{1. Idea 重写}
+
+\textbf{用户原始 idea：}
+
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+继续利用 research_idea_investigation_skill，
+看一下现阶段图像编辑领域下一步的科研走向。
+\end{lstlisting}
+
+\textbf{更准确的问题定义：}
+
+在 \href{https://arxiv.org/abs/2211.09800}{InstructPix2Pix}、\href{https://arxiv.org/abs/2306.10012}{MagicBrush}、\href{https://arxiv.org/abs/2311.10089}{Emu Edit} 之后，指令图像编辑已经不是新任务；在 \href{https://arxiv.org/abs/2407.05282}{UltraEdit}、\href{https://arxiv.org/abs/2411.15738}{AnyEdit}、\href{https://arxiv.org/abs/2504.17761}{Step1X-Edit}、\href{https://arxiv.org/abs/2504.20690}{ICEdit}、\href{https://arxiv.org/abs/2506.15742}{FLUX.1 Kontext}、\href{https://arxiv.org/abs/2508.02324}{Qwen-Image} 这类强 baseline 出现后，下一步的问题不是“能否按文字改图”，而是：
+
+\begin{quote}
+如何让编辑模型在真实复杂指令、多轮修改、多参考图、局部约束和人类偏好下，稳定做到“改对该改的，同时不乱改不该改的”，并且能被可靠评估和后训练？
+\end{quote}
+
+\textbf{本质变量：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{Edit state}：原图中哪些对象、属性、关系、文字和布局应该变化，哪些应该保持。
+  \item \key{Target localization}：复杂指令是否落到正确对象、正确区域、正确属性。
+  \item \key{Source preservation}：背景、身份、风格、构图和非目标对象是否被无意改变。
+  \item \key{Multi-turn consistency}：连续编辑后，之前已经满足的约束是否漂移或被覆盖。
+  \item \key{Preference calibration}：模型输出是否符合真实用户对“改得对、改得自然、改得少”的偏好，而不只是高美学分。
+  \item \key{Credit assignment}：最终失败能否归因到理解、规划、区域选择、denoising / flow 轨迹或 reward 误判。
+\end{itemize}
+
+\subsubsection*{2. 趋势判断}
+
+\textbf{方向仍然重要。} 图像编辑比纯文生图更接近内容生产、设计、电商、广告、照片修图、UI / 包装修改等真实工作流。用户很少只要“从零生成一张图”，更多时候要在已有资产上做可控修改。
+
+\textbf{但一阶问题已经拥挤。}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{任务定义成熟：} InstructPix2Pix 把自然语言编辑指令和 diffusion editing 结合，MagicBrush 提供人工标注的真实编辑数据，Emu Edit 把 recognition / generation task 融入精确编辑训练。
+  \item \textbf{数据规模上来：} UltraEdit、AnyEdit、HumanEdit 等工作已经把 instruction editing 数据推到百万级、多模态、多类型覆盖。
+  \item \textbf{模型 baseline 变强：} Step1X-Edit、ICEdit、FLUX.1 Kontext、SeedEdit、Qwen-Image / Qwen-Image-Edit 等说明通用编辑器已经具备强单轮能力。
+  \item \textbf{reward 与 RL 出现：} \href{https://arxiv.org/abs/2509.26346}{EditReward}、\href{https://arxiv.org/abs/2512.16864}{RePlan}、\href{https://arxiv.org/abs/2512.13276}{CogniEdit}、\href{https://arxiv.org/abs/2601.03467}{ThinkRL-Edit}、\href{https://arxiv.org/abs/2602.14186}{UniRef-Image-Edit}、\href{https://arxiv.org/abs/2604.09386}{RC-GRPO-Editing}、\href{https://arxiv.org/abs/2604.19406}{HP-Edit} 说明“编辑专属后训练”已经不是空白。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{趋势判断：}\\
+图像编辑还值得做，但不能做成“又一个 instruction editing SFT”或“又一个通用 GRPO”。值得做的是二阶问题：\key{复杂指令状态建模、区域级过程 reward、多轮编辑漂移、多参考一致性、真实人类偏好校准、文本/布局/标识精确编辑}。
+\end{summarybox}
+
+\subsubsection*{3. 本质判断}
+
+图像编辑不是普通文生图：
+
+\[
+(I_\text{src}, c)
+\Rightarrow
+I_\text{edit}
+\]
+
+这里的目标不是让 $I_\text{edit}$ 看起来像 prompt，而是让它满足一个\key{相对原图的差分约束}：
+
+\[
+\Delta(I_\text{src}, I_\text{edit})
+\approx
+\text{the intended edit in } c
+\]
+
+更完整地说，编辑结果要同时最大化：
+
+\[
+R_\text{edit}
+=
+R_\text{target}
++
+R_\text{preserve}
++
+R_\text{quality}
++
+R_\text{preference}
++
+R_\text{consistency}
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $R_\text{target}$：目标区域是否真的完成指令；
+  \item $R_\text{preserve}$：非目标区域、身份、背景、构图是否保持；
+  \item $R_\text{quality}$：画质、自然度、伪影；
+  \item $R_\text{preference}$：真实用户是否更喜欢；
+  \item $R_\text{consistency}$：多轮、多参考、多对象场景下约束是否持续成立。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{关键误区：}\\
+如果只优化图文相似度，模型容易把编辑任务退化成重新生成；如果只优化保持，模型会 under-edit；如果只优化美学偏好，模型可能把原图资产、身份、文字或产品细节改坏。图像编辑的 reward 必须理解“变化”和“保持”的边界。
+\end{warnbox}
+
+\subsubsection*{4. 供需判断}
+
+\textbf{真实需求：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{设计工作流：} 用户需要对已有素材做局部改动，而不是每次重生成。
+  \item \textbf{电商与广告：} 产品、logo、包装、文字、品牌色必须保持准确，背景和场景可以改。
+  \item \textbf{多轮协作：} 用户常常连续提出“小改一下”，模型需要保留之前已经满意的部分。
+  \item \textbf{可审计性：} 工业系统需要知道失败是因为理解错、定位错、执行错，还是评价模型错。
+\end{itemize}
+
+\textbf{现有供给：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 单轮编辑模型已经很强；
+  \item 大规模合成/人工编辑数据已经存在；
+  \item VLM-as-judge、编辑 reward、人类偏好 reward 开始成熟；
+  \item 区域规划、思维链、multi-reference、region-constrained GRPO 已经出现。
+\end{itemize}
+
+\textbf{供给不足：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 多数 benchmark 仍偏单轮、最终图评分，难以定位失败步骤；
+  \item reward 经常把 target success、preservation、aesthetics 和 human preference 混成一个分数；
+  \item 多轮编辑缺少统一状态表示和漂移评测；
+  \item 多参考编辑仍容易在 identity、style、pose、object relation 之间互相污染；
+  \item 真实业务最在意的文字、logo、布局、材质和产品细节仍不稳定。
+\end{itemize}
+
+\subsubsection*{5. 领域时间线}
+
+{\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{longtable}{p{0.08\linewidth} p{0.18\linewidth} p{0.16\linewidth} p{0.34\linewidth} p{0.16\linewidth}}
+\toprule
+\textbf{时间} & \textbf{工作} & \textbf{阶段} & \textbf{主要贡献} & \textbf{对当前判断的影响} \\
+\midrule
+2022--2023 &
+\href{https://arxiv.org/abs/2211.09800}{InstructPix2Pix} &
+Task baseline &
+用 GPT-3 生成编辑指令和前后图描述，结合 Stable Diffusion 做 instruction-based image editing。 &
+指令编辑任务已经被定义，不能再把任务本身当创新。 \\
+\midrule
+2023 &
+\href{https://arxiv.org/abs/2306.10012}{MagicBrush} &
+Human data / benchmark &
+构建人工标注的真实图像编辑数据集，覆盖单轮和多轮编辑。 &
+多轮编辑从早期就存在，但后续仍没有被充分解决。 \\
+\midrule
+2023 &
+\href{https://arxiv.org/abs/2311.10089}{Emu Edit} &
+Task mixture / model &
+把多种编辑类型组织成可学习任务，强调精确识别与生成能力。 &
+说明单纯“更多任务类型”已是 baseline。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2407.05282}{UltraEdit} &
+Large-scale data &
+构建大规模 instruction-based fine-grained editing 数据，强化区域和细粒度编辑。 &
+普通扩数据需要非常明确的新监督，否则新意不足。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2411.15738}{AnyEdit} &
+Multimodal editing data &
+覆盖多模态、多类型编辑任务，推动通用编辑数据集规模化。 &
+通用编辑数据集已经拥挤，下一步应补状态、偏好或过程监督。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2412.04280}{HumanEdit} &
+Real instruction editing &
+强调开放域真实用户指令和人类偏好相关编辑。 &
+真实用户需求和合成数据之间存在分布差异。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2504.17761}{Step1X-Edit} &
+Open model / SFT &
+提出开放图像编辑模型和高质量训练流程。 &
+强开源 baseline 出现后，泛 SFT 贡献会被压缩。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2504.20690}{ICEdit} &
+In-context editing &
+用 in-context generation 路线实现指令图像编辑。 &
+编辑正在被统一到更通用的 in-context 生成框架。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2506.05083}{SeedEdit 3.0} &
+Strong editor / data &
+面向高质量 image editing 的数据和模型训练。 &
+闭源/强模型进一步提高普通编辑方法的门槛。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2506.15742}{FLUX.1 Kontext} &
+Generative flow matching &
+在 flow matching 框架下做 in-context image generation and editing，并提出 KontextBench。 &
+强产品级 baseline 出现，评测必须覆盖复杂和真实编辑。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2508.02324}{Qwen-Image} &
+Foundation model &
+强调复杂文本渲染和精确图像编辑等能力。 &
+文字/布局/精确编辑成为基础模型能力竞争点。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2509.26346}{EditReward} &
+Reward model &
+面向 instruction-guided image editing 训练 human-aligned reward model。 &
+编辑专属 reward 已出现，普通 VLM judge 不再够新。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2512.16864}{RePlan} &
+Planning / complex editing &
+用 reasoning-guided region planning 拆解复杂编辑指令，再交给编辑器执行。 &
+复杂编辑需要先规划目标区域和操作。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2512.13276}{CogniEdit} &
+Dense RL / fine-grained editing &
+结合多模态推理、token focus 和 Dense GRPO 做细粒度编辑。 &
+trajectory-level 信号正在进入图像编辑。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2601.03467}{ThinkRL-Edit} &
+Reasoning-centric RL &
+把 planning、reflection、checklist reward 引入复杂图像编辑后训练。 &
+“让模型先想清楚再改”已成为明确路线。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2602.14186}{UniRef-Image-Edit} &
+Multi-reference editing &
+处理可扩展一致的多参考图编辑，提出 multi-source GRPO。 &
+多参考一致性是强二阶问题。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2604.09386}{RC-GRPO-Editing} &
+Region-constrained RL &
+在 flow-based editing 中用区域约束和 attention concentration reward 降低背景扰动。 &
+区域级探索和 reward 是编辑 RL 的关键。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2604.19406}{HP-Edit} &
+Human preference post-training &
+构建 RealPref-50K、HP-Scorer、RealPref-Bench，系统化引入人类偏好后训练。 &
+真实偏好已经成为下一代编辑模型的核心训练信号。 \\
+\bottomrule
+\end{longtable}
+}
+
+\subsubsection*{6. Baseline 判断}
+
+\textbf{当前社区 baseline：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{数据/SFT baseline：} InstructPix2Pix、MagicBrush、Emu Edit、UltraEdit、AnyEdit、HumanEdit、Step1X-Edit。
+  \item \textbf{强编辑器 baseline：} Step1X-Edit、ICEdit、SeedEdit、FLUX.1 Kontext、Qwen-Image / Qwen-Image-Edit。
+  \item \textbf{评测/reward baseline：} EditBench、MagicBrush、Emu Edit、KontextBench、EditReward、HP-Scorer、RealPref-Bench。
+  \item \textbf{后训练 baseline：} RePlan、CogniEdit、ThinkRL-Edit、UniRef-Image-Edit、RC-GRPO-Editing、HP-Edit。
+\end{itemize}
+
+\textbf{不建议作为主线的方向：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 只做一个更大的普通 instruction editing 数据集；
+  \item 只把 CLIP / ImageReward / PickScore 加权成 editing reward；
+  \item 只把 GRPO / DPO 套到编辑模型上，不解决区域、状态或偏好分解；
+  \item 只做 prompt engineering 或 test-time VLM judge，没有训练信号和系统性评测；
+  \item 只做单轮“看起来更好”的 demo，不证明 source preservation 和 multi-turn stability。
+\end{itemize}
+
+\subsubsection*{7. 下一步科研切口排序}
+
+{\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{longtable}{p{0.20\linewidth} p{0.31\linewidth} p{0.25\linewidth} p{0.13\linewidth}}
+\toprule
+\textbf{方向} & \textbf{核心问题} & \textbf{为什么现在值得做} & \textbf{推荐度} \\
+\midrule
+\key{状态转移式编辑后训练} &
+把编辑显式表示成 target state、preserve state 和 delta constraint，再做 reward / RL。 &
+现有 reward 多是最终分数；复杂编辑失败通常来自“该变/不该变”边界不清。 &
+\textbf{最高} \\
+\midrule
+\key{多轮编辑记忆与漂移控制} &
+连续 5--10 轮编辑后，之前满足的约束是否仍成立，是否可以 rollback / verify。 &
+MagicBrush 已有多轮雏形，但强模型时代多轮真实工作流仍是痛点。 &
+\textbf{最高} \\
+\midrule
+\key{多参考一致性编辑} &
+从多张参考图中绑定身份、风格、姿态、产品属性和场景关系。 &
+UniRef 已说明需求存在，但 identity / style / layout 的冲突仍难解。 &
+高 \\
+\midrule
+\key{人类偏好分解 reward} &
+把偏好拆成 edit success、preservation、naturalness、minimality、brand/text fidelity。 &
+HP-Edit 说明人类偏好进入主线；下一步是可解释和可控的偏好分解。 &
+高 \\
+\midrule
+\key{文字、logo、布局精确编辑} &
+在图片中准确修改文字、商标、UI 布局、包装信息，且不破坏原图。 &
+Qwen-Image 等模型显示文字能力成为竞争点；工业需求强。 &
+高 \\
+\midrule
+\key{编辑 agent：规划-执行-验证闭环} &
+用 planner 定位和分解，editor 执行，verifier 检查，再自动修正。 &
+RePlan、ThinkRL-Edit 已开路；还有空间把闭环训练成可学习策略。 &
+中高 \\
+\bottomrule
+\end{longtable}
+}
+
+\subsubsection*{8. 最推荐论文方向}
+
+\begin{summarybox}
+\textbf{建议题目：}\\
+\textit{State-Transition Rewarding for Reliable Multi-Turn Image Editing}\\
+\textbf{一句话：}\\
+把图像编辑从“生成一张符合指令的新图”改写成“对原图状态做可验证、可追踪、最小必要的状态转移”，并用区域级、反事实和人类偏好 reward 做后训练。
+\end{summarybox}
+
+\textbf{核心假设：}
+
+\[
+\text{state-aware reward}
+>
+\text{final-only VLM reward}
+\]
+
+尤其在复杂指令、多轮编辑、多参考编辑中，结构化状态能显著降低：
+
+\[
+\text{wrong target}
+\quad
+\text{over-edit}
+\quad
+\text{identity drift}
+\quad
+\text{layout/text corruption}
+\quad
+\text{preference mismatch}
+\]
+
+\textbf{方法草图：}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{State parser：} 用 VLM / MLLM 把编辑指令解析成结构化状态：
+  \[
+  s=(\text{target},\text{operation},\text{new attributes},\text{preserve constraints},\text{optional mask/box})
+  \]
+  \item \textbf{Counterfactual negatives：} 自动构造 wrong-target、under-edit、over-edit、identity-drift、text-corruption 等 hard negatives。
+  \item \textbf{Disentangled reward：} 分别训练或校准 $R_\text{target}$、$R_\text{preserve}$、$R_\text{text/layout}$、$R_\text{identity}$、$R_\text{human}$，避免一个标量掩盖失败类型。
+  \item \textbf{Post-training：} 对开放编辑模型做 DPO / GRPO / rejection sampling fine-tuning。若能访问 flow trajectory，则加入 region-constrained 或 dense process reward；若不能，则先做 candidate-level preference optimization。
+  \item \textbf{Verifier loop：} 训练一个 edit-state verifier，判断编辑后哪些状态已经满足、哪些需要下一轮修正。
+\end{enumerate}
+
+\textbf{最小可行实验：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 选一个开源编辑模型作为主模型，例如 Step1X-Edit / ICEdit / Qwen-Image-Edit 可用版本；
+  \item 从 MagicBrush、AnyEdit、UltraEdit、HumanEdit 中抽取复杂局部编辑任务；
+  \item 生成每个样本的结构化 edit state 和 3--5 个 hard negative；
+  \item 训练 state-aware reward 或 preference ranker；
+  \item 比较 final-only VLM judge、普通 preference reward、state-aware reward 三种后训练方式；
+  \item 在单轮复杂编辑、多轮编辑和文本/布局编辑三个子集上报告 target success、preservation、human preference 和 drift rate。
+\end{itemize}
+
+\textbf{关键 ablation：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 去掉 preserve state，看 over-edit 是否上升；
+  \item 去掉 counterfactual negatives，看 wrong-target 是否上升；
+  \item 去掉 human preference calibration，看模型是否变成“指标好但用户不喜欢”；
+  \item 单轮训练迁移到多轮，测 drift rate；
+  \item global reward 对比 region-aware reward，测背景污染。
+\end{itemize}
+
+\subsubsection*{9. 风险与规避}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{风险：reward 被模型 hack。} 规避：使用 held-out human preference、小规模人工复核和 counterfactual hard negatives。
+  \item \textbf{风险：状态解析器本身会错。} 规避：从容易验证的编辑类型开始，例如颜色、对象替换、局部添加/移除、文字修改，再逐步扩展到关系和风格。
+  \item \textbf{风险：强闭源模型无法公平比较。} 规避：主实验用开源模型，闭源模型只作为 API baseline 或 case study。
+  \item \textbf{风险：问题太大。} 规避：先限定在 \key{复杂局部编辑 + 多轮保持}，不要同时覆盖全部编辑类型。
+  \item \textbf{风险：缺少真实偏好数据。} 规避：用小规模真实偏好校准 reward，大规模部分用自动 hard negative 补足。
+\end{itemize}
+
+\subsubsection*{10. 论文故事}
+
+\begin{quote}
+现有图像编辑模型已经能生成高质量单轮编辑结果，但在复杂指令和多轮工作流里仍会改错对象、过度修改背景、丢失身份和破坏文字布局。根本原因是当前训练信号多把编辑结果压成最终偏好分数，缺少对“目标状态应该如何变化、非目标状态必须如何保持”的显式建模。我们提出 state-transition editing post-training：先解析编辑状态，再用区域级、反事实和人类偏好 reward 优化编辑模型，并用 verifier 跟踪多轮状态漂移。实验显示该方法在复杂局部编辑、多轮编辑和真实偏好评测上同时提升编辑成功率和保持能力。
+\end{quote}
+
+\subsubsection*{11. 最终判断}
+
+\begin{conceptbox}
+\textbf{可以做，但必须换题面。}\\
+不要把题目写成“图像编辑大模型”或“GRPO 提升图像编辑”。更强的题面是：\key{Reliable image editing as state transition}。\\
+\textbf{最小论文切口：} 复杂局部编辑 + 多轮保持。\\
+\textbf{核心贡献：} 结构化 edit state、反事实 hard negatives、分解式 edit reward、多轮 drift benchmark / verifier。\\
+\textbf{目标指标：} 不只报告美学分和 VLM 分数，而要报告 target success、source preservation、identity/text/layout consistency、drift rate 和 human preference。
+\end{conceptbox}
+

@@ -1,0 +1,1034 @@
+% ============================================================
+% SenseNova-U1 / NEO-Unify generation pathway notes
+% ============================================================
+
+\section{T2I / Editing / Flow-Matching Generation Pathway：按源码分块读}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 不再先按概念拆 T2I / editing / interleave，而是\key{按官方源码本身的文件与函数顺序}阅读 generation pathway：先看三个 example wrapper 如何把参数转给模型，再看 \texttt{modeling\_fm\_modules.py} 里生成头的定义，接着看 \texttt{modeling\_neo\_chat.py} 的 helper，最后逐段读 \texttt{interleave\_gen()}、\texttt{it2i\_generate()} 和 \texttt{t2i\_generate()}。\\
+\textbf{当前阅读基准：} 本节基于官方仓库 commit \texttt{2e339f94e992464d468794286af34ca759cb7ac0} 的 \texttt{examples/t2i/inference.py}、\texttt{examples/editing/inference.py}、\texttt{examples/interleave/inference.py}、\texttt{modeling\_neo\_chat.py} 与 \texttt{modeling\_fm\_modules.py}。
+\end{conceptbox}
+
+\begin{summarybox}
+\textbf{本节读法：} 每一块先标出源码位置，再解释这段代码做什么。不要先记抽象结论；先沿着源码看到：wrapper 调哪个模型方法，模型方法怎么建 query/cache，怎么初始化噪声图，怎么在 loop 里调用 \texttt{\_t2i\_predict\_v()}，最后怎么 \texttt{unpatchify} 回图像。
+\end{summarybox}
+
+\subsection{一、example wrapper：三个入口都只是薄转发}
+
+\subsubsection{1. \texttt{examples/t2i/inference.py:64--122}}
+
+T2I wrapper 的核心代码在 \texttt{SenseNovaU1T2I.generate()}。它不做生成逻辑，只把 CLI / JSONL 解析出的参数交给 \texttt{model.t2i\_generate()}：
+
+\begin{lstlisting}[language=Python]
+out = self.model.t2i_generate(
+    self.tokenizer,
+    prompt,
+    image_size=image_size,
+    cfg_scale=cfg_scale,
+    cfg_norm=cfg_norm,
+    timestep_shift=timestep_shift,
+    cfg_interval=cfg_interval,
+    num_steps=num_steps,
+    batch_size=batch_size,
+    seed=seed,
+    think_mode=think_mode,
+)
+\end{lstlisting}
+
+所以从源码阅读角度，\texttt{examples/t2i/inference.py} 只回答两个问题：一是输出尺寸、CFG、步数、seed 这些参数从哪里来；二是模型返回的 normalized tensor 如何经过 \texttt{\_to\_pil()} 保存成图片。真正的 T2I 生成逻辑在 \texttt{modeling\_neo\_chat.py:1619--1787}。
+
+\subsubsection{2. \texttt{examples/editing/inference.py:171--230}}
+
+Editing wrapper 的 \texttt{SenseNovaU1Editing.edit()} 同样只是转发，但比 T2I 多了输入图片列表和 \texttt{img\_cfg\_scale}：
+
+\begin{lstlisting}[language=Python]
+output = self.model.it2i_generate(
+    self.tokenizer,
+    prompt,
+    list(images),
+    image_size=image_size,
+    cfg_scale=cfg_scale,
+    img_cfg_scale=img_cfg_scale,
+    cfg_norm=cfg_norm,
+    timestep_shift=timestep_shift,
+    cfg_interval=cfg_interval,
+    num_steps=num_steps,
+    batch_size=batch_size,
+    think_mode=think_mode,
+    seed=seed,
+)
+\end{lstlisting}
+
+因此 editing 的源码阅读重点不是 wrapper，而是 \texttt{it2i\_generate()} 里输入图像如何先被转成 \texttt{pixel\_values/grid\_hw}，再写入 \texttt{<IMG\_CONTEXT>} 槽位，最后变成 prefix cache。
+
+\subsubsection{3. \texttt{examples/interleave/inference.py:119--167}}
+
+Interleave wrapper 调的是 \texttt{model.interleave\_gen()}：
+
+\begin{lstlisting}[language=Python]
+text, image_tensors = self.model.interleave_gen(
+    self.tokenizer,
+    prompt,
+    images=list(input_images),
+    image_size=image_size,
+    cfg_scale=cfg_scale,
+    img_cfg_scale=img_cfg_scale,
+    timestep_shift=timestep_shift,
+    cfg_interval=cfg_interval,
+    num_steps=num_steps,
+    system_message=system_message,
+    think_mode=think_mode,
+    seed=seed,
+)
+\end{lstlisting}
+
+这一点很重要：interleave 不是先完整生成文本再额外调用图像生成器，而是在 \texttt{interleave\_gen()} 的自回归循环中，遇到 \texttt{<img>} token 才切入图像 flow loop。
+
+\subsection{二、\texttt{modeling\_fm\_modules.py}：生成头和时间步 embedding}
+
+这部分源码定义的是 generation pathway 会用到的“小模块”，它们不是完整 pipeline，只是在 \texttt{modeling\_neo\_chat.py} 中被组装进 \texttt{fm\_modules}。
+
+\subsubsection{1. \texttt{TimestepEmbedder}}
+
+\texttt{TimestepEmbedder} 把标量时间步 \(t\) 变成和 LLM hidden size 对齐的 embedding。后面在采样 loop 里会看到它直接加到当前图像 token embedding 上：
+
+\begin{lstlisting}[language=Python]
+timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded)
+image_embeds = image_embeds + timestep_embeddings
+\end{lstlisting}
+
+也就是说，时间条件不是单独进一个 scheduler 对象，而是作为 token embedding 的一部分进入 Qwen3 decoder。
+
+\subsubsection{2. \texttt{fm\_head}}
+
+\texttt{fm\_head} 的职责是把 Qwen3 输出的图像 token hidden state 投回 RGB patch 维度。普通分支在 \texttt{NEOChatModel.\_\_init\_\_()} 中构造为：
+
+\begin{lstlisting}[language=Python]
+fm_head = nn.Sequential(
+    nn.Linear(llm_hidden_size, 4096, bias=True),
+    nn.GELU(),
+    nn.Linear(4096, output_dim, bias=True),
+)
+\end{lstlisting}
+
+其中 \texttt{output\_dim} 是一块 RGB patch 的像素维度：
+
+\begin{lstlisting}[language=Python]
+merge_size = int(1 / self.downsample_ratio)
+output_dim = 3 * (patch_size * merge_size) ** 2
+\end{lstlisting}
+
+源码读到这里先记住一句：\key{Qwen3 输出 hidden state，\texttt{fm\_head} 把 hidden state 变成 RGB patch 预测。}
+
+\subsection{三、\texttt{modeling\_neo\_chat.py:366--623}：generation helper 逐块读}
+
+\subsubsection{1. \texttt{patchify()} / \texttt{unpatchify()}：源码行 366--395}
+
+生成 loop 里的图像状态是 \texttt{image\_prediction}，形状是 \texttt{[B, 3, H, W]}。\texttt{patchify()} 把它切成 patch 序列：
+
+\begin{lstlisting}[language=Python]
+def patchify(self, images, patch_size, channel_first=False):
+    h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
+    x = images.reshape(shape=(images.shape[0], 3, h, patch_size, w, patch_size))
+    if channel_first:
+        x = torch.einsum('nchpwq->nhwcpq', x)
+    else:
+        x = torch.einsum('nchpwq->nhwpqc', x)
+    x = x.reshape(shape=(images.shape[0], h * w, patch_size**2 * 3))
+    return x
+\end{lstlisting}
+
+这里有两个用法，后面会反复出现：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{作为 flow 状态：} \texttt{patchify(image\_prediction, patch\_size * merge\_size)} 得到要被 Euler 更新的 \texttt{z}；
+  \item \textbf{作为 vision encoder 输入：} \texttt{patchify(image\_prediction, patch\_size, channel\_first=True)} 得到送入生成侧 vision encoder 的 patch。
+\end{itemize}
+
+\texttt{unpatchify()} 做反向操作，把更新后的 patch 序列拼回 \texttt{[B,3,H,W]} 图像：
+
+\begin{lstlisting}[language=Python]
+def unpatchify(sle, x, patch_size, h=None, w=None):
+    if h is None or w is None:
+        h = w = int(x.shape[1]**.5)
+    else:
+        h = h // patch_size
+        w = w // patch_size
+    x = x.reshape(shape=(x.shape[0], h, w, patch_size, patch_size, 3))
+    x = torch.einsum('nhwpqc->nchpwq', x)
+    images = x.reshape(shape=(x.shape[0], 3, h * patch_size, w * patch_size))
+    return images
+\end{lstlisting}
+
+\subsubsection{2. Euler 与时间表：源码行 397--429}
+
+\texttt{\_euler\_step()} 很短：
+
+\begin{lstlisting}[language=Python]
+def _euler_step(self, v_pred, z, t, t_next):
+    z_next = z + (t_next - t) * v_pred
+    return z_next
+\end{lstlisting}
+
+主循环里没有直接调用这个 helper，而是展开写成：
+
+\begin{lstlisting}[language=Python]
+z = z + (t_next - t) * v_pred
+\end{lstlisting}
+
+\texttt{\_apply\_time\_schedule()} 对 \texttt{torch.linspace(0,1,num\_steps+1)} 得到的时间步做 shift：
+
+\begin{lstlisting}[language=Python]
+sigma = 1 - t
+shift = timestep_shift
+sigma = shift * sigma / (1 + (shift - 1) * sigma)
+return 1 - sigma
+\end{lstlisting}
+
+所以源码里所谓 \texttt{timestep\_shift}，不是换一个采样器，而是重新映射 \(t\) 的分布。
+
+\subsubsection{3. T2I 文本输入和图像位置索引：源码行 431--466}
+
+\texttt{\_build\_t2i\_query()} 先用 conversation template 拼 prompt：
+
+\begin{lstlisting}[language=Python]
+template = get_conv_template(self.template)
+template.system_message = self.system_message if system_message is None else system_message
+template.append_message(template.roles[0], prompt_text)
+template.append_message(template.roles[1], None)
+return template.get_prompt() + append_text
+\end{lstlisting}
+
+\texttt{\_build\_t2i\_text\_inputs()} 把纯文本 query token 化，并构造 \texttt{t/h/w} 三轴索引：
+
+\begin{lstlisting}[language=Python]
+t_idx = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
+h_idx = torch.zeros_like(t_idx)
+w_idx = torch.zeros_like(t_idx)
+indexes = torch.stack([t_idx, h_idx, w_idx], dim=0)
+attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
+\end{lstlisting}
+
+纯文本没有图像二维坐标，所以 \texttt{h/w} 全是 0。
+
+\texttt{\_build\_t2i\_image\_indexes()} 则给将要生成的图像 token 建位置：
+
+\begin{lstlisting}[language=Python]
+t_image = torch.full((token_h * token_w,), text_len, dtype=torch.long, device=device)
+idx = torch.arange(token_h * token_w, device=device, dtype=torch.long)
+h_image = idx // token_w
+w_image = idx % token_w
+return torch.stack([t_image, h_image, w_image], dim=0)
+\end{lstlisting}
+
+这一段说明生成图像 token 仍然进入 Qwen3 的 \texttt{t/h/w} 位置体系：同一张图里的 token 拥有同一个 \texttt{t}，但有不同的 \texttt{h/w}。
+
+\subsubsection{4. Prefix forward：源码行 459--476}
+
+T2I 前缀用 \texttt{input\_ids}：
+
+\begin{lstlisting}[language=Python]
+out = self.language_model.model(
+    input_ids=input_ids,
+    indexes=indexes,
+    attention_mask=attention_mask,
+    use_cache=True,
+)
+return out.past_key_values, out.last_hidden_state
+\end{lstlisting}
+
+IT2I / interleave 前缀用 \texttt{inputs\_embeds}，因为其中可能已经塞入视觉 embedding：
+
+\begin{lstlisting}[language=Python]
+out = self.language_model.model(
+    inputs_embeds=input_imbeds,
+    indexes=indexes,
+    attention_mask=attention_mask,
+    use_cache=True,
+    image_gen_indicators=gen_indicators.view(1, -1) if gen_indicators is not None else None
+)
+\end{lstlisting}
+
+这就是源码里 T2I 和 editing 的关键分叉：\key{T2I prefix 是纯文本 token；editing prefix 是已经替换过 \texttt{<IMG\_CONTEXT>} 的 embedding 序列。}
+
+\subsubsection{5. \texttt{\_generate\_think()}：源码行 507--560}
+
+如果打开 \texttt{think\_mode}，\texttt{t2i\_generate()} / \texttt{it2i\_generate()} 不会马上进图像 loop，而是先从 prefix 的 logits 开始自回归生成 \texttt{<think>...</think>}：
+
+\begin{lstlisting}[language=Python]
+next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
+for _ in range(max_think_tokens):
+    token_item = next_token.item()
+    if token_item == eos_token_id:
+        break
+    if token_item == think_end_token_id:
+        ... append </think> to cache ...
+        break
+    ... append generated token to cache ...
+\end{lstlisting}
+
+生成完 think block 后，源码再把 \texttt{"\textbackslash n\textbackslash n" + IMG\_START\_TOKEN} 追加进 cache：
+
+\begin{lstlisting}[language=Python]
+append_ids = tokenizer('\n\n' + IMG_START_TOKEN, return_tensors='pt', add_special_tokens=False)['input_ids']
+t_idx = self._append_text_tokens_to_cache(past_key_values, t_idx, append_ids)
+\end{lstlisting}
+
+所以 \texttt{think\_mode} 的源码含义是：\textbf{先让模型生成思考文本，并把这段思考也写进 prefix cache，再开始图像生成。}
+
+\subsubsection{6. \texttt{\_t2i\_predict\_v()}：源码行 562--602}
+
+这是所有图像采样 loop 复用的核心函数。输入是当前图像 token embedding、图像位置索引、prefix cache、当前时间 \(t\)、当前 patch 状态 \texttt{z}：
+
+\begin{lstlisting}[language=Python]
+outputs = self.language_model.model(
+    inputs_embeds=input_embeds,
+    image_gen_indicators=torch.ones(..., dtype=torch.bool),
+    indexes=indexes_image,
+    attention_mask=attn_mask,
+    past_key_values=past_key_values,
+    update_cache=False,
+    use_cache=True,
+)
+\end{lstlisting}
+
+这里 \texttt{update\_cache=False} 很关键：每个采样步只是临时把当前图像 token 接到 prefix 后预测速度，不把每一步的噪声图永久追加到 cache。
+
+接着 \texttt{fm\_head} 把图像 token hidden state 投成 \texttt{x\_pred}：
+
+\begin{lstlisting}[language=Python]
+x_pred = self.fm_modules["fm_head"](
+    outputs.last_hidden_state[:, -image_token_num:].view(B, L, -1)
+).view(B, L, -1)
+\end{lstlisting}
+
+最后得到 velocity：
+
+\begin{lstlisting}[language=Python]
+v_pred = (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
+return v_pred
+\end{lstlisting}
+
+到这里为止，源码已经告诉我们图像生成 loop 的最小单元：\texttt{image\_embeds + prefix cache -> Qwen3 -> fm\_head -> v\_pred}。
+
+\subsubsection{7. \texttt{\_build\_it2i\_inputs()}：源码行 604--623}
+
+editing / interleave 的输入图像不是直接作为图片对象送进 Qwen3，而是先展开成 \texttt{<IMG\_CONTEXT>} 槽位，再把视觉 embedding 写进去：
+
+\begin{lstlisting}[language=Python]
+indexes = self.get_thw_indexes(input_ids[0], grid_hw)
+attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
+input_embeds = self.language_model.get_input_embeddings()(input_ids)
+
+vit_embeds = self.extract_feature(pixel_values, grid_hw=grid_hw)
+selected = (input_ids == self.img_context_token_id)
+input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+\end{lstlisting}
+
+这段和上一节 VQA pathway 是同一个机制。区别只在后续目标：VQA 后面生成文本，editing / interleave 后面可能继续进入图像采样 loop。
+
+\subsection{四、\texttt{interleave\_gen():954--1295}：源码先写 interleave，所以先按它读}
+
+\subsubsection{1. 行 979--1044：准备 special token、输入图像和 condition cache}
+
+函数一开始设置 special token id 和 \texttt{t\_eps}：
+
+\begin{lstlisting}[language=Python]
+self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+self.img_start_token_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
+self.config.t_eps = t_eps
+\end{lstlisting}
+
+如果传了输入图像，源码先补足 prompt 里的 \texttt{<image>}，再逐张调用 \texttt{load\_image\_native()}：
+
+\begin{lstlisting}[language=Python]
+image_token_count = prompt.count('<image>')
+assert len(images) >= image_token_count
+if len(images) > image_token_count:
+    prompt = "<image>\n" * (len(images) - image_token_count) + prompt
+
+for image in images:
+    cur_pixel_values, cur_grid_hw = load_image_native(...)
+\end{lstlisting}
+
+接着构造 condition query，并把每个 \texttt{<image>} 替换成 \texttt{<img>} + 多个 \texttt{<IMG\_CONTEXT>} + \texttt{</img>}：
+
+\begin{lstlisting}[language=Python]
+num_patch_token = int(grid_hw_list[i][0, 0] * grid_hw_list[i][0, 1] * self.downsample_ratio**2)
+image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
+query = query.replace('<image>', image_tokens, 1)
+\end{lstlisting}
+
+然后 \texttt{\_build\_it2i\_inputs()} 把输入图片视觉 embedding 写入槽位，再跑一次 LLM 得到 condition cache：
+
+\begin{lstlisting}[language=Python]
+input_embeds_cond, indexes_cond, attention_mask_cond = self._build_it2i_inputs(...)
+outputs_cond = self.language_model(inputs_embeds=input_embeds_cond, indexes=indexes_cond, attention_mask=attention_mask_cond, use_cache=True)
+past_key_values_cond = outputs_cond.past_key_values
+\end{lstlisting}
+
+\subsubsection{2. 行 1046--1065：准备 text-uncondition 和 image-uncondition cache}
+
+interleave 图像生成时有三条 cache：
+
+\begin{lstlisting}[language=Python]
+# text uncondition: only keep input images
+question_text_uncondition = '<image>' * len(images)
+...
+past_key_values_tu = outputs_tu.past_key_values
+
+# image uncondition: empty T2I query
+query_img_uncond = self._build_t2i_query("", append_text=IMG_START_TOKEN)
+...
+past_key_values_iu = outputs_iu.past_key_values
+\end{lstlisting}
+
+这里不要把它理解成抽象概念，按源码看就是三份 \texttt{past\_key\_values}：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{past\_key\_values\_cond}：} 当前完整上下文；
+  \item \textbf{\texttt{past\_key\_values\_tu}：} 去掉文本条件，只保留输入图像；
+  \item \textbf{\texttt{past\_key\_values\_iu}：} 空图像生成条件。
+\end{itemize}
+
+\subsubsection{3. 行 1072--1127：文本自回归，直到遇到 \texttt{<img>}}
+
+主循环先从 \texttt{outputs\_cond.logits} 取下一个 token：
+
+\begin{lstlisting}[language=Python]
+next_token = torch.argmax(outputs_cond.logits[:, -1, :], dim=-1)
+\end{lstlisting}
+
+只要下一个 token 不是 EOS，也不是 \texttt{<img>}，就按普通 LLM decoding 追加到 condition cache：
+
+\begin{lstlisting}[language=Python]
+while True:
+    token_item = next_token.item()
+    if token_item == eos_token_id or token_item == self.img_start_token_id:
+        break
+    ...
+    outputs_cond = self.language_model(
+        input_ids=next_token.unsqueeze(0),
+        past_key_values=past_key_values_cond,
+        use_cache=True
+    )
+\end{lstlisting}
+
+遇到 \texttt{<img>} 后，源码先把这个 token 写入 condition 和 text-uncondition 两个 cache：
+
+\begin{lstlisting}[language=Python]
+outputs_cond = self.language_model(input_ids=next_token.unsqueeze(0), past_key_values=past_key_values_cond, use_cache=True)
+outputs_tu = self.language_model(input_ids=next_token.unsqueeze(0), past_key_values=past_key_values_tu, use_cache=True)
+\end{lstlisting}
+
+到这一行，控制流才真正从“文本生成”切到“图像生成”。
+
+\subsubsection{4. 行 1128--1178：为即将生成的一张图准备位置、噪声和 KV cache}
+
+源码根据当前第几张图选择 \texttt{image\_size}，并计算生成图像 token 网格：
+
+\begin{lstlisting}[language=Python]
+token_h = image_size[1] // (self.patch_size * merge_size)
+token_w = image_size[0] // (self.patch_size * merge_size)
+indexes_image_condition = self._build_t2i_image_indexes(token_h, token_w, t_index_cond + 1, device=device)
+\end{lstlisting}
+
+然后按分辨率初始化随机噪声图：
+
+\begin{lstlisting}[language=Python]
+noise_scale = self.noise_scale
+if self.noise_scale_mode in ("resolution", "dynamic", 'dynamic_sqrt'):
+    noise_scale = math.sqrt((grid_h*grid_w)/(merge_size**2)/base) * float(self.noise_scale)
+image_prediction = noise_scale * torch.randn((1, 3, image_size[1], image_size[0]), device=device, dtype=outputs_cond.logits.dtype, generator=generator)
+\end{lstlisting}
+
+\texttt{prepare\_flash\_kv\_cache()} 提前给三条 cache 预留当前图像 token 长度：
+
+\begin{lstlisting}[language=Python]
+prepare_flash_kv_cache(past_key_values_cond_cfg, current_len=token_h * token_w, batch_size=1)
+prepare_flash_kv_cache(past_key_values_tu_cfg, current_len=token_h * token_w, batch_size=1)
+prepare_flash_kv_cache(past_key_values_iu_cfg, current_len=token_h * token_w, batch_size=1)
+\end{lstlisting}
+
+\subsubsection{5. 行 1179--1228：图像 flow loop}
+
+每个 step 的源码顺序固定：先取 \(t,t_{next}\)，再从当前图像构造 \texttt{z} 和 \texttt{image\_embeds}：
+
+\begin{lstlisting}[language=Python]
+z = self.patchify(image_prediction, self.patch_size * merge_size)
+image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
+image_embeds = self.extract_feature(
+    image_input.view(1 * grid_h*grid_w, -1),
+    gen_model=True,
+    grid_hw=gen_grid_hw,
+).view(1, token_h*token_w, -1)
+\end{lstlisting}
+
+再加时间 embedding 和可选噪声强度 embedding：
+
+\begin{lstlisting}[language=Python]
+timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(1, token_h*token_w, -1)
+if self.add_noise_scale_embedding:
+    timestep_embeddings += noise_embeddings
+image_embeds = image_embeds + timestep_embeddings
+\end{lstlisting}
+
+接着调用 \texttt{\_t2i\_predict\_v()}。根据 \texttt{cfg\_scale} / \texttt{img\_cfg\_scale}，源码可能跑一条、两条或三条 cache：
+
+\begin{lstlisting}[language=Python]
+out_cond = self._t2i_predict_v(... past_key_values_cond_cfg ...)
+...
+v_pred = (
+    out_uncond
+    + cfg_scale * (out_cond - out_img_cond)
+    + img_cfg_scale * (out_img_cond - out_uncond)
+)
+\end{lstlisting}
+
+最后直接 Euler 更新并拼回图像：
+
+\begin{lstlisting}[language=Python]
+z = z + (t_next - t) * v_pred
+image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+\end{lstlisting}
+
+\subsubsection{6. 行 1237--1293：生成图像重新编码回文本上下文}
+
+interleave 和 T2I / editing 最大的源码差异在这里。图像生成完并不是直接返回，而是先转回 understanding branch 的归一化格式：
+
+\begin{lstlisting}[language=Python]
+pred_img = image_prediction[0].unsqueeze(0).to(torch.bfloat16)
+raw_img = pred_img * 0.5 + 0.5
+und_img = (raw_img - img_mean) / img_std
+\end{lstlisting}
+
+然后重新切 patch、抽 understanding 视觉特征：
+
+\begin{lstlisting}[language=Python]
+flatten_pixel_values = ...
+vit_embeds = self.extract_feature(flatten_pixel_values, grid_hw=gen_grid_hw[:1]).unsqueeze(0)
+\end{lstlisting}
+
+最后把这张新图的视觉 token 和 \texttt{</img>} token 追加进 cache：
+
+\begin{lstlisting}[language=Python]
+inputs_embeds_img = torch.cat([vit_embeds, img_end_embed], dim=1)
+outputs = self.language_model(
+    inputs_embeds=inputs_embeds_img,
+    indexes=indexes,
+    attention_mask=attention_mask_dict,
+    past_key_values=cache,
+    use_cache=True
+)
+\end{lstlisting}
+
+源码层面的含义很明确：\textbf{interleave 生成一张图以后，会马上把这张图重新当作输入图像理解一遍，使后续文本生成可以看见它。}
+
+\subsection{五、\texttt{it2i\_generate():1298--1616}：editing 按源码块读}
+
+\subsubsection{1. 行 1301--1328：special token、补 \texttt{<image>}、加载输入图像}
+
+editing 函数先设置 \texttt{img\_context\_token\_id} 和 \texttt{t\_eps}：
+
+\begin{lstlisting}[language=Python]
+self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+self.config.t_eps = t_eps
+\end{lstlisting}
+
+然后检查 prompt 里有几个 \texttt{<image>}。如果传入图片更多，源码会自动补占位符：
+
+\begin{lstlisting}[language=Python]
+image_token_count = prompt.count('<image>')
+assert len(images) >= image_token_count
+if len(images) > image_token_count:
+    if image_token_count == 0 and len(images) > 1:
+        prompt = "".join(f"Image-{i + 1}:<image>\n" for i in range(len(images))) + prompt
+    else:
+        prompt = "<image>\n" * (len(images) - image_token_count) + prompt
+\end{lstlisting}
+
+每张输入图像走 \texttt{load\_image\_native()}，得到 \texttt{pixel\_values} 和 \texttt{grid\_hw}：
+
+\begin{lstlisting}[language=Python]
+cur_pixel_values, cur_grid_hw = load_image_native(
+    image,
+    self.patch_size,
+    self.downsample_ratio,
+    min_pixels=512 * 512,
+    max_pixels=min(2048*2048, (4096 * 4096) // len(images)),
+    upscale=False,
+)
+\end{lstlisting}
+
+\subsubsection{2. 行 1330--1368：构造三种 query，并把输入图像写入 embedding}
+
+editing 的 CFG 分支在源码中先由三个布尔量决定：
+
+\begin{lstlisting}[language=Python]
+needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
+needs_img_condition = needs_cfg and (img_cfg_scale == 1 or cfg_scale != img_cfg_scale)
+needs_uncondition = needs_cfg and img_cfg_scale != 1
+\end{lstlisting}
+
+接着生成三种 query：
+
+\begin{lstlisting}[language=Python]
+query_condition = self._build_t2i_query(question_condition, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
+query_img_condition = self._build_t2i_query('<image>' * len(images), append_text=IMG_START_TOKEN) if needs_img_condition else None
+query_uncondition = self._build_t2i_query("", append_text=IMG_START_TOKEN) if needs_uncondition else None
+\end{lstlisting}
+
+然后把 \texttt{<image>} 替换成图像 token 槽位：
+
+\begin{lstlisting}[language=Python]
+num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2)
+image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
+query_condition = query_condition.replace('<image>', image_tokens, 1)
+\end{lstlisting}
+
+最后调用 \texttt{\_build\_it2i\_inputs()}，把输入图像 embedding 写进这些槽位：
+
+\begin{lstlisting}[language=Python]
+input_embeds_condition, indexes_condition, attention_mask_condition_prefix = self._build_it2i_inputs(
+    tokenizer, query_condition, pixel_values, grid_hw
+)
+\end{lstlisting}
+
+\subsubsection{3. 行 1369--1425：生成图像位置索引，并跑 prefix forward}
+
+输出图尺寸决定目标图像 token 数：
+
+\begin{lstlisting}[language=Python]
+token_h = image_size[1] // (self.patch_size * merge_size)
+token_w = image_size[0] // (self.patch_size * merge_size)
+\end{lstlisting}
+
+每个分支都有自己的图像位置索引，因为每个 prefix 的 \texttt{t} 长度不同：
+
+\begin{lstlisting}[language=Python]
+indexes_image_condition = self._build_t2i_image_indexes(
+    token_h, token_w, indexes_condition[0].max() + 1, device=input_embeds_condition.device
+)
+\end{lstlisting}
+
+如果 \texttt{think\_mode=True}，condition 分支先生成 think，再重新计算图像位置索引；否则直接用 \texttt{\_it2i\_prefix\_forward()} 建 cache：
+
+\begin{lstlisting}[language=Python]
+past_key_values_condition, hidden_states_condition = self._it2i_prefix_forward(
+    input_embeds_condition, indexes_condition, attention_mask_condition_prefix
+)
+\end{lstlisting}
+
+image-only 和 unconditional 分支也分别跑 prefix forward：
+
+\begin{lstlisting}[language=Python]
+past_key_values_img_condition, _ = self._it2i_prefix_forward(...)
+past_key_values_uncondition, _ = self._it2i_prefix_forward(...)
+\end{lstlisting}
+
+\subsubsection{4. 行 1437--1500：batch 扩展 cache、准备 flash cache、初始化噪声图}
+
+源码先把每层 KV cache expand 到 \texttt{batch\_size}：
+
+\begin{lstlisting}[language=Python]
+past_key_values_condition.layers[layer_idx].keys = past_key_values_condition.layers[layer_idx].keys.expand(
+    batch_size, *past_key_values_condition.layers[layer_idx].keys.shape[1:]
+)
+\end{lstlisting}
+
+再调用 \texttt{prepare\_flash\_kv\_cache()} 给将要生成的图像 token 预留空间：
+
+\begin{lstlisting}[language=Python]
+prepare_flash_kv_cache(
+    past_key_values_condition,
+    current_len=token_h * token_w,
+    batch_size=batch_size,
+)
+\end{lstlisting}
+
+然后根据输出分辨率初始化当前图像状态：
+
+\begin{lstlisting}[language=Python]
+grid_h = image_size[1] // self.patch_size
+grid_w = image_size[0] // self.patch_size
+grid_hw = torch.tensor([[grid_h, grid_w]] * batch_size, device=device)
+
+image_prediction = noise_scale * torch.randn(
+    (batch_size, 3, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator
+)
+\end{lstlisting}
+
+\subsubsection{5. 行 1502--1605：editing 的采样 loop}
+
+采样 loop 开头和 interleave 相同：当前图像先切成 \texttt{z} 和 vision encoder 输入：
+
+\begin{lstlisting}[language=Python]
+z = self.patchify(image_prediction, self.patch_size * merge_size)
+image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
+image_embeds = self.extract_feature(
+    image_input.view(batch_size * grid_h * grid_w, -1),
+    gen_model=True,
+    grid_hw=grid_hw,
+).view(batch_size, token_h * token_w, -1)
+\end{lstlisting}
+
+然后加时间条件：
+
+\begin{lstlisting}[language=Python]
+timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, token_h * token_w, -1)
+image_embeds = image_embeds + timestep_embeddings
+\end{lstlisting}
+
+condition 分支总会先跑：
+
+\begin{lstlisting}[language=Python]
+out_cond = self._t2i_predict_v(
+    image_embeds,
+    indexes_image_condition,
+    attention_mask_condition,
+    past_key_values_condition,
+    t,
+    z,
+    image_token_num=token_h * token_w,
+)
+\end{lstlisting}
+
+之后源码按 \texttt{cfg\_scale} / \texttt{img\_cfg\_scale} 分情况组合：
+
+\begin{lstlisting}[language=Python]
+if not use_cfg:
+    v_pred = out_cond
+elif img_cfg_scale == 1:
+    v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
+elif cfg_scale == img_cfg_scale:
+    v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+else:
+    v_pred = (
+        out_uncond
+        + cfg_scale * (out_cond - out_img_cond)
+        + img_cfg_scale * (out_img_cond - out_uncond)
+    )
+\end{lstlisting}
+
+最后是同一行 Euler 更新和反 patch：
+
+\begin{lstlisting}[language=Python]
+z = z + (t_next - t) * v_pred
+image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+\end{lstlisting}
+
+\subsubsection{6. 行 1607--1616：清理 cache 并返回}
+
+loop 结束后，源码清理 flash cache，并根据 \texttt{think\_mode} 决定返回一张图，还是图像加 think 文本：
+
+\begin{lstlisting}[language=Python]
+clear_flash_kv_cache(past_key_values_condition)
+...
+self.last_think_content = think_text
+if think_mode:
+    return image_prediction, think_text
+return image_prediction
+\end{lstlisting}
+
+\subsection{六、\texttt{t2i\_generate():1619--1787}：T2I 按源码块读}
+
+\subsubsection{1. 行 1620--1640：构造 condition / uncondition 文本 query}
+
+T2I 比 editing 少了输入图片，所以一开始只有文本：
+
+\begin{lstlisting}[language=Python]
+question_condition = f"{prompt}"
+needs_cfg = cfg_scale > 1
+think_content = '<think>\n' if think_mode else '<think>\n\n</think>\n\n' + IMG_START_TOKEN
+query_condition = self._build_t2i_query(question_condition, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
+query_uncondition = self._build_t2i_query("", append_text=IMG_START_TOKEN) if needs_cfg else None
+\end{lstlisting}
+
+再把 query 变成 \texttt{input\_ids/indexes/attention\_mask}：
+
+\begin{lstlisting}[language=Python]
+input_ids_condition, indexes_condition, attention_mask_condition_prefix = self._build_t2i_text_inputs(tokenizer, query_condition)
+\end{lstlisting}
+
+这和 editing 的差异非常具体：T2I 走 \texttt{\_build\_t2i\_text\_inputs()}，editing 走 \texttt{\_build\_it2i\_inputs()}。
+
+\subsubsection{2. 行 1642--1678：目标图像位置索引和 prefix cache}
+
+T2I 根据输出尺寸计算目标图 token 网格：
+
+\begin{lstlisting}[language=Python]
+token_h = image_size[1] // (self.patch_size * merge_size)
+token_w = image_size[0] // (self.patch_size * merge_size)
+\end{lstlisting}
+
+再构造 condition / uncondition 的目标图像位置索引：
+
+\begin{lstlisting}[language=Python]
+indexes_image_condition = self._build_t2i_image_indexes(token_h, token_w, indexes_condition.shape[1], device=input_ids_condition.device)
+\end{lstlisting}
+
+如果 \texttt{think\_mode=False}，直接跑 prefix forward：
+
+\begin{lstlisting}[language=Python]
+past_key_values_condition, hidden_states_condition = self._t2i_prefix_forward(
+    input_ids_condition,
+    indexes_condition,
+    attention_mask_condition_prefix,
+)
+\end{lstlisting}
+
+如果有 CFG，无条件 query 也跑一次 prefix forward：
+
+\begin{lstlisting}[language=Python]
+past_key_values_uncondition, _ = self._t2i_prefix_forward(
+    input_ids_uncondition,
+    indexes_uncondition,
+    attention_mask_uncondition_prefix,
+)
+\end{lstlisting}
+
+\subsubsection{3. 行 1687--1728：扩展 cache、准备随机图像初值和时间步}
+
+batch 维度是通过 expand cache 实现的：
+
+\begin{lstlisting}[language=Python]
+past_key_values_condition.layers[layer_idx].keys = past_key_values_condition.layers[layer_idx].keys.expand(
+    batch_size, *past_key_values_condition.layers[layer_idx].keys.shape[1:]
+)
+\end{lstlisting}
+
+接着预留 flash KV cache：
+
+\begin{lstlisting}[language=Python]
+prepare_flash_kv_cache(
+    past_key_values_condition,
+    current_len=token_h * token_w,
+    batch_size=batch_size,
+)
+\end{lstlisting}
+
+然后初始化噪声图：
+
+\begin{lstlisting}[language=Python]
+grid_h = image_size[1] // self.patch_size
+grid_w = image_size[0] // self.patch_size
+grid_hw = torch.tensor([[grid_h, grid_w]]*batch_size, device=device)
+
+image_prediction = noise_scale * torch.randn(
+    (batch_size, 3, image_size[1], image_size[0]),
+    device=device,
+    dtype=dtype,
+    generator=generator,
+)
+\end{lstlisting}
+
+最后创建时间表：
+
+\begin{lstlisting}[language=Python]
+timesteps = torch.linspace(0.0, 1.0, num_steps+1, device=device)
+if enable_timestep_shift:
+    timesteps = self._apply_time_schedule(timesteps, token_h*token_w, timestep_shift)
+\end{lstlisting}
+
+\subsubsection{4. 行 1730--1745：T2I loop 前半段，当前图像变成 token embedding}
+
+每一步先把当前图像拆成两份：
+
+\begin{lstlisting}[language=Python]
+z = self.patchify(image_prediction, self.patch_size * merge_size)
+image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
+\end{lstlisting}
+
+\texttt{z} 是要被更新的 RGB patch 状态；\texttt{image\_input} 送给生成侧 vision encoder：
+
+\begin{lstlisting}[language=Python]
+image_embeds = self.extract_feature(
+    image_input.view(batch_size * grid_h*grid_w, -1),
+    gen_model=True,
+    grid_hw=grid_hw,
+).view(batch_size, token_h*token_w, -1)
+\end{lstlisting}
+
+时间步 embedding 直接加到图像 token 上：
+
+\begin{lstlisting}[language=Python]
+timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, token_h*token_w, -1)
+image_embeds = image_embeds + timestep_embeddings
+\end{lstlisting}
+
+然后 condition 分支预测速度：
+
+\begin{lstlisting}[language=Python]
+v_pred_condition = self._t2i_predict_v(
+    image_embeds,
+    indexes_image_condition,
+    attention_mask_condition,
+    past_key_values_condition,
+    t,
+    z,
+    image_token_num=token_h*token_w,
+)
+\end{lstlisting}
+
+\subsubsection{5. 行 1747--1774：T2I CFG 分支}
+
+如果当前 \(t\) 落在 \texttt{cfg\_interval}，且 \texttt{cfg\_scale > 1}，源码会再跑 uncondition 分支：
+
+\begin{lstlisting}[language=Python]
+v_pred_uncondition = self._t2i_predict_v(
+    image_embeds,
+    indexes_image_uncondition,
+    attention_mask_uncondition,
+    past_key_values_uncondition,
+    t,
+    z,
+    image_token_num=token_h*token_w,
+)
+\end{lstlisting}
+
+普通 CFG 是：
+
+\begin{lstlisting}[language=Python]
+v_pred = v_pred_uncondition + cfg_scale * (v_pred_condition - v_pred_uncondition)
+\end{lstlisting}
+
+如果 \texttt{cfg\_norm == 'global'} 或 \texttt{'channel'}，源码会把 CFG 后的速度范数往 condition 速度范数上拉：
+
+\begin{lstlisting}[language=Python]
+norm_v_condition = torch.norm(v_pred_condition, dim=(1,2), keepdim=True)
+norm_v_cfg = torch.norm(v_pred, dim=(1,2), keepdim=True)
+scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+v_pred = v_pred * scale
+\end{lstlisting}
+
+如果不满足 CFG 条件，就直接用 condition 速度：
+
+\begin{lstlisting}[language=Python]
+v_pred = v_pred_condition
+\end{lstlisting}
+
+\subsubsection{6. 行 1776--1787：Euler 更新、反 patch、返回}
+
+T2I 最后一段和 editing 相同：
+
+\begin{lstlisting}[language=Python]
+z = z + (t_next - t) * v_pred
+image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+\end{lstlisting}
+
+loop 结束后清理 cache 并返回：
+
+\begin{lstlisting}[language=Python]
+clear_flash_kv_cache(past_key_values_condition)
+if past_key_values_uncondition is not None:
+    clear_flash_kv_cache(past_key_values_uncondition)
+
+if think_mode:
+    return image_prediction, think_text
+return image_prediction
+\end{lstlisting}
+
+\subsection{七、按源码顺序串一次调用栈}
+
+\subsubsection{1. T2I}
+
+\begin{lstlisting}[language=Python]
+examples/t2i/inference.py
+  SenseNovaU1T2I.generate()
+    -> model.t2i_generate()                         # modeling_neo_chat.py:1619
+       -> _build_t2i_query()
+       -> _build_t2i_text_inputs()
+       -> _build_t2i_image_indexes()
+       -> _t2i_prefix_forward()
+       -> optional _generate_think()
+       -> initialize image_prediction from randn
+       -> for step in timesteps:
+            patchify(image_prediction)              # z
+            patchify(image_prediction, channel_first=True)
+            extract_feature(..., gen_model=True)
+            timestep_embedder(t)
+            _t2i_predict_v(... condition cache ...)
+            optional _t2i_predict_v(... uncondition cache ...)
+            CFG on v_pred
+            z = z + (t_next - t) * v_pred
+            unpatchify(z)
+\end{lstlisting}
+
+\subsubsection{2. Editing}
+
+\begin{lstlisting}[language=Python]
+examples/editing/inference.py
+  SenseNovaU1Editing.edit()
+    -> model.it2i_generate()                        # modeling_neo_chat.py:1298
+       -> load_image_native(input images)
+       -> replace <image> with <IMG_CONTEXT> slots
+       -> _build_it2i_inputs()
+            -> extract_feature(pixel_values)        # understanding branch
+            -> input_embeds[selected] = vit_embeds
+       -> _it2i_prefix_forward()                    # condition / img_condition / uncondition
+       -> initialize image_prediction from randn
+       -> for step in timesteps:
+            same image flow loop as T2I
+            combine out_cond / out_img_cond / out_uncond
+            unpatchify(z)
+\end{lstlisting}
+
+\subsubsection{3. Interleave}
+
+\begin{lstlisting}[language=Python]
+examples/interleave/inference.py
+  SenseNovaU1Interleave.generate()
+    -> model.interleave_gen()                       # modeling_neo_chat.py:954
+       -> build condition / text-uncondition / image-uncondition caches
+       -> while True:
+            generate text tokens with condition cache
+            if next token is <img>:
+                append <img> to caches
+                run image flow loop
+                re-encode generated image with understanding encoder
+                append generated image tokens back into cache
+            if eos: break
+\end{lstlisting}
+
+\subsection{八、本节小结：只保留源码能直接支持的结论}
+
+\begin{summarybox}
+按源码读下来，可以得到四个确定结论：\\
+1. 三个 example wrapper 都很薄，分别进入 \texttt{t2i\_generate()}、\texttt{it2i\_generate()}、\texttt{interleave\_gen()}；\\
+2. 图像采样状态是 \texttt{image\_prediction}，通过 \texttt{patchify()} 变成 RGB patch 序列 \texttt{z}，再通过 \texttt{unpatchify()} 回到图像；\\
+3. 每个采样 step 都会调用 \texttt{extract\_feature(..., gen\_model=True)}、\texttt{timestep\_embedder} 和 \texttt{\_t2i\_predict\_v()}，其中 \texttt{\_t2i\_predict\_v()} 负责用 Qwen3 + \texttt{fm\_head} 得到 \texttt{v\_pred = (x\_pred - z)/(1-t)}；\\
+4. T2I、editing、interleave 的差异不是采样 loop 本身，而是源码里进入 loop 前准备了哪些 \texttt{past\_key\_values}，以及 loop 后是否像 interleave 那样把生成图像重新编码回 cache。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item OpenSenseNova，\emph{SenseNova-U1 官方 GitHub 仓库}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1}
+  \item OpenSenseNova，\emph{SenseNova-U1 examples README：T2I、editing、interleaved generation 运行参数说明}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/README.md}
+  \item OpenSenseNova，\emph{Text-to-Image inference wrapper：\texttt{SenseNovaU1T2I.generate}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/t2i/inference.py}
+  \item OpenSenseNova，\emph{Image editing inference wrapper：\texttt{SenseNovaU1Editing.edit}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/editing/inference.py}
+  \item OpenSenseNova，\emph{Interleaved generation wrapper：\texttt{SenseNovaU1Interleave.generate}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/interleave/inference.py}
+  \item OpenSenseNova，\emph{NEOChatModel generation methods：\texttt{patchify}、\texttt{unpatchify}、\texttt{interleave\_gen}、\texttt{it2i\_generate}、\texttt{t2i\_generate}、\texttt{\_t2i\_predict\_v}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py}
+  \item OpenSenseNova，\emph{Flow-matching helper modules：\texttt{TimestepEmbedder}、\texttt{FlowMatchingHead}、\texttt{ConvDecoder}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_fm_modules.py}
+  \item Yaron Lipman et al.，\emph{Flow Matching for Generative Modeling}。\\
+  \url{https://arxiv.org/abs/2210.02747}
+  \item Xingchao Liu et al.，\emph{Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow}。\\
+  \url{https://arxiv.org/abs/2209.03003}
+  \item Jonathan Ho and Tim Salimans，\emph{Classifier-Free Diffusion Guidance}。\\
+  \url{https://arxiv.org/abs/2207.12598}
+  \item William Peebles and Saining Xie，\emph{Scalable Diffusion Models with Transformers}。\\
+  \url{https://arxiv.org/abs/2212.09748}
+\end{itemize}
+\endgroup

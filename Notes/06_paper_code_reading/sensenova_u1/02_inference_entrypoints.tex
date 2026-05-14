@@ -1,0 +1,289 @@
+% ============================================================
+% SenseNova-U1 / NEO-Unify inference entrypoints
+% ============================================================
+
+\section{推理入口：先从 \texttt{examples/} 看模型怎么被调用}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 不急着深入大模型内部实现，先把官方公开的四个推理入口读清楚。\key{源码阅读第一步不是看所有 class，而是看外部任务如何把输入组织好，然后调用模型的哪个高层方法。}\\
+\textbf{当前阅读基准：} 本节基于官方仓库 commit \texttt{2e339f94e992464d468794286af34ca759cb7ac0} 的 \texttt{examples/} 与 \texttt{src/sensenova\_u1/models/neo\_unify/modeling\_neo\_chat.py}。
+\end{conceptbox}
+
+\subsection{一、先给出最终地图}
+
+\begin{summarybox}
+\textbf{四个 examples 脚本本质上都是薄封装。} 它们共同完成三件事：\key{加载 tokenizer / model，处理任务输入，然后调用模型对象上的一个高层推理方法}。真正值得后续深入追的函数都集中在 \texttt{modeling\_neo\_chat.py}：\texttt{t2i\_generate}、\texttt{it2i\_generate}、\texttt{interleave\_gen} 和 \texttt{chat}。
+\end{summarybox}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.0cm}p{4.0cm}p{4.0cm}p{3.2cm}}
+\hline
+\textbf{任务} & \textbf{example 入口} & \textbf{模型高层方法} & \textbf{路径直觉} \\
+\hline
+文生图 & \texttt{examples/t2i/inference.py} & \texttt{model.t2i\_generate(...)} & 生成侧主路径 \\
+图像编辑 & \texttt{examples/editing/inference.py} & \texttt{model.it2i\_generate(...)} & 图像条件生成路径 \\
+图文交错 & \texttt{examples/interleave/inference.py} & \texttt{model.interleave\_gen(...)} & 统一能力展示路径 \\
+VQA & \texttt{examples/vqa/inference.py} & \texttt{model.chat(...)} & 理解侧主路径 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{intubox}
+\textbf{最重要的阅读姿势：} \texttt{examples/} 不是模型核心，它是“任务适配层”。它告诉我们：什么输入会被传进模型、哪些参数是用户可控的、输出如何被保存。下一步真正要钻的是 \texttt{src/sensenova\_u1/models/neo\_unify/modeling\_neo\_chat.py} 里对应的四个方法。
+\end{intubox}
+
+\subsection{二、四个入口的共同骨架}
+
+四个推理脚本看起来任务不同，但外层套路高度一致：
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{解析命令行参数：} 都支持 \texttt{--model\_path}、\texttt{--device}、\texttt{--dtype}、\texttt{--attn\_backend}、\texttt{--profile} 等通用参数。
+  \item \textbf{设置 attention 后端：} 通过 \texttt{sensenova\_u1.set\_attn\_backend(args.attn\_backend)} 控制使用 \texttt{auto}、\texttt{flash} 或 \texttt{sdpa}。
+  \item \textbf{加载配置、tokenizer 和模型：} 基本模式是 \texttt{AutoConfig.from\_pretrained}、\texttt{AutoTokenizer.from\_pretrained}、\texttt{AutoModel.from\_pretrained}，再 \texttt{to(device).eval()}。
+  \item \textbf{做任务输入预处理：} 文生图主要处理 prompt 和输出尺寸；编辑处理输入图像、缩放和输出尺寸；interleave 处理文本、可选输入图像和系统提示词；VQA 处理图像 tensor 与问题文本。
+  \item \textbf{调用模型高层方法：} 入口脚本不自己实现 attention / transformer / flow matching，而是调用模型暴露出来的任务级方法。
+  \item \textbf{保存输出：} 图像任务保存 \texttt{png}，think mode 额外保存推理文本；VQA 保存答案；interleave 同时保存文本和生成图像。
+\end{enumerate}
+
+可以把它抽象成下面这条流程：
+
+\begin{center}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tikzpicture}[
+  node distance=1.6cm,
+  box/.style={draw, rounded corners, align=center, inner sep=6pt, font=\small},
+  arr/.style={->, thick}
+]
+\node[box] (cli) {CLI / JSONL\\输入参数};
+\node[box, right=of cli] (load) {加载 tokenizer\\和 AutoModel};
+\node[box, right=of load] (prep) {任务输入\\预处理};
+\node[box, right=of prep] (call) {调用模型\\高层方法};
+\node[box, right=of call] (save) {保存文本\\或图像输出};
+\draw[arr] (cli) -- (load);
+\draw[arr] (load) -- (prep);
+\draw[arr] (prep) -- (call);
+\draw[arr] (call) -- (save);
+\end{tikzpicture}
+\end{adjustbox}
+\end{center}
+
+\subsection{三、Text-to-Image：\texttt{t2i\_generate} 是生成侧主入口}
+
+\begin{conceptbox}
+\textbf{入口定位：} \texttt{examples/t2i/inference.py} 是最纯粹的生成侧路径。它只需要文本 prompt，就能走到模型的图像生成逻辑。
+\end{conceptbox}
+
+\texttt{SenseNovaU1T2I.generate} 里最关键的一步是调用：
+
+\begin{lstlisting}[language=Python]
+out = self.model.t2i_generate(
+    self.tokenizer,
+    prompt,
+    image_size=image_size,
+    cfg_scale=cfg_scale,
+    cfg_norm=cfg_norm,
+    timestep_shift=timestep_shift,
+    cfg_interval=cfg_interval,
+    num_steps=num_steps,
+    batch_size=batch_size,
+    seed=seed,
+    think_mode=think_mode,
+)
+\end{lstlisting}
+
+这里先不要把参数想复杂，先建立直觉：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{prompt}：} 生成图像的文本条件。
+  \item \textbf{\texttt{image\_size}：} 输出图像分辨率。
+  \item \textbf{\texttt{cfg\_scale} / \texttt{cfg\_norm} / \texttt{cfg\_interval}：} classifier-free guidance 相关控制，决定条件约束在采样过程中怎么起作用。
+  \item \textbf{\texttt{timestep\_shift} / \texttt{num\_steps}：} 和生成侧去噪 / flow-matching 采样过程有关。
+  \item \textbf{\texttt{think\_mode}：} 如果打开，模型先生成 \texttt{<think>...</think>}，再做图像生成；脚本会把 think 文本另存为 \texttt{.think.txt}。
+\end{itemize}
+
+\begin{intubox}
+\textbf{后续追源码时的抓手：} 看到 \texttt{t2i\_generate}，就把它理解为“文本条件 \(\rightarrow\) 生成图像”的主函数。下一步要看它如何组织 prompt token、图像 token、采样 timestep、CFG，以及最终如何把模型输出还原成图像 tensor。
+\end{intubox}
+
+\subsection{四、Image Editing：\texttt{it2i\_generate} 多了图像条件}
+
+\begin{conceptbox}
+\textbf{入口定位：} \texttt{examples/editing/inference.py} 是 image-to-image / image-text-to-image 路径。和 T2I 相比，它不只是给 prompt，还要把输入图像作为条件传给模型。
+\end{conceptbox}
+
+它的高层调用是：
+
+\begin{lstlisting}[language=Python]
+output = self.model.it2i_generate(
+    self.tokenizer,
+    prompt,
+    list(images),
+    image_size=image_size,
+    cfg_scale=cfg_scale,
+    img_cfg_scale=img_cfg_scale,
+    cfg_norm=cfg_norm,
+    timestep_shift=timestep_shift,
+    cfg_interval=cfg_interval,
+    num_steps=num_steps,
+    batch_size=batch_size,
+    think_mode=think_mode,
+    seed=seed,
+)
+\end{lstlisting}
+
+这条路径比 T2I 多出的重点是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{输入图像列表：} \texttt{images} 会被转成 \texttt{list(images)} 传入模型，说明编辑任务支持多图输入。
+  \item \textbf{\texttt{input\_max\_pixels}：} 控制输入图像预处理预算，避免输入图像过大。
+  \item \textbf{\texttt{target\_pixels}：} 当没有显式指定输出宽高时，脚本会按第一张输入图像的长宽比，归一化到目标像素规模。
+  \item \textbf{\texttt{img\_cfg\_scale}：} 这是编辑路径里额外出现的图像条件 CFG 权重，用来区分“文本条件”和“图像条件”的引导力度。
+  \item \textbf{\texttt{compare}：} 脚本还支持保存输入图和输出图的对比图，方便观察编辑效果。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{一句话理解 editing：} T2I 是“按文字生成一张图”，editing 是“拿已有图像作为条件，再按文字要求改出一张图”。所以它在同样的生成采样参数之外，多了输入图像读取、缩放、尺寸对齐和 \texttt{img\_cfg\_scale}。
+\end{summarybox}
+
+\subsection{五、Interleave：\texttt{interleave\_gen} 是统一能力最值得看的路径}
+
+\begin{conceptbox}
+\textbf{入口定位：} \texttt{examples/interleave/inference.py} 是最能体现 SenseNova-U1 路线价值的 example。它不是单纯回答文字，也不是单纯生成图片，而是允许一次响应里同时出现文本和生成图像。
+\end{conceptbox}
+
+关键调用是：
+
+\begin{lstlisting}[language=Python]
+text, image_tensors = self.model.interleave_gen(
+    self.tokenizer,
+    prompt,
+    images=list(input_images),
+    image_size=image_size,
+    cfg_scale=cfg_scale,
+    img_cfg_scale=img_cfg_scale,
+    timestep_shift=timestep_shift,
+    cfg_interval=cfg_interval,
+    num_steps=num_steps,
+    system_message=system_message,
+    think_mode=think_mode,
+    seed=seed,
+)
+\end{lstlisting}
+
+这条路径有几个明显特点：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{输出是两类：} 返回 \texttt{text} 和 \texttt{image\_tensors}，脚本再把图像 tensor 转成 PIL 图像保存。
+  \item \textbf{可以带输入图像：} \texttt{--image} 是可重复参数，说明 interleave 可以在已有图像基础上做图文混合推理。
+  \item \textbf{默认有 system message：} 默认系统提示词明确约束了 think / no-think 协议，以及 \texttt{<image1>}、\texttt{<image2>} 这类图像引用标签。
+  \item \textbf{默认开启 think mode：} \texttt{--think\_mode} 默认是 true，也可以通过 \texttt{--no-think\_mode} 关闭。
+  \item \textbf{图像尺寸策略：} 如果有输入图像，输出尺寸会按第一张输入图像经过 \texttt{smart\_resize} 对齐；如果没有输入图像，则使用预设分辨率 bucket 或显式宽高。
+\end{itemize}
+
+\begin{intubox}
+\textbf{为什么它最值得看：} 如果只看 T2I，你会觉得它像图像生成模型；只看 VQA，你会觉得它像视觉理解模型。但 \texttt{interleave\_gen} 同时处理文本、输入图像、生成图像和 think 协议，是后续理解“统一多模态”最关键的源码入口。
+\end{intubox}
+
+\subsection{六、VQA：\texttt{chat} 是理解侧主入口}
+
+\begin{conceptbox}
+\textbf{入口定位：} \texttt{examples/vqa/inference.py} 是 visual understanding / VQA 路径。它的输出是文本答案，不涉及图像生成采样参数。
+\end{conceptbox}
+
+VQA 的核心流程是先把图像转成模型需要的视觉输入：
+
+\begin{lstlisting}[language=Python]
+pixel_values, grid_hw = load_image_native(image)
+pixel_values = pixel_values.to(self.device, dtype=self.model.dtype)
+grid_hw = grid_hw.to(self.device)
+\end{lstlisting}
+
+然后调用：
+
+\begin{lstlisting}[language=Python]
+response, updated_history = self.model.chat(
+    self.tokenizer,
+    pixel_values,
+    question,
+    generation_config,
+    history=history,
+    return_history=True,
+    grid_hw=grid_hw,
+)
+\end{lstlisting}
+
+和生成图像路径相比，VQA 的参数明显更像语言模型解码：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{max\_new\_tokens}：} 控制最多生成多少回答 token。
+  \item \textbf{\texttt{do\_sample} / \texttt{temperature} / \texttt{top\_p} / \texttt{top\_k}：} 控制文本采样策略。
+  \item \textbf{\texttt{repetition\_penalty}：} 控制重复惩罚。
+  \item \textbf{\texttt{history}：} 支持对话历史，说明它走的是 chat 风格接口。
+  \item \textbf{\texttt{grid\_hw}：} 保留图像 patch 网格信息，让模型知道视觉 token 的空间布局。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{一句话理解 VQA：} 这条路径的核心不是“采样一张图”，而是“把图像编码成视觉 token，再和问题一起走文本回答解码”。因此它没有 \texttt{cfg\_scale}、\texttt{timestep\_shift}、\texttt{num\_steps} 这些图像生成采样参数。
+\end{summarybox}
+
+\subsection{七、把四条路径放在一起比较}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.6cm}p{3.0cm}p{3.4cm}p{3.8cm}p{2.4cm}}
+\hline
+\textbf{路径} & \textbf{输入} & \textbf{输出} & \textbf{关键参数} & \textbf{下一步追踪} \\
+\hline
+\texttt{t2i} & prompt & image & \texttt{cfg\_scale}, \texttt{cfg\_norm}, \texttt{timestep\_shift}, \texttt{num\_steps}, \texttt{think} & \texttt{t2i\_generate} \\
+\texttt{editing} & prompt + images & edited image & \texttt{img\_cfg\_scale}, \texttt{input\_max\_pixels}, \texttt{target\_pixels}, \texttt{think} & \texttt{it2i\_generate} \\
+\texttt{interleave} & prompt + optional images & text + images & \texttt{system\_message}, \texttt{think\_mode}, \texttt{img\_cfg\_scale}, \texttt{num\_steps} & \texttt{interleave\_gen} \\
+\texttt{vqa} & image + question & answer text & \texttt{max\_new\_tokens}, \texttt{do\_sample}, \texttt{temperature}, \texttt{top\_p} & \texttt{chat} \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{八、源码阅读顺序建议}
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{先读 \texttt{examples/t2i/inference.py}：} 它最干净，能先建立“加载模型 \(\rightarrow\) 调 \texttt{t2i\_generate} \(\rightarrow\) 保存图像”的基本骨架。
+  \item \textbf{再读 \texttt{examples/vqa/inference.py}：} 它和 T2I 形成强对照：一个生成图像，一个生成文本答案。
+  \item \textbf{接着读 \texttt{examples/editing/inference.py}：} 理解图像条件如何参与生成，尤其是输入 resize、输出尺寸和 \texttt{img\_cfg\_scale}。
+  \item \textbf{最后读 \texttt{examples/interleave/inference.py}：} 这里最复杂，也最能体现统一多模态能力，适合在 T2I / VQA / Editing 都有直觉之后再看。
+  \item \textbf{进入 \texttt{modeling\_neo\_chat.py}：} 分别追 \texttt{t2i\_generate}、\texttt{chat}、\texttt{it2i\_generate}、\texttt{interleave\_gen} 的内部逻辑。
+\end{enumerate}
+
+\begin{warnbox}
+\textbf{暂时不要做的事：} 不要一上来就把 \texttt{modeling\_neo\_chat.py} 从头到尾硬读。这个文件很大，直接读会迷路。更好的方法是从四个 example 的调用点切进去，每次只追一个任务路径。
+\end{warnbox}
+
+\subsection{九、本节小结}
+
+\begin{summarybox}
+SenseNova-U1 的公开推理入口可以先理解成四条任务线：\key{T2I 调 \texttt{t2i\_generate}，Editing 调 \texttt{it2i\_generate}，Interleave 调 \texttt{interleave\_gen}，VQA 调 \texttt{chat}}。\texttt{examples/} 的价值不是展示模型内部细节，而是告诉我们每个任务如何准备输入、暴露哪些推理参数、最终进入哪个模型高层方法。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item OpenSenseNova，\emph{SenseNova-U1 examples README：公开推理脚本说明}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/README_CN.md}
+  \item OpenSenseNova，\emph{Text-to-Image inference script}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/t2i/inference.py}
+  \item OpenSenseNova，\emph{Image Editing inference script}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/editing/inference.py}
+  \item OpenSenseNova，\emph{Interleaved text-image inference script}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/interleave/inference.py}
+  \item OpenSenseNova，\emph{Visual understanding / VQA inference script}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/vqa/inference.py}
+  \item OpenSenseNova，\emph{NEO-Unify model implementation：\texttt{modeling\_neo\_chat.py}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py}
+\end{itemize}
+\endgroup

@@ -1,0 +1,415 @@
+\subsection*{Idea 冲分调研：状态感知的长序列多模态交织生成后训练}
+\phantomsection
+\addcontentsline{toc}{subsection}{Idea 冲分调研：状态感知的长序列多模态交织生成后训练}
+
+\begin{conceptbox}
+\textbf{调研日期：} 2026-05-11。\\
+\textbf{Idea 名称：} \key{State-aware Long-horizon Multimodal Interleaved Generation Post-training}。\\
+\textbf{核心判断：} 这个方向可以冲，但题面必须避开两个已拥挤区域：\key{通用 interleaved generation 数据/模型} 和 \key{泛泛 GRPO for interleaved generation}。更强的切口是：把长序列交织生成建模为 \key{跨模态状态转移过程}，让后训练优化的不只是最终图文质量，而是每一步的状态保持、状态更新、错误归因和记忆选择。\\
+\textbf{一句话卖点：} 现有模型会生成图文交织内容，但长到多页、多图、多轮以后会出现 identity drift、style drift、logic drift、knowledge drift 和 visual-history pollution；我们把这些失败变成可解析的 state transition，并用 state-aware reward / GRPO / verifier 做后训练。
+\end{conceptbox}
+
+\subsubsection*{0. 冲分版结论}
+
+\begin{summarybox}
+\textbf{最应该强调的论文空位：}\\
+现有工作已经有：
+\[
+\begin{aligned}
+&\text{interleaved task}
+\quad
+\text{data / benchmark}
+\quad
+\text{unified models}\\
+&\text{generic GRPO}
+\quad
+\text{structured memory plug-in}
+\end{aligned}
+\]
+但还缺：
+\[
+\begin{aligned}
+&\text{state-aware post-training objective}
+\quad
+\text{state-level process reward}\\
+&\text{state drift benchmark}
+\quad
+\text{cross-modal credit attribution}
+\end{aligned}
+\]
+\textbf{所以不要把贡献写成“我们加一个 memory”。}\\
+\textbf{要写成：} 我们定义并优化长序列交织生成中的 \key{state transition reliability}。
+\end{summarybox}
+
+\subsubsection*{1. 背景：为什么这个问题现在重要}
+
+多模态交织生成的目标是让模型输出一个序列：
+
+\[
+Y =
+(y_1,y_2,\ldots,y_T),
+\qquad
+y_t \in \{\text{text},\text{image},\text{tool output},\text{edit}\}.
+\]
+
+真实应用不是生成一张图，而是生成长内容：教程、儿童绘本、漫画脚本、产品说明、旅行攻略、科研解释、图文报告、交互式设计稿。这里用户真正关心的是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 同一个人物、物体、风格和设定能不能跨多页保持；
+  \item 文本步骤和图像步骤能不能互相对齐；
+  \item 前面给出的知识、定义、约束，后面是否继续成立；
+  \item 模型是否知道什么时候该写字、什么时候该画图、什么时候该检索或编辑上一张图；
+  \item 出错后能否定位是 planner、image generator、retriever、memory 还是 verifier 的问题。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{为什么这不是普通 long-context 问题：}\\
+长文本里历史主要会被稀释；长交织生成里视觉历史会主动污染后续生成。近期 \href{https://arxiv.org/abs/2603.07540}{UniLongGen} 明确指出，长序列失稳更受 image events 数量影响，而不只是 token 数量。也就是说，长序列 interleaved generation 的问题是\key{模态事件驱动的状态污染}，不是简单加长上下文窗口就能解决。
+\end{warnbox}
+
+\subsubsection*{2. Related Work 分层}
+
+\paragraph{2.1 任务定义与早期 pipeline}
+
+\href{https://arxiv.org/abs/2310.07749}{OpenLEAF} 最早系统化提出 open-domain interleaved image-text generation：由 LLM 生成文本、规划图像 prompt、调用 T2I，并用全局上下文提高实体和风格一致性。它的重要性在于：任务已经被定义，pipeline baseline 已经存在。因此新论文不能把“图文交织生成”本身当主要贡献。
+
+\href{https://arxiv.org/abs/2311.18775}{CoDi-2} 从 any-to-any 角度处理 interleaved / in-context / interactive multimodal generation，强调通过语言空间对齐实现多模态输入输出。这类工作说明 interleaved 不只是 image-text，也可以扩展到 audio、editing、composition 和 in-context learning。
+
+\paragraph{2.2 数据集与评测}
+
+\href{https://arxiv.org/abs/2406.14643}{InterleavedBench} 指出早期评测不能覆盖任意图文交织输入输出，并提出 GPT-4o reference-free evaluator。它把评测维度推进到 instruction following、coherence、quality 和 relevance。
+
+\href{https://arxiv.org/abs/2411.18499}{OpenING} 构建 5,400 个高质量人工标注样本、覆盖 56 个真实任务，并训练 IntJudge。它说明通用 interleaved benchmark 已经比较成熟，后续工作需要给出更细粒度的新评测维度。
+
+\href{https://arxiv.org/abs/2411.17188}{ISG} 用 Interleaved Scene Graph 做多层级评估，包括 holistic、structural、block-level、image-specific。它是这个 idea 的关键前置，因为它证明 scene graph / state graph 可以作为可解释评估工具。
+
+\href{https://arxiv.org/abs/2506.09427}{InterSyn} 提供 1.8M 高质量 interleaved 样本，并提出 SynJudge，输出 Text Content Completeness、Image Content Completeness、Image Quality、Image-Text Synergy 四类分数。它说明“再收一个普通交织数据集”已经不是高分贡献。
+
+\href{https://arxiv.org/abs/2512.05119}{RAG-IGBench} 把 interleaved generation 放进 RAG-based open-domain QA，强调外部检索证据与图文内容组织。这说明 state-aware 方法最好考虑 grounding，而不是只做漂亮图文。
+
+\paragraph{2.3 统一模型与生成架构}
+
+\href{https://arxiv.org/abs/2401.10208}{MM-Interleaved} 是端到端 interleaved image-text generative model，用 multi-scale / multi-image feature synchronizer 处理多图上下文细节。
+
+\href{https://arxiv.org/abs/2505.09568}{BLIP3-o}、\href{https://arxiv.org/abs/2505.14683}{BAGEL} 和 \href{https://arxiv.org/abs/2602.00508}{DuoGen} 代表统一理解与生成模型进入 strong baseline 阶段。尤其 BAGEL 和 DuoGen 说明大规模 interleaved pretraining + SFT 已经可以支撑通用交织输出。
+
+\href{https://arxiv.org/abs/2510.03506}{OneFlow} 提出非自回归、可变长度、并发 mixed-modal generation，用 Edit Flow 处理离散文本插入，用 Flow Matching 处理图像 latent。它提醒我们：未来 baseline 可能不再是严格 autoregressive interleaving，而是 concurrent / insertion-based 生成。
+
+\href{https://arxiv.org/abs/2512.18254}{Loom} 面向 long-horizon interleaved generation，引入语言规划和 prior-frame conditioning；它不拼接全部历史，而是采样一小部分 prior frames 加全局文本条件。这直接指向长序列记忆选择。
+
+\paragraph{2.4 后训练与策略优化}
+
+\href{https://arxiv.org/abs/2603.09538}{Interleaved-GRPO} 已经把 GRPO 用于 multimodal interleaved generation：warm-up + unified policy optimization + hybrid rewards + process-level rewards。这是最直接的 baseline，意味着“把 GRPO 用到交织生成上”已经不是创新。
+
+\href{https://arxiv.org/abs/2603.23500}{UniGRPO} 把文本推理 token 和 flow matching 图像生成统一成一个 MDP，用 Text-GRPO + Flow-GRPO 联合优化，并去掉 CFG、用 velocity-field MSE 正则降低 reward hacking。这说明跨模态轨迹优化已经进入 baseline 阶段。
+
+\paragraph{2.5 状态、记忆与长序列稳定性}
+
+\href{https://arxiv.org/abs/2510.10969}{IUT-Plug} 是最接近本 idea 的工作。它把 long interleaved failures 归纳为 Multimodal Context Drift，并用 Image Understanding Tree 维护实体、属性和关系的结构化 memory。它证明显式状态有用，但它更像 \key{model-agnostic plug-in / inference-time structured memory}，不是系统化的 state-aware post-training objective。
+
+\href{https://arxiv.org/abs/2603.07540}{UniLongGen} 研究 long-horizon interleaved image generation 的 reliability collapse，指出 visual history 会变成 active pollution，并提出 context curation / active forgetting。这说明长序列交织生成的核心不只是记忆更多，而是\key{选择性保留安全状态，丢弃干扰状态}。
+
+\subsubsection*{3. 现阶段 Baseline}
+
+{\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{longtable}{p{0.18\linewidth} p{0.21\linewidth} p{0.32\linewidth} p{0.20\linewidth}}
+\toprule
+\textbf{Baseline 类别} & \textbf{代表工作} & \textbf{能做到什么} & \textbf{还缺什么} \\
+\midrule
+Pipeline &
+OpenLEAF, ISG-Agent &
+LLM 规划 + T2I / 工具调用 + VLM 评估；可解释、易组合。 &
+不可端到端后训练，状态多靠 prompt 和外部模块。 \\
+\midrule
+End-to-end / unified model &
+MM-Interleaved, CoDi-2, BLIP3-o, BAGEL, DuoGen &
+直接处理图文交织理解与生成，强 base model 能力不断上升。 &
+长序列状态漂移、跨步一致性和错误归因仍弱。 \\
+\midrule
+Data / SFT &
+CoMM, InterSyn, DuoGen dataset &
+高质量、大规模 interleaved instruction 数据，能显著提升输出格式和图文协同。 &
+数据扩展不等于状态可靠；缺少过程监督和状态监督。 \\
+\midrule
+Benchmark / judge &
+InterleavedBench, OpenING, ISG, SynJudge, RAG-IGBench &
+能评价通用质量、图文协同、开放域任务和 RAG 场景。 &
+多数仍偏最终成品或静态结构，缺少 drift timeline 和 state transition score。 \\
+\midrule
+Post-training &
+Interleaved-GRPO, UniGRPO &
+把文本生成和图像生成放进统一 RL / GRPO 轨迹，已有 hybrid reward 和 process reward。 &
+reward 多数仍围绕相关性、对齐和结构，不显式追踪实体、风格和知识状态。 \\
+\midrule
+Structured memory / context curation &
+IUT-Plug, UniLongGen, Loom &
+证明长序列需要显式状态或选择性记忆；能缓解 context drift 和 visual-history pollution。 &
+多为插件或 inference strategy，还没有和后训练 credit/reward 深度结合。 \\
+\bottomrule
+\end{longtable}
+}
+
+\subsubsection*{4. 该 Idea 的精确定义}
+
+把长序列交织生成写成状态转移过程：
+
+\[
+S_t =
+\{\mathcal{E}_t,\mathcal{A}_t,\mathcal{R}_t,\mathcal{K}_t,\mathcal{N}_t,\mathcal{C}_t\},
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $\mathcal{E}_t$：entities，例如角色、物体、地点；
+  \item $\mathcal{A}_t$：attributes，例如外观、颜色、服装、风格；
+  \item $\mathcal{R}_t$：relations，例如空间、动作、因果、图文对应；
+  \item $\mathcal{K}_t$：knowledge facts，例如定义、步骤、检索证据；
+  \item $\mathcal{N}_t$：narrative / procedural progress，例如故事进度、教程步骤；
+  \item $\mathcal{C}_t$：constraints，例如必须保持、必须改变、不得出现。
+\end{itemize}
+
+每一步生成不是独立输出，而是：
+
+\[
+(S_{t-1}, a_t)
+\rightarrow
+y_t
+\rightarrow
+\hat{S}_t,
+\]
+
+其中 $a_t$ 是 modality / tool action：
+
+\[
+a_t \in
+\{\text{text},\text{image},\text{edit},\text{retrieve},\text{chart},\text{verify}\}.
+\]
+
+后训练的核心不是只优化：
+
+\[
+R(Y)
+\]
+
+而是优化：
+
+\[
+R(Y)
++
+\sum_t
+\left[
+R_\text{state-update}(S_{t-1},\hat{S}_t)
++
+R_\text{state-preserve}(S_{t-1},\hat{S}_t)
++
+R_\text{state-grounding}(\hat{S}_t,\mathcal{D})
+\right].
+\]
+
+\begin{summarybox}
+\textbf{一句话定义：}\\
+State-aware interleaved post-training = 对长交织序列的每一步生成进行状态解析、状态差分、状态奖励和状态归因，让模型知道哪些状态必须变、哪些状态必须保持、哪些错误从哪一步开始。
+\end{summarybox}
+
+\subsubsection*{5. 为什么它能和现有工作拉开差距}
+
+\textbf{和 Interleaved-GRPO 的区别：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Interleaved-GRPO 的 reward 主要覆盖 textual relevance、visual-text alignment、structural fidelity 和 process-level step guidance；
+  \item 你的 idea 需要强调 \key{state graph reward}：实体、属性、关系、知识和叙事状态的增删改查；
+  \item 不只是“每一步有没有好”，而是“每一步有没有正确改变状态，并保持不该变的状态”。
+\end{itemize}
+
+\textbf{和 IUT-Plug 的区别：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item IUT-Plug 是 model-agnostic structured memory / plug-in；
+  \item 你的 idea 应该做 \key{post-training objective}：让模型内化状态更新策略，而不是只在推理时加外部树；
+  \item 可以把 IUT / scene graph 当 evaluator 或 reward parser，而不是把树结构本身当唯一贡献。
+\end{itemize}
+
+\textbf{和 UniLongGen 的区别：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item UniLongGen 主要是 inference-time context curation / active forgetting；
+  \item 你的 idea 要把“保留什么、忘掉什么”变成可训练策略：state-aware memory selection reward；
+  \item 重点不是减少视觉历史，而是保留 \key{state-relevant} 历史、丢弃 \key{state-interfering} 历史。
+\end{itemize}
+
+\subsubsection*{6. 可冲分技术路线}
+
+\paragraph{模块 1：State Parser / State Graph}
+
+用 MLLM / VLM 把每个 text block 和 image block 解析成状态图：
+
+\[
+G_t=(V_t,E_t,A_t,F_t),
+\]
+
+其中节点是实体/概念，边是关系，属性记录外观/风格/知识事实，$F_t$ 记录出处和证据。
+
+\textbf{冲分点：} 不只解析单步，还要解析 \key{state delta}：
+
+\[
+\Delta_t =
+\mathrm{Diff}(G_{t-1},G_t)
+=
+\{\text{added},\text{removed},\text{changed},\text{preserved},\text{violated}\}.
+\]
+
+\paragraph{模块 2：State-aware Reward}
+
+构造分解式 reward：
+
+\[
+R_t =
+\lambda_1 R^\text{task}_t
++
+\lambda_2 R^\text{preserve}_t
++
+\lambda_3 R^\text{update}_t
++
+\lambda_4 R^\text{ground}_t
++
+\lambda_5 R^\text{memory}_t.
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $R^\text{preserve}$：不该变的实体/风格/知识是否保持；
+  \item $R^\text{update}$：该变的步骤/场景/动作是否完成；
+  \item $R^\text{ground}$：知识状态是否有检索证据支持；
+  \item $R^\text{memory}$：选择的历史上下文是否足够且无污染；
+  \item $R^\text{task}$：传统图文质量、alignment、structural fidelity。
+\end{itemize}
+
+\paragraph{模块 3：State-aware GRPO / DPO}
+
+对同一长序列任务采样多条 trajectories：
+
+\[
+Y^{(1)},\ldots,Y^{(G)}.
+\]
+
+不同于普通 GRPO 只比较最终分数，state-aware GRPO 给每个 segment 一个状态 advantage：
+
+\[
+A_t^{(i)}
+=
+\mathrm{Norm}_G
+\left(
+R_t^{(i)}
++
+\gamma V_\text{state}(S_t^{(i)})
+-
+V_\text{state}(S_{t-1}^{(i)})
+\right).
+\]
+
+\textbf{冲分点：} 把文本 token、图像 denoising/flow step、image block、tool action 分成不同粒度的 policy segment，避免把最终 reward 机械广播到所有步骤。
+
+\paragraph{模块 4：State Drift Benchmark}
+
+构造专门评测：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Entity drift：} 同一角色/物体跨 8--20 图是否保持；
+  \item \textbf{Style drift：} 画风、配色、构图规则是否稳定；
+  \item \textbf{Logic drift：} 过程步骤、因果关系是否前后一致；
+  \item \textbf{Knowledge drift：} 科学解释/教程事实是否和证据一致；
+  \item \textbf{Memory pollution：} 加入无关历史图后是否导致生成退化；
+  \item \textbf{Recovery：} 出现状态错误后能否自我修正。
+\end{itemize}
+
+\subsubsection*{7. 实验设计}
+
+\textbf{模型 baseline：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item BAGEL / BLIP3-o / DuoGen 类 unified model；
+  \item OpenLEAF / ISG-Agent 类 pipeline；
+  \item Interleaved-GRPO 作为直接后训练 baseline；
+  \item IUT-Plug / UniLongGen 作为 state-memory 和 context-curation baseline。
+\end{itemize}
+
+\textbf{训练数据：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item InterSyn / OpenING / ISG-Bench / RAG-IGBench 的可用子集；
+  \item 自构 long-horizon synthetic set：教程、视觉故事、科学解释、漫画分镜；
+  \item 人工或半自动 hard negatives：换脸、换风格、步骤错位、证据不一致、无关图污染。
+\end{itemize}
+
+\textbf{指标：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 通用：InterleavedBench、OpenING、SynJudge、ISG score；
+  \item 状态：entity consistency、style consistency、logic consistency、knowledge grounding；
+  \item 长序列：score vs. image event count 曲线；
+  \item 归因：first-drift step detection accuracy；
+  \item 代价：memory length、inference time、reward evaluation cost；
+  \item 人评：长教程/故事的整体可用性和偏好。
+\end{itemize}
+
+\textbf{Ablation：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 去掉 state parser，只用 VLM judge；
+  \item 去掉 preserve reward，看 identity/style drift；
+  \item 去掉 update reward，看 under-generation / text-image mismatch；
+  \item 去掉 memory reward，看 long-horizon collapse；
+  \item final-only reward vs. state process reward；
+  \item inference-only memory plug-in vs. post-training 内化。
+\end{itemize}
+
+\subsubsection*{8. 论文写法：如何“冲分”}
+
+\begin{summarybox}
+\textbf{推荐标题：}\\
+\textit{State-Aware Post-Training for Long-Horizon Multimodal Interleaved Generation}\\
+\textbf{推荐主张：}\\
+Long-horizon interleaved generation fails because models do not explicitly track and optimize multimodal state transitions. We introduce state-aware post-training, which decomposes each generation step into state update, state preservation, grounding, and memory selection signals.
+\end{summarybox}
+
+\textbf{论文贡献最好写成四点：}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Problem formulation：} 把 interleaved generation 重新定义为 multimodal state transition，而不是普通 sequence generation。
+  \item \textbf{State-aware reward / GRPO：} 提出 state graph parser、state delta reward、state-level credit assignment。
+  \item \textbf{Benchmark：} 构造长序列 state drift benchmark，覆盖实体、风格、逻辑、知识和历史记忆污染。
+  \item \textbf{Empirical result：} 在强 unified models 和 pipeline baselines 上，提升长序列一致性，同时保持通用 interleaved benchmark 不掉分。
+\end{enumerate}
+
+\textbf{最容易被审稿人认可的亮点：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 不是只提高最终分数，而是解释“第几步开始漂移”；
+  \item 不是只加长上下文，而是证明视觉历史会污染，需要 state-aware memory；
+  \item 不是只做 GRPO，而是证明普通 GRPO 的 credit assignment 对长交织状态不够；
+  \item 不是只做插件，而是把结构化状态变成训练信号。
+\end{itemize}
+
+\subsubsection*{9. 风险与规避}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{风险：和 IUT-Plug 太近。} 规避：IUT-Plug 作为 structured memory baseline；本文主贡献必须是 post-training objective 和 drift benchmark。
+  \item \textbf{风险：state parser 不可靠。} 规避：先限定实体、属性、关系、步骤、证据五类可验证状态；用人工小集校准 parser。
+  \item \textbf{风险：训练成本高。} 规避：先做 LoRA / adapter / rejection sampling + DPO，再扩展到 GRPO。
+  \item \textbf{风险：长序列生成评测主观。} 规避：用 state graph 自动指标 + VLM judge + 小规模人评三套证据。
+  \item \textbf{风险：通用 benchmark 掉分。} 规避：混合通用 reward 和 state reward，报告 OpenING / InterleavedBench 不下降。
+\end{itemize}
+
+\subsubsection*{10. 最终建议}
+
+\begin{conceptbox}
+\textbf{这个 idea 值得推进。}\\
+但题目不要写成“长序列图文交织生成”或“GRPO for interleaved generation”。那两个表述都已经被 baseline 覆盖。\\
+\textbf{最强题面：} \key{State-aware post-training for long-horizon interleaved generation}。\\
+\textbf{最小可做版本：} 先做 8--12 步教程/故事的 entity-style-logic state drift benchmark + state-aware DPO/GRPO。\\
+\textbf{论文核心差异：} 从最终图文质量优化，推进到状态转移可靠性优化。
+\end{conceptbox}

@@ -1,0 +1,484 @@
+% ============================================================
+% Stage 4：再学 FlexAttention，重点放在“什么时候需要”
+% ============================================================
+
+\section{Stage 4：再学 FlexAttention，重点放在“什么时候需要”}
+
+\begin{conceptbox}
+\textbf{最终口径：} FlexAttention 不是“比 FlashAttention 更高级的新默认”，而是当你的 attention 已经不是普通 dense / causal 模式，出现\key{自定义 token 可见性、自定义 pre-softmax score 修改、sliding window、prefix-LM、document mask、sample packing、block-sparse、多模态分区规则}时，用 \texttt{score\_mod} / \texttt{mask\_mod} 把规则写出来，再让 PyTorch 通过 \texttt{torch.compile} 尽量生成 fused、可利用稀疏性的高性能 attention kernel。
+\end{conceptbox}
+
+\note{这一节重点是“什么时候需要 FlexAttention”，不是教你手写 Triton/CUDA kernel，也不是把所有 attention 变体都实现一遍。你要先能判断：普通 SDPA / FlashAttention 够不够；如果不够，是不是该上 FlexAttention。}
+
+\subsection{一、先给结论：什么时候需要 FlexAttention？}
+
+如果一句话判断：
+
+\begin{summarybox}
+\textbf{普通 dense / causal attention：} 优先用 PyTorch SDPA / FlashAttention。\\
+\textbf{复杂 attention pattern：} 如果你需要控制“哪些 token 能看哪些 token”，或者需要在 softmax 前对 score 做自定义修改，并且还想尽量保留 fused kernel 的性能，就开始考虑 FlexAttention。
+\end{summarybox}
+
+换句话说，FlexAttention 解决的不是“标准 attention 怎么更快”这个问题；这个问题主要由 SDPA / FlashAttention 负责。FlexAttention 解决的是：
+
+\begin{center}
+\begin{tabular}{p{13.2cm}}
+\hline
+我现在的 attention 规则太灵活，普通 flash backend 支持不了；但如果退回 eager / dense mask，又慢又吃显存。有没有办法用 PyTorch 写规则，同时让底层生成接近 fused attention 的实现？ \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{你可以这样记：} FlashAttention 主要优化“怎么算标准 attention”；FlexAttention 主要解决“我想定义不标准的 attention 规则，但又不想为了每一种规则手写 kernel”。
+\end{intubox}
+
+\subsection{二、先和 FlashAttention 分清边界}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.0cm}p{5.0cm}p{5.0cm}}
+\hline
+\textbf{问题} & \textbf{优先想到 FlashAttention / SDPA} & \textbf{开始考虑 FlexAttention} \\
+\hline
+attention 语义 & 普通 dense self-attention 或 causal attention。 & token pair 可见性有自定义规则。 \\
+mask 类型 & causal mask、简单 padding mask，且 backend 支持。 & sliding window、prefix-LM、document boundary、block-sparse、多规则组合。 \\
+score 修改 & 没有额外 pre-softmax 修改，或框架已有内置支持。 & ALiBi / relative bias / tanh soft cap 等需要自定义 \texttt{score\_mod}。 \\
+性能目标 & 更快地算标准公式，减少 $S/P$ 物化和 HBM IO。 & 自定义规则下仍希望 fused、少物化、能跳过 masked block。 \\
+工程复杂度 & 配置或调用现成接口即可。 & 需要写 \texttt{score\_mod} / \texttt{mask\_mod}，并关注编译、缓存和 mask 稀疏结构。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{不要把 FlexAttention 理解成“所有场景都更快”。} 如果你的 attention 本来就是普通 causal LLM attention，那么成熟的 SDPA / FlashAttention 往往是更直接、更稳的选择。FlexAttention 的优势出现在\key{规则复杂、普通 backend 不支持、但规则又有结构可利用}的时候。
+\end{warnbox}
+
+\subsection{三、FlexAttention 的最小心智模型}
+
+标准 attention 可以写成：
+
+\[
+S_{ij}=\frac{q_i k_j^\top}{\sqrt d}
+\]
+
+\[
+P_{ij}=\mathrm{softmax}(S_{ij})
+\]
+
+\[
+O_i=\sum_j P_{ij}v_j
+\]
+
+FlexAttention 给你的关键能力是：在 score 进入 softmax 之前，插入可编程规则。
+
+\subsubsection*{1. \texttt{score\_mod}：改 score 的数值}
+
+\texttt{score\_mod} 的直觉是：对每一个 query-key pair 的 score，在 softmax 前做一次自定义变换。
+
+概念上可以理解成：
+
+\begin{lstlisting}[language=Python]
+def score_mod(score, b, h, q_idx, kv_idx):
+    return score
+\end{lstlisting}
+
+参数含义是：
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.3cm}p{10.2cm}}
+\hline
+\textbf{参数} & \textbf{含义} \\
+\hline
+\texttt{score} & 当前 query token 和 key token 的点积 score。 \\
+\texttt{b} & 当前 batch index。 \\
+\texttt{h} & 当前 head index。 \\
+\texttt{q\_idx} & 当前 query 位置。 \\
+\texttt{kv\_idx} & 当前 key/value 位置。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+它适合表达：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 给不同距离加 bias，例如相对位置 bias 或 ALiBi 风格 bias；
+  \item 对 score 做 soft cap，例如某些模型里的 tanh soft-capping；
+  \item 对不同 head、不同 token 区域使用不同的 pre-softmax 修改。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{注意：} 你也可以在 \texttt{score\_mod} 里把不允许的位置改成 $-\infty$，这样数学上可以实现 mask；但如果目标是利用 mask 的稀疏性跳过计算，通常应该用 \texttt{mask\_mod} + \texttt{BlockMask}。
+\end{warnbox}
+
+\subsubsection*{2. \texttt{mask\_mod}：定义哪些 token pair 可以参与计算}
+
+\texttt{mask\_mod} 的直觉是：返回一个布尔值，告诉 kernel 当前 query-key pair 是否允许参与 attention。
+
+概念上可以理解成：
+
+\begin{lstlisting}[language=Python]
+def mask_mod(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+\end{lstlisting}
+
+其中 \texttt{True} 表示这个位置保留，\texttt{False} 表示这个位置被 mask 掉。
+
+如果只是把 mask 写进 dense tensor，你仍然可能要处理一个很大的 $n\times n$ mask。FlexAttention 更重要的地方是：把 \texttt{mask\_mod} 交给 \texttt{create\_block\_mask}，生成 \texttt{BlockMask}，让底层知道哪些 block 可以整体跳过。
+
+\subsubsection*{3. \texttt{BlockMask}：让 mask 的稀疏性真正变成性能收益}
+
+\texttt{BlockMask} 可以理解成 block 级别的稀疏 mask 表示。它不是只告诉你“某个元素是否可见”，而是帮助 kernel 判断：
+
+\begin{center}
+\begin{tabular}{p{13.2cm}}
+\hline
+这一整块 query-key 区域是不是都不用算？如果整块都被 mask 掉，就可以跳过这块计算。 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{最直白的理解：} \texttt{score\_mod} 更像“改分数”；\texttt{mask\_mod} 更像“规定谁能看谁”；\texttt{BlockMask} 更像“把谁能看谁这件事整理成适合 kernel 跳过整块计算的地图”。
+\end{intubox}
+
+\subsection{四、最典型的需要场景 1：sliding window / local attention}
+
+长上下文里，如果每个 token 都看全部历史 token，attention 仍然有 $n^2$ token pair。很多模型会改成局部窗口：每个 token 只看附近一段上下文。
+
+例如 causal sliding window：第 $i$ 个 query 只能看过去 $W$ 个 token：
+
+\[
+i-W \le j \le i
+\]
+
+用 FlexAttention 的 \texttt{mask\_mod} 可以表达成：
+
+\begin{lstlisting}[language=Python]
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+WINDOW = 1024
+
+def sliding_causal_mask(b, h, q_idx, kv_idx):
+    return (kv_idx <= q_idx) & (q_idx - kv_idx <= WINDOW)
+
+block_mask = create_block_mask(
+    sliding_causal_mask,
+    B=None,
+    H=None,
+    Q_LEN=S,
+    KV_LEN=S,
+    device=query.device,
+)
+
+out = flex_attention(query, key, value, block_mask=block_mask)
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{什么时候需要：} 如果你要的是标准 causal attention，就不需要 FlexAttention；如果你要的是\key{只看局部窗口、局部窗口再叠加 causal、局部窗口再叠加文档边界}，普通 flash backend 未必直接支持，这时 FlexAttention 就有价值。
+\end{summarybox}
+
+\subsection{五、最典型的需要场景 2：prefix-LM}
+
+prefix-LM 的规则和普通 causal 不一样。常见形式是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item prefix 区域内部可以双向看；
+  \item generation 区域可以看整个 prefix；
+  \item generation 区域内部仍然 causal，只能看过去，不能看未来。
+\end{itemize}
+
+如果 prefix 长度是 $p$，可以粗略理解成：
+
+\[
+\text{allow}(i,j)=
+\begin{cases}
+\text{true}, & i < p \text{ and } j < p \\
+\text{true}, & i \ge p \text{ and } j < p \\
+\text{true}, & i \ge p \text{ and } p \le j \le i \\
+\text{false}, & \text{otherwise}
+\end{cases}
+\]
+
+这已经不是普通 causal mask。你当然可以构造完整 dense mask，但长序列下这会重新带来 $n^2$ mask 和 IO 压力。
+
+\begin{intubox}
+\textbf{为什么适合 FlexAttention：} prefix-LM 的规则很清楚，而且通常有块结构。它适合用 \texttt{mask\_mod} 表达，再转成 \texttt{BlockMask}，而不是为了这个规则专门写一个 attention kernel。
+\end{intubox}
+
+\subsection{六、最典型的需要场景 3：document mask / sample packing}
+
+训练 LLM 时，为了提高吞吐，常常会把多个短样本 pack 到同一个长序列里。例如一个 batch 里的某条序列其实是：
+
+\begin{center}
+\begin{tabular}{p{13.2cm}}
+\hline
+文档 A tokens $\mid$ 文档 B tokens $\mid$ 文档 C tokens \\
+\hline
+\end{tabular}
+\end{center}
+
+这时如果直接用普通 causal mask，文档 B 的 token 可能会看到文档 A，文档 C 的 token 可能会看到 A/B。对语言模型训练来说，这通常是错误的数据泄漏。
+
+正确规则应该是：
+
+\begin{center}
+\begin{tabular}{p{13.2cm}}
+\hline
+同一个文档内部按 causal 或 dense 规则 attend；不同文档之间不能 attend。 \\
+\hline
+\end{tabular}
+\end{center}
+
+概念上可以写成：
+
+\begin{lstlisting}[language=Python]
+def document_causal_mask(b, h, q_idx, kv_idx):
+    same_doc = doc_id[q_idx] == doc_id[kv_idx]
+    causal = kv_idx <= q_idx
+    return same_doc & causal
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{什么时候需要：} 只做 padding，不一定需要 FlexAttention；但如果你做 sample packing / sequence packing，并且要求不同样本之间严格隔离，\key{document mask} 就是 FlexAttention 很典型的适用场景。
+\end{summarybox}
+
+\subsection{七、最典型的需要场景 4：多模态和视频里的分区规则}
+
+AIGC 场景里，token 往往不是单一文本序列。它可能包含：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本 token；
+  \item 图像 patch token；
+  \item 视频的时间帧 token 和空间 patch token；
+  \item 条件 token、控制 token、参考图 token、全局 summary token。
+\end{itemize}
+
+这时 attention 规则可能变成：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 文本 token 可以看全部文本条件；
+  \item 图像 token 只能看局部空间窗口；
+  \item 视频 token 只能看邻近帧和邻近 patch；
+  \item 少数全局 token 可以被所有 token 访问；
+  \item 不同图、不同视频片段、不同文档之间不能互相 attend。
+\end{itemize}
+
+这些规则通常不是一个简单的 causal mask 能表达的。如果用 dense mask，mask 本身可能就很大；如果为每种组合写 kernel，工程成本又很高。
+
+\begin{intubox}
+\textbf{AIGC 使用者视角：} FlexAttention 在多模态 / 视频里最有价值的地方，不是“更快地算普通 attention”，而是让你能表达\key{文本、图像、视频、条件 token 之间的结构化可见性规则}，并尽量让底层利用这些结构化稀疏性。
+\end{intubox}
+
+\subsection{八、最典型的需要场景 5：多个 attention 规则叠加}
+
+现实项目里麻烦的不是单个规则，而是规则组合。例如：
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.0cm}p{8.7cm}}
+\hline
+\textbf{组合} & \textbf{含义} \\
+\hline
+causal + sliding window & 只能看过去，而且只能看最近窗口。 \\
+document mask + causal & pack 多个样本时，同文档内 causal，不同文档隔离。 \\
+prefix-LM + document mask & 每个样本内部有 prefix 和 generation 区域，不同样本之间隔离。 \\
+sliding window + global token & 大多数 token 看局部，少数全局 token 负责长程信息。 \\
+video local window + text condition & 视频 token 看局部时空邻域，同时看文本条件。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+PyTorch 官方博客把这类问题称作组合爆炸：每种 mask、bias、attention setting 的组合都写一个手工 kernel，几乎不可维护。
+
+\begin{summarybox}
+\textbf{FlexAttention 的核心工程价值：} 不是为了某一个固定 mask，而是为了避免“每出现一种新 attention 变体组合，就要等别人写一个专用 kernel”。你用 PyTorch 函数描述规则，让编译器尽量生成 fused kernel。
+\end{summarybox}
+
+\subsection{九、什么时候不需要 FlexAttention？}
+
+\begin{warnbox}
+\textbf{普通场景不要过度工程化。} FlexAttention 很有用，但不是所有 attention 都应该改成 FlexAttention。
+\end{warnbox}
+
+下面这些情况通常不需要优先考虑 FlexAttention：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{普通 causal LLM attention：} 优先用 PyTorch SDPA / FlashAttention / \texttt{flash-attn} 包。
+  \item \textbf{普通 dense DiT self-attention：} 如果没有复杂 mask，FlashAttention 类 backend 往往更直接。
+  \item \textbf{只是简单 padding：} 先看当前框架的 SDPA / flash backend 是否已经支持，不要急着上 FlexAttention。
+  \item \textbf{序列很短：} attention 不是瓶颈时，FlexAttention 的编译和 mask 构造复杂度可能不值得。
+  \item \textbf{mask 每一步都高度动态且难以缓存：} \texttt{create\_block\_mask} 本身有成本，无法缓存时可能抵消收益。
+  \item \textbf{mask 是随机、细粒度、没有 block 结构的稀疏：} 即使语义上 sparse，也未必能转化成好的 block-sparse 性能。
+  \item \textbf{环境不适合 \texttt{torch.compile}：} 版本、硬件、动态 shape、编译时间和部署限制都可能让 FlexAttention 不合适。
+  \item \textbf{decode 阶段主要瓶颈是 KV cache 管理：} 这时常常要优先看 KV cache、paged attention、batching、memory bandwidth，而不是直接套 FlexAttention。
+\end{itemize}
+
+\subsection{十、决策树：看到一个 attention 需求怎么判断？}
+
+\begin{center}
+{\small
+\begin{tabular}{p{1.0cm}p{6.4cm}p{5.4cm}}
+\hline
+\textbf{步骤} & \textbf{问题} & \textbf{判断} \\
+\hline
+1 & 它是不是普通 dense 或普通 causal attention？ & 是：优先 SDPA / FlashAttention；否：继续。 \\
+2 & 复杂性来自“谁能看谁”吗？ & 是：考虑 \texttt{mask\_mod}。 \\
+3 & 复杂性来自“softmax 前 score 怎么改”吗？ & 是：考虑 \texttt{score\_mod}。 \\
+4 & mask 是否有块结构或可跳过大块？ & 是：用 \texttt{create\_block\_mask} / \texttt{BlockMask} 更可能有性能收益。 \\
+5 & mask 是否能按 shape、device、规则缓存？ & 能缓存：更适合；不能缓存：评估构造成本。 \\
+6 & 现有 backend 是否已经直接支持？ & 已支持：没必要为了新而新；不支持：FlexAttention 价值上升。 \\
+7 & 你是否愿意承担编译、调试和版本兼容成本？ & 愿意且收益明确：再上 FlexAttention。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{最短判断模板：} \key{标准 attention 用 FlashAttention；复杂 mask / score 规则用 FlexAttention；复杂但没有结构或无法缓存时，要先 benchmark，不要默认一定更快。}
+\end{summarybox}
+
+\subsection{十一、FlexAttention 写法上的几个坑}
+
+\subsubsection*{1. 用 \texttt{score\_mod} 做 mask 正确，但不一定快}
+
+如果你写：
+
+\begin{lstlisting}[language=Python]
+def causal_score_mod(score, b, h, q_idx, kv_idx):
+    return torch.where(q_idx >= kv_idx, score, -float("inf"))
+\end{lstlisting}
+
+数学语义是对的，因为被 mask 的位置 softmax 后权重为 0。但这不一定能让底层跳过对应计算。想利用 mask 稀疏性，通常应该写 \texttt{mask\_mod}，再生成 \texttt{BlockMask}。
+
+\subsubsection*{2. \texttt{create\_block\_mask} 要缓存}
+
+\texttt{create\_block\_mask} 不是免费的。如果你的 mask pattern 只依赖 shape、device、窗口大小、文档边界等相对稳定的信息，应该缓存它，而不是每次 forward 都重新创建。
+
+\begin{warnbox}
+\textbf{工程提示：} benchmark 时要把首次 \texttt{torch.compile} 编译时间、\texttt{BlockMask} 构造时间、warmup 后 steady-state 时间分开看。否则你可能误判 FlexAttention 的实际收益。
+\end{warnbox}
+
+\subsubsection*{3. \texttt{B=None} / \texttt{H=None} 代表广播，不是忘了写}
+
+如果 mask pattern 不依赖 batch 或 head，可以在构造 block mask 时把 \texttt{B} 或 \texttt{H} 设成 \texttt{None}，表示这个规则在 batch/head 维度共享。这样通常更省、更容易复用。
+
+\subsubsection*{4. 自定义函数要对编译器友好}
+
+FlexAttention 的价值依赖 \texttt{torch.compile} 把你的规则降到 fused kernel。实践中应尽量让 \texttt{score\_mod} / \texttt{mask\_mod}：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 逻辑简单，避免复杂 Python side effect；
+  \item 使用可追踪的 tensor / index 运算；
+  \item 尽量避免每步变化过大的动态 shape；
+  \item 先用小 shape 做正确性测试，再做性能测试。
+\end{itemize}
+
+\subsection{十二、和 Stage 1 的 FlashAttention 口径接起来}
+
+Stage 1 里我们说过：FlashAttention 的核心是分块处理 $Q/K/V$，让局部 score tile 在片上高速内存里完成 scale、mask、online softmax 和对 $V$ 的累加，避免完整物化 $S/P$。
+
+FlexAttention 和它的关系可以这样理解：
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.2cm}p{4.7cm}p{4.8cm}}
+\hline
+\textbf{对象} & \textbf{FlashAttention} & \textbf{FlexAttention} \\
+\hline
+主要目标 & 高效计算标准 dense / causal attention。 & 高效表达和计算自定义 attention 变体。 \\
+核心直觉 & tiling、online softmax、fusion、少物化 $S/P$。 & 用 \texttt{score\_mod} / \texttt{mask\_mod} 描述规则，再生成 fused / block-sparse kernel。 \\
+是否改变语义 & 不改变标准 attention 语义。 & 可能改变 token 可见性或 score 规则；它 exact 地执行你定义的新规则。 \\
+最适合场景 & 普通 LLM causal、普通 dense self-attention。 & sliding window、prefix-LM、document mask、block-sparse、多模态复杂 mask。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{conceptbox}
+\textbf{关键区分：} FlashAttention 是“标准 attention 的高性能实现”；FlexAttention 是“复杂 attention 规则的可编程高性能入口”。当你用 FlexAttention 改了 mask 或 score，它不再是在算普通 dense attention，而是在准确地算你定义的新 attention 语义。
+\end{conceptbox}
+
+\subsection{十三、AIGC 项目里的选型口径}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.1cm}p{4.6cm}p{5.0cm}}
+\hline
+\textbf{场景} & \textbf{优先方案} & \textbf{什么时候转向 FlexAttention} \\
+\hline
+LLM 普通训练 & SDPA / FlashAttention。 & 做 sequence packing，需要 document mask；或需要 sliding window / global token 组合。 \\
+LLM 长上下文 & FlashAttention + KV/cache/并行策略。 & attention pattern 从 full causal 改成局部、稀疏、prefix、文档隔离等复杂规则。 \\
+DiT 图像生成 & dense attention 先用 FlashAttention 类 backend。 & patch 间只看局部窗口，或多图、多区域、多条件之间有结构化可见性规则。 \\
+视频生成 & 先确认 token 数和瓶颈。 & 时间窗口、空间窗口、跨帧局部注意力、全局 token 等组合规则明显时。 \\
+多模态模型 & 先看现有框架是否支持 mask。 & 文本、图像、视频、参考条件之间的 attention 规则需要自定义时。 \\
+推理 decode & 先看 KV cache / paged attention / batching。 & 如果 decode/prefill 中确实有自定义 block mask 且现有 kernel 不支持，再评估。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{十四、这一节的最终账本}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.0cm}p{4.8cm}p{5.0cm}}
+\hline
+\textbf{关键词} & \textbf{核心含义} & \textbf{你要记住的工程结论} \\
+\hline
+\texttt{flex\_attention} & PyTorch 提供的可编程 attention API。 & 用来表达复杂 attention 变体，而不是普通 attention 的默认替代品。 \\
+\texttt{score\_mod} & softmax 前修改每个 score。 & 适合 bias、soft cap、按 head/token 区域改分数。 \\
+\texttt{mask\_mod} & 定义哪些 query-key pair 可见。 & 适合 sliding window、prefix-LM、document mask 等可见性规则。 \\
+\texttt{BlockMask} & block 级稀疏 mask 表示。 & 让 mask 的结构化稀疏更可能变成跳过计算的性能收益。 \\
+缓存 & 复用编译结果和 block mask。 & 不缓存可能让构造成本抵消性能收益。 \\
+适用边界 & 规则复杂且有结构。 & 普通 dense/causal 仍优先 SDPA / FlashAttention。 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{Stage 4 最终结论：} 你需要 FlexAttention 的典型信号不是“我想让 attention 更快”，而是\key{我的 attention 规则已经不是普通 dense/causal，现有 flash backend 不直接支持；我又不想退回慢的 dense mask/eager 实现，更不想为每个规则组合手写 kernel。} 这时用 \texttt{score\_mod} 表达 score 修改，用 \texttt{mask\_mod} + \texttt{BlockMask} 表达结构化 mask，并通过 \texttt{torch.compile} 尽量获得 fused / sparse 的执行路径。
+\end{summarybox}
+
+\subsection{十五、你学完这一节后应该能立刻回答的问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 普通 causal LLM attention 为什么通常不需要先上 FlexAttention？
+  \item FlexAttention 和 FlashAttention 的边界是什么？
+  \item \texttt{score\_mod} 和 \texttt{mask\_mod} 分别解决什么问题？
+  \item 为什么用 \texttt{score\_mod} 返回 $-\infty$ 可以实现 mask，但未必能获得稀疏性能收益？
+  \item \texttt{BlockMask} 为什么重要？它和 dense boolean mask 的区别是什么？
+  \item sliding window、prefix-LM、document mask 为什么是 FlexAttention 的典型场景？
+  \item 为什么 \texttt{create\_block\_mask} 要缓存？benchmark 时为什么要区分编译时间和 steady-state 时间？
+  \item 在多模态或视频生成里，什么样的 attention 规则会让你想到 FlexAttention？
+\end{itemize}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item PyTorch 官方博客，\emph{FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention}。用于理解 FlexAttention 的设计动机：用 PyTorch 写 attention 变体，通过 \texttt{torch.compile} 降到 fused FlashAttention-like kernel，并支持利用 mask 稀疏性。\\
+  \url{https://pytorch.org/blog/flexattention/}
+  \item PyTorch \texttt{torch.nn.attention.flex\_attention} 官方文档。用于确认 \texttt{flex\_attention}、\texttt{score\_mod}、\texttt{mask\_mod}、\texttt{BlockMask}、\texttt{create\_block\_mask} 等 API 语义。\\
+  \url{https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html}
+  \item PyTorch 源码 \texttt{flex\_attention.py}。用于校准 \texttt{flex\_attention}、\texttt{create\_block\_mask} 和 \texttt{BlockMask} 的函数签名与实现口径。\\
+  \url{https://github.com/pytorch/pytorch/blob/main/torch/nn/attention/flex_attention.py}
+  \item PyTorch Labs \texttt{attention-gym}：FlexAttention 示例集合，包含 masks、score mods、paged attention 等示例。\\
+  \url{https://github.com/pytorch-labs/attention-gym}
+  \item Dao 等，\emph{FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness}, arXiv:2205.14135。用于对比 FlashAttention 的标准 exact attention 高性能实现与 FlexAttention 的可编程复杂 mask 场景。\\
+  \url{https://arxiv.org/abs/2205.14135}
+  \item Beltagy 等，\emph{Longformer: The Long-Document Transformer}, arXiv:2004.05150。用于理解 sliding window / global attention 等长文档结构化 attention pattern 的背景。\\
+  \url{https://arxiv.org/abs/2004.05150}
+  \item Zaheer 等，\emph{Big Bird: Transformers for Longer Sequences}, arXiv:2007.14062。用于理解 block-sparse / global / random attention pattern 在长序列 Transformer 中的背景。\\
+  \url{https://arxiv.org/abs/2007.14062}
+\end{itemize}
+\endgroup

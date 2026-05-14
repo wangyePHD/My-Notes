@@ -1,0 +1,493 @@
+% ============================================================
+% SenseNova-U1 / NEO-Unify model loading and processor notes
+% ============================================================
+
+\section{模型加载与输入格式：\texttt{AutoModel}、tokenizer 与图像 patch}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 读懂 SenseNova-U1 推理代码里“模型是怎么加载起来的、文本和图像是怎么喂进去的”。这里先给结论：\key{官方代码没有单独暴露一个传统意义上的 \texttt{AutoProcessor}；输入加工由 \texttt{AutoTokenizer}、\texttt{load\_image\_native}、聊天模板，以及模型方法内部的 \texttt{<image>} token 展开机制共同完成。}\\
+\textbf{当前阅读基准：} 本节基于官方仓库 commit \texttt{2e339f94e992464d468794286af34ca759cb7ac0} 的 \texttt{examples/}、\texttt{src/sensenova\_u1/\_\_init\_\_.py}、\texttt{src/sensenova\_u1/models/neo\_unify/\_\_init\_\_.py}、\texttt{utils.py}、\texttt{configuration\_neo\_chat.py} 与 \texttt{modeling\_neo\_chat.py}。
+\end{conceptbox}
+
+\subsection{一、先给最终心智模型}
+
+\begin{summarybox}
+\textbf{SenseNova-U1 的输入链路可以概括成一句话：} \key{文本走 tokenizer，图像走 \texttt{load\_image\_native} 变成 patch 序列；文本 prompt 中的 \texttt{<image>} 占位符会被替换成 \texttt{<img>} + 多个 \texttt{<IMG\_CONTEXT>} + \texttt{</img>}，然后模型把 \texttt{<IMG\_CONTEXT>} 位置的文本 embedding 替换成视觉 embedding。}
+\end{summarybox}
+
+\begin{center}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tikzpicture}[
+  node distance=0.85cm and 0.75cm,
+  box/.style={draw, rounded corners, align=center, inner sep=5pt, font=\small, text width=3.25cm},
+  arr/.style={->, thick}
+]
+\node[box] (text) {prompt / question\\含可选 \texttt{<image>}};
+\node[box, right=of text] (query) {conversation template\\生成 query};
+\node[box, right=of query] (tokens) {\texttt{<image>} 展开成\\\texttt{<img>} + N 个\\\texttt{<IMG\_CONTEXT>} + \texttt{</img>}};
+\node[box, below=of text] (image) {PIL image\\或图片路径};
+\node[box, right=of image] (patch) {\texttt{load\_image\_native}\\得到 \texttt{pixel\_values}\\和 \texttt{grid\_hw}};
+\node[box, right=of patch] (embed) {视觉特征替换\\\texttt{<IMG\_CONTEXT>} embedding};
+\node[box, below=of embed] (model) {NEOChatModel\\理解或生成};
+\draw[arr] (text) -- (query);
+\draw[arr] (query) -- (tokens);
+\draw[arr] (image) -- (patch);
+\draw[arr] (patch) -- (embed);
+\draw[arr] (tokens) -- (embed);
+\draw[arr] (embed) -- (model);
+\end{tikzpicture}
+\end{adjustbox}
+\end{center}
+
+\begin{intubox}
+\textbf{容易误解的点：} 很多多模态 Hugging Face 项目会有 \texttt{AutoProcessor.from\_pretrained(...)}，但 SenseNova-U1 当前公开代码不是这个组织方式。它把 processor 的职责拆散到了 tokenizer、图像工具函数和模型高层方法内部。
+\end{intubox}
+
+\subsection{二、模型加载：为什么 \texttt{AutoModel.from\_pretrained} 能直接用}
+
+四个官方推理入口的加载代码几乎完全一致：
+
+\begin{lstlisting}[language=Python]
+config = AutoConfig.from_pretrained(model_path)
+check_checkpoint_compatibility(config)
+self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+self.model = AutoModel.from_pretrained(
+    model_path,
+    config=config,
+    torch_dtype=dtype,
+).to(device).eval()
+\end{lstlisting}
+
+这里关键不在这四行本身，而在 \texttt{import sensenova\_u1} 的副作用：包初始化时会调用内部注册函数，把 NEO-Unify 的 config / model 类型注册到 Transformers 的 \texttt{AutoConfig} 和 \texttt{AutoModel}。
+
+\begin{lstlisting}[language=Python]
+AutoConfig.register("neo_vision", NEOVisionConfig, exist_ok=True)
+AutoConfig.register("neo_chat", NEOChatConfig, exist_ok=True)
+
+AutoModel.register(NEOVisionConfig, NEOVisionModel, exist_ok=True)
+AutoModel.register(NEOChatConfig, NEOChatModel, exist_ok=True)
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{这意味着：} 只要先导入 \texttt{sensenova\_u1}，Transformers 看到 checkpoint 的 \texttt{model\_type = neo\_chat} 时，就知道应该实例化 \texttt{NEOChatConfig} 和 \texttt{NEOChatModel}。这也是官方 example 注释里说“不需要 \texttt{trust\_remote\_code=True}”的原因。
+\end{summarybox}
+
+\subsection{三、checkpoint 兼容检查：小但重要}
+
+加载 config 后，example 会立刻调用：
+
+\begin{lstlisting}[language=Python]
+check_checkpoint_compatibility(config)
+\end{lstlisting}
+
+这个函数会读取 config 字段 \texttt{sensenova\_u1\_min\_version}。如果 checkpoint 声明需要更高版本的 \texttt{sensenova-u1} 包，而本地安装版本太旧，就直接抛出清晰错误。
+
+\begin{intubox}
+\textbf{源码阅读意义：} 这不是模型结构核心，但说明官方预期 checkpoint 和代码会一起演化。以后如果你换新权重、旧代码加载失败，第一时间应该检查 \texttt{sensenova\_u1\_min\_version} 和本地包版本。
+\end{intubox}
+
+\subsection{四、配置结构：\texttt{NEOChatConfig} 是组合配置}
+
+\texttt{NEOChatConfig} 的 \texttt{model\_type} 是 \texttt{neo\_chat}，并且 \texttt{is\_composition = True}。它不是一个单纯 LLM config，而是组合了：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{vision\_config}：} 对应 \texttt{NEOVisionConfig}，包含视觉侧 patch size 等配置。
+  \item \textbf{\texttt{llm\_config}：} 对应 \texttt{NEOLLMConfig}，继承自 \texttt{Qwen3Config}，并额外加入 height / width rope 相关配置。
+  \item \textbf{\texttt{downsample\_ratio}：} 默认 \texttt{0.5}，后面计算图像 token 数、空间索引和生成 token 网格时都会用到。
+  \item \textbf{\texttt{template}：} 指定对话模板，后续通过 \texttt{get\_conv\_template(self.template)} 构造 prompt。
+\end{itemize}
+
+模型初始化时会保存：
+
+\begin{lstlisting}[language=Python]
+self.patch_size = config.vision_config.patch_size
+self.template = config.template
+self.downsample_ratio = config.downsample_ratio
+self.conv_template = get_conv_template(self.template)
+self.system_message = self.conv_template.system_message
+\end{lstlisting}
+
+这几个字段直接决定后面图像如何 patchify、\texttt{<image>} 要展开成多少个上下文 token，以及 query 使用什么聊天格式。
+
+\subsection{五、文本侧：没有神秘 processor，本质是 conversation template + tokenizer}
+
+T2I 路径用 \texttt{\_build\_t2i\_query} 构造 query：
+
+\begin{lstlisting}[language=Python]
+template = get_conv_template(self.template)
+template.system_message = self.system_message if system_message is None else system_message
+template.append_message(template.roles[0], prompt_text)
+template.append_message(template.roles[1], None)
+query = template.get_prompt()
+\end{lstlisting}
+
+VQA 路径也是同样思想：把历史对话和当前问题 append 到模板，再得到一个完整 prompt。区别是如果有图像但问题里没有写 \texttt{<image>}，\texttt{chat} 会自动在问题前面补：
+
+\begin{lstlisting}[language=Python]
+if history is None and pixel_values is not None and '<image>' not in question:
+    question = '<image>\n' + question
+\end{lstlisting}
+
+随后调用 tokenizer：
+
+\begin{lstlisting}[language=Python]
+model_inputs = tokenizer(query, return_tensors='pt')
+input_ids = model_inputs['input_ids'].to(self.device)
+attention_mask = model_inputs['attention_mask'].to(self.device)
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{文本侧 processor 的真实形态：} \key{conversation template 负责把 system / user / assistant 拼成模型熟悉的聊天格式；tokenizer 负责把 query 变成 token ids；模型内部再根据 token ids 计算时空索引。}
+\end{summarybox}
+
+\subsection{六、图像侧：\texttt{load\_image\_native} 返回两个核心对象}
+
+VQA 入口的图像加载非常直接：
+
+\begin{lstlisting}[language=Python]
+pixel_values, grid_hw = load_image_native(image)
+pixel_values = pixel_values.to(self.device, dtype=self.model.dtype)
+grid_hw = grid_hw.to(self.device)
+\end{lstlisting}
+
+\texttt{load\_image\_native} 做了四件事：
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{读取并转 RGB：} 支持路径或 PIL 图像；如果是 RGBA，会先用白色背景合成成 RGB。
+  \item \textbf{智能 resize：} \texttt{smart\_resize} 会让高宽都能被给定 factor 整除，并把总像素数限制在 \texttt{min\_pixels} 和 \texttt{max\_pixels} 之间。
+  \item \textbf{归一化：} 使用 ImageNet mean/std 做 \texttt{ToTensor + Normalize}。
+  \item \textbf{patchify：} 按 \texttt{patch\_size = 16} 默认逻辑，把图像展平成 patch 序列，并返回 \texttt{grid\_hw}。
+\end{enumerate}
+
+\texttt{preprocess\_pixel\_values} 的输出形状可以这样理解：
+
+\begin{lstlisting}[language=Python]
+# input:  pixel_values shape = [3, H, W]
+# output: flatten_pixel_values shape = [grid_h * grid_w, 3 * patch_size ** 2]
+# output: grid_hw shape = [[grid_h, grid_w]]
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{重点记住：} \texttt{pixel\_values} 不是常见的 \texttt{[B, 3, H, W]} 图像 batch，而是已经被 patchify 成二维 patch 序列；\texttt{grid\_hw} 则保留原始 patch 网格的高宽，后面用于恢复空间位置索引。
+\end{intubox}
+
+\subsection{七、\texttt{<image>} 如何变成可替换的视觉 token}
+
+SenseNova-U1 用一个很关键的约定连接文本和图像：用户 prompt 里写的是 \texttt{<image>}，但模型真正看到的是：
+
+\begin{lstlisting}[language=Python]
+image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
+query = query.replace('<image>', image_tokens, 1)
+\end{lstlisting}
+
+其中默认 special token 是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{IMG\_START\_TOKEN}：} \texttt{<img>}
+  \item \textbf{\texttt{IMG\_CONTEXT\_TOKEN}：} \texttt{<IMG\_CONTEXT>}
+  \item \textbf{\texttt{IMG\_END\_TOKEN}：} \texttt{</img>}
+\end{itemize}
+
+\texttt{num\_patch\_token} 由图像网格和 \texttt{downsample\_ratio} 决定：
+
+\begin{lstlisting}[language=Python]
+num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2)
+\end{lstlisting}
+
+在默认 \texttt{downsample\_ratio = 0.5} 时，\texttt{downsample\_ratio\^{}2 = 0.25}，也就是视觉 token 数相当于 patch 网格数量的四分之一。这和后续的 merge / downsample 机制一致。
+
+\begin{summarybox}
+\textbf{关键直觉：} \texttt{<image>} 只是用户态占位符；\texttt{<IMG\_CONTEXT>} 才是模型内部用于“放置视觉 embedding”的槽位。图像越大，\texttt{grid\_hw} 越大，需要的 \texttt{<IMG\_CONTEXT>} 槽位就越多。
+\end{summarybox}
+
+\subsection{八、视觉 embedding 如何塞回语言序列}
+
+在 VQA 的 \texttt{generate} 里，如果传入了 \texttt{pixel\_values}，模型会先抽取视觉特征：
+
+\begin{lstlisting}[language=Python]
+vit_embeds = self.extract_feature(pixel_values, grid_hw=grid_hw)
+\end{lstlisting}
+
+然后找到文本 token 序列中所有 \texttt{<IMG\_CONTEXT>} 的位置，把这些位置原来的 token embedding 替换成视觉 embedding：
+
+\begin{lstlisting}[language=Python]
+input_embeds = self.language_model.get_input_embeddings()(input_ids)
+selected = (input_ids == self.img_context_token_id)
+assert selected.sum() != 0
+input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+\end{lstlisting}
+
+Image Editing 的 \texttt{\_build\_it2i\_inputs} 也做了同样的事情，只是它用于生成路径的 prefix 输入。
+
+\begin{intubox}
+\textbf{这就是“图文融合”的最小实现抓手：} 图像不是作为一个外部对象永远悬挂在旁边，而是经过视觉模型抽特征后，直接写入语言模型输入 embedding 序列中的 \texttt{<IMG\_CONTEXT>} 槽位。
+\end{intubox}
+
+\subsection{九、维度如何对齐：\texttt{dense\_embedding} 同时做降采样和投影}
+
+这里有一个必须追清楚的问题：\key{ViT 提取出来的图像特征，为什么能直接替换语言模型的 token embedding？}因为语言模型输入 embedding 的最后一维固定是 \texttt{llm\_hidden\_size}，如果视觉特征最后一维不是同一个大小，下面这句赋值会直接形状不匹配：
+
+\begin{lstlisting}[language=Python]
+input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+\end{lstlisting}
+
+SenseNova-U1 的对齐点在视觉侧的 \texttt{NEOVisionEmbeddings}。配置里显式保存了两个维度：
+
+\begin{lstlisting}[language=Python]
+hidden_size=1024
+llm_hidden_size=2048
+downsample_ratio=0.5
+\end{lstlisting}
+
+进入视觉 embedding 模块后，先用 \texttt{patch\_embedding} 把每个 \(16 \times 16\) 图像 patch 变成视觉隐空间向量：
+
+\begin{lstlisting}[language=Python]
+self.patch_embedding = nn.Conv2d(
+    in_channels=config.num_channels,
+    out_channels=self.embed_dim,
+    kernel_size=self.patch_size,
+    stride=self.patch_size,
+)
+\end{lstlisting}
+
+此时每个 patch 的通道维度是视觉侧的 \texttt{hidden\_size}。随后真正完成“对齐到 LLM”的是 \texttt{dense\_embedding}：
+
+\begin{lstlisting}[language=Python]
+self.dense_embedding = nn.Conv2d(
+    in_channels=self.embed_dim,
+    out_channels=self.llm_embed_dim,
+    kernel_size=self.downsample_factor,
+    stride=self.downsample_factor,
+)
+\end{lstlisting}
+
+它一口气做了两件事：
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{空间降采样：} \texttt{downsample\_ratio = 0.5}，所以 \texttt{downsample\_factor = 2}。一个 \(2 \times 2\) 的 patch 小块会合并成一个视觉 token，token 数量变成原来的四分之一。
+  \item \textbf{通道投影：} \texttt{out\_channels = self.llm\_embed\_dim}，所以输出 token 的最后一维直接变成语言模型 hidden size。
+\end{enumerate}
+
+源码里还有两个 assert 把这个约束钉死：
+
+\begin{lstlisting}[language=Python]
+assert embeddings.shape[0] == int(patch_embeds.shape[0] / self.downsample_factor**2)
+return embeddings
+\end{lstlisting}
+
+因此，图像特征能塞进 \texttt{<IMG\_CONTEXT>} 槽位，不是靠“运行时自动适配”，而是靠视觉模型末端提前产出和 LLM 输入 embedding 同维度的视觉 token。
+
+\begin{summarybox}
+\textbf{可以把它想成“坑和砖”的匹配：} \texttt{<IMG\_CONTEXT>} 在文本序列里提前挖好了若干个坑；\texttt{dense\_embedding} 负责把原始 patch 砖块压缩成同样数量、同样宽度的砖。坑的数量由 \texttt{grid\_hw * downsample\_ratio\^{}2} 决定；砖的宽度由 \texttt{llm\_hidden\_size} 决定。
+\end{summarybox}
+
+举一个小例子。假设原图被切成 \(4 \times 4 = 16\) 个 patch，\texttt{downsample\_ratio = 0.5}，则 \texttt{downsample\_factor = 2}：
+
+\begin{lstlisting}[language=Python]
+# before dense_embedding
+patch_embeds: [16, hidden_size]
+
+# after 2x2 merge + channel projection
+vit_embeds: [4, llm_hidden_size]
+
+# text side
+<img> <IMG_CONTEXT> <IMG_CONTEXT> <IMG_CONTEXT> <IMG_CONTEXT> </img>
+\end{lstlisting}
+
+最后的结果是：4 个 \texttt{<IMG\_CONTEXT>} 槽位，对应 4 个 \texttt{vit\_embeds}；每个 \texttt{vit\_embeds} 的最后一维都等于语言模型输入 embedding 的最后一维。
+
+\subsection{十、位置编码分两层：视觉侧 2D RoPE，LLM 侧 \texttt{t/h/w} 三轴 RoPE}
+
+位置编码也要分清楚两件事：\key{视觉编码器内部先给 patch 注入二维空间感；进入 LLM 后，还要在统一图文序列里继续保留文本顺序和图像二维坐标。}
+
+\subsubsection{视觉编码器内部：patch 先做 2D RoPE}
+
+图像 patch 天然是二维网格。如果直接把它们拉平成一维序列，模型会丢掉“谁在左上、谁在右下”的结构。\texttt{NEOVisionEmbeddings} 里先根据 \texttt{grid\_hw} 生成每个 patch 的 \(x, y\) 坐标：
+
+\begin{lstlisting}[language=Python]
+abs_pos_x, abs_pos_y = build_abs_positions_from_grid_hw(grid_hw, device=patch_embeds.device)
+\end{lstlisting}
+
+然后把 embedding 最后一维拆成两半：一半按 \(x\) 坐标旋转，一半按 \(y\) 坐标旋转：
+
+\begin{lstlisting}[language=Python]
+x_part_1 = x[..., :dim_half]
+x_part_2 = x[..., dim_half:]
+rotated_part_1 = apply_rotary_emb_1d(x_part_1, cos_cached_x, sin_cached_x, abs_positions_x)
+rotated_part_2 = apply_rotary_emb_1d(x_part_2, cos_cached_y, sin_cached_y, abs_positions_y)
+return torch.cat((rotated_part_1, rotated_part_2), dim=-1)
+\end{lstlisting}
+
+通俗讲：一个 patch 不只是“第 7 个 patch”，而是“第 \(h\) 行、第 \(w\) 列的 patch”。二维 RoPE 就是在视觉特征里提前写入这种行列关系。
+
+\subsubsection{进入 LLM 后：统一序列使用 \texttt{t/h/w} 三套索引}
+
+视觉 token 替换进 \texttt{<IMG\_CONTEXT>} 后，模型面对的是一条混合序列：
+
+\begin{lstlisting}[language=Python]
+[文本 token, 文本 token, <IMG_CONTEXT>, <IMG_CONTEXT>, 文本 token]
+\end{lstlisting}
+
+这时只用普通一维位置还不够。SenseNova-U1 在语言模型 attention 里传入的是三行索引：
+
+\begin{lstlisting}[language=Python]
+indexes = torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
+\end{lstlisting}
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{t\_indexes}：} 控制文本/整体序列顺序；
+  \item \textbf{\texttt{h\_indexes}：} 控制图像 token 的高度坐标；
+  \item \textbf{\texttt{w\_indexes}：} 控制图像 token 的宽度坐标。
+\end{itemize}
+
+在 \texttt{modeling\_qwen3.py} 的 attention 里，query/key 会被拆成时间部分和空间部分：
+
+\begin{lstlisting}[language=Python]
+query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
+query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
+\end{lstlisting}
+
+然后三部分分别做 RoPE：
+
+\begin{lstlisting}[language=Python]
+cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
+cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+\end{lstlisting}
+
+最后再拼回完整的 query/key：
+
+\begin{lstlisting}[language=Python]
+query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
+key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
+\end{lstlisting}
+
+所以这不是简单的“文本用文本位置，图片用图片位置”两套系统并排放着，而是在同一个 attention 里把每个 token 的位置拆成三条轴：\texttt{t} 管序列先后，\texttt{h/w} 管图像二维结构。
+
+\subsubsection{一个通俗例子}
+
+假设 prompt 被展开成：
+
+\begin{lstlisting}[language=Python]
+请 描述 这 张 图 ： <img> A B C D </img>
+\end{lstlisting}
+
+其中 \texttt{A/B/C/D} 是 4 个 \texttt{<IMG\_CONTEXT>}，对应一张 \(2 \times 2\) 图：
+
+\begin{center}
+\begin{tabular}{cc}
+A: $(h=0,w=0)$ & B: $(h=0,w=1)$ \\
+C: $(h=1,w=0)$ & D: $(h=1,w=1)$
+\end{tabular}
+\end{center}
+
+文本侧的一维顺序告诉模型：
+
+\begin{lstlisting}[language=Python]
+请 -> 描述 -> 这 -> 张 -> 图 -> A -> B -> C -> D
+\end{lstlisting}
+
+图像侧的二维坐标告诉模型：
+
+\begin{lstlisting}[language=Python]
+A 在左上，B 在右上，C 在左下，D 在右下
+\end{lstlisting}
+
+把两者合起来，模型既知道“图片插在这句话的哪个位置”，也知道“每个视觉 token 在图片里的哪个位置”。这就是 \texttt{grid\_hw}、\texttt{t/h/w indexes} 和 RoPE 共同完成的事情。
+
+\subsection{十一、\texttt{grid\_hw} 与三维索引：为什么模型知道图像空间位置}
+
+模型不只需要知道“这里有视觉 token”，还需要知道这些 token 的二维空间位置。\texttt{get\_thw\_indexes} 会返回三行索引：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{t\_indexes}：} 文本/序列维度上的位置。
+  \item \textbf{\texttt{h\_indexes}：} 图像 token 的高度坐标。
+  \item \textbf{\texttt{w\_indexes}：} 图像 token 的宽度坐标。
+\end{itemize}
+
+当 \texttt{grid\_hw} 存在，并且当前 token 是 \texttt{<IMG\_CONTEXT>} 时，模型会用 \texttt{build\_abs\_positions\_from\_grid\_hw} 给这些 token 填上空间坐标：
+
+\begin{lstlisting}[language=Python]
+selected = (input_ids == self.img_context_token_id)
+abs_pos_w, abs_pos_h = build_abs_positions_from_grid_hw(
+    grid_hw // int(1 / self.downsample_ratio),
+    device=t_indexes.device,
+)
+h_indexes[selected] = abs_pos_h
+w_indexes[selected] = abs_pos_w
+\end{lstlisting}
+
+这一步解释了为什么 \texttt{grid\_hw} 必须和 \texttt{pixel\_values} 一起传：\key{前者负责告诉模型视觉 token 的二维布局，后者负责提供视觉内容本身。}
+
+\subsection{十二、不同任务里的输入格式差异}
+
+\begin{center}
+{\small
+\begin{tabular}{p{2.6cm}p{3.2cm}p{3.8cm}p{4.4cm}}
+\hline
+\textbf{任务} & \textbf{文本输入} & \textbf{图像输入} & \textbf{进入模型前的关键加工} \\
+\hline
+VQA & question / chat query & 单图或多图 patch 序列 & 若 question 没有 \texttt{<image>}，自动补；再展开为 \texttt{<IMG\_CONTEXT>} 槽位 \\
+T2I & prompt + generation system message & 无输入图像 & 构造 T2I query；后续根据输出分辨率建立生成图像 token 网格 \\
+Editing & prompt + 一个或多个 \texttt{<image>} & 多张输入图 patch 序列 & 图像先 patchify；prompt 中 \texttt{<image>} 数量不足时自动补；视觉 embedding 写入槽位 \\
+Interleave & prompt + optional images + system message & 可选多图 patch 序列 & 文本与输入图像混合；输出又可能包含文本和生成图像 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{不要把 \texttt{<image>} 和 \texttt{<img>} 混为一谈：} \texttt{<image>} 是 prompt 里的占位符；\texttt{<img>}、\texttt{<IMG\_CONTEXT>}、\texttt{</img>} 是模型真正 token 化前替换进去的 special token 序列。
+\end{warnbox}
+
+\subsection{十三、本节小结}
+
+\begin{summarybox}
+本节可以浓缩成五句话：\\
+1. SenseNova-U1 通过本地注册机制接入 Transformers 的 \texttt{AutoConfig} / \texttt{AutoModel}，所以 example 里可以直接 \texttt{from\_pretrained}；\\
+2. 当前公开代码没有单独的 processor 类，processor 职责被拆成 tokenizer、conversation template、\texttt{load\_image\_native} 和模型内部的 token 展开逻辑；\\
+3. 图像输入的关键格式是 \texttt{pixel\_values + grid\_hw + <IMG\_CONTEXT>}，其中 \texttt{pixel\_values} 提供视觉内容，\texttt{grid\_hw} 提供空间布局，\texttt{<IMG\_CONTEXT>} 提供语言序列中的替换槽位；\\
+4. 视觉特征能替换文本 embedding，是因为 \texttt{dense\_embedding} 同时把 patch 网格按 \texttt{downsample\_ratio} 降采样，并把通道数投影到 \texttt{llm\_hidden\_size}；\\
+5. 位置编码分两层：视觉侧先对 patch 做 2D RoPE，LLM 侧再用 \texttt{t/h/w} 三轴 RoPE 同时表达文本顺序和图像二维坐标。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item OpenSenseNova，\emph{SenseNova-U1 官方 GitHub 仓库}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1}
+  \item OpenSenseNova，\emph{SenseNova-U1 examples README：公开推理脚本说明}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/README_CN.md}
+  \item OpenSenseNova，\emph{T2I inference wrapper：\texttt{AutoConfig} / \texttt{AutoTokenizer} / \texttt{AutoModel} 加载方式}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/t2i/inference.py}
+  \item OpenSenseNova，\emph{VQA inference wrapper：\texttt{load\_image\_native} 与 \texttt{model.chat}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/vqa/inference.py}
+  \item OpenSenseNova，\emph{Package init：\texttt{check\_checkpoint\_compatibility} 与模型注册入口}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/__init__.py}
+  \item OpenSenseNova，\emph{NEO-Unify AutoConfig / AutoModel registration}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/__init__.py}
+  \item OpenSenseNova，\emph{Image preprocessing utilities：\texttt{smart\_resize} 与 \texttt{load\_image\_native}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/utils.py}
+  \item OpenSenseNova，\emph{NEOChatConfig：组合配置与 \texttt{downsample\_ratio}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/configuration_neo_chat.py}
+  \item OpenSenseNova，\emph{NEOChatModel：\texttt{chat}、\texttt{t2i\_generate}、\texttt{it2i\_generate} 与输入 embedding 替换逻辑}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py}
+  \item OpenSenseNova，\emph{NEOVisionModel：\texttt{patch\_embedding}、\texttt{dense\_embedding} 与视觉侧 2D RoPE 实现}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_neo_vit.py}
+  \item OpenSenseNova，\emph{Qwen3 attention modification：\texttt{t/h/w} 三轴 RoPE 与图文统一 attention}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_qwen3.py}
+  \item Alexey Dosovitskiy et al.，\emph{An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale}。\\
+  \url{https://arxiv.org/abs/2010.11929}
+  \item Jianlin Su et al.，\emph{RoFormer: Enhanced Transformer with Rotary Position Embedding}。\\
+  \url{https://arxiv.org/abs/2104.09864}
+  \item Qwen Team，\emph{Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution}。\\
+  \url{https://arxiv.org/abs/2409.12191}
+\end{itemize}
+\endgroup

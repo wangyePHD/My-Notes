@@ -1,0 +1,283 @@
+% ============================================================
+% arXiv & Hugging Face Daily Papers daily note
+% ============================================================
+
+\section{arXiv \& Hugging Face Daily Papers 日报：2026年5月6日}
+
+\begin{conceptbox}
+\textbf{方向}：后训练 · 视频生成/编辑 · 图像生成/编辑 · 统一理解与生成 · 世界模型 · 具身智能 · Style/Voice/Identity\\
+\textbf{数据来源}：用户提供的 arXiv PDF 列表 · \href{https://huggingface.co/papers}{Hugging Face Daily Papers} · \href{https://arxiv.org/list/cs.CV/new}{arXiv cs.CV} · \href{https://arxiv.org/list/cs.LG/new}{cs.LG} · \href{https://arxiv.org/list/cs.AI/new}{cs.AI}\\
+\textbf{整理日期}：2026-05-06\\
+\textbf{状态}：已完成第一轮粗读；本页用于筛选是否进入单篇深读。
+\end{conceptbox}
+
+\subsection{今日重点}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Large Language Models are Universal Reasoners for Visual Generation}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2605.04040}{2605.04040}\\
+  今日最值得放入统一理解与生成主线。它提出 \textbf{understanding-generation gap}：同一个 LLM/MLLM 对图像是否满足复杂 prompt 的判断能力很强，但生成时仍容易漏掉关系、数量和组合约束。UniReasoner 的做法是让 LLM 先生成离散视觉 draft，再自我评估 draft 和 prompt 的差异，最后把 prompt、draft、evaluation 一起喂给 diffusion model。这个思路很适合作为“把 verifier/reasoner 转成 generation guidance”的案例。
+
+  \item \textbf{Stream-R1: Reliability-Perplexity Aware Reward Distillation for Streaming Video Generation}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2605.03849}{2605.03849}\\
+  和你最近关注的 reward、rollout、step/chunk credit assignment 强相关。它不是直接做 GRPO 训练，而是把 reward model 用到 streaming video diffusion 的 distillation：rollout 级别按可靠性加权，像素/空间/时间级别按 reward gradient saliency 加权。核心启发是：不是所有 rollout、frame、pixel 都值得同等学习。
+
+  \item \textbf{AniMatrix: An Anime Video Generation Model that Thinks in Art, Not Physics}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2605.03652}{2605.03652}\\
+  视频生成方向最有意思的一篇。它明确把 anime video 的正确性从 physical realism 改成 artistic correctness，并用 production knowledge system、AniCaption、dual-channel conditioning、style-motion-deformation curriculum 和 deformation-aware preference optimization 去覆盖动画特有的夸张形变、impact frame、smear 等语言。
+
+  \item \textbf{GRPO-TTA: Test-Time Visual Tuning for Vision-Language Models via GRPO-Driven Reinforcement Learning}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2605.03403}{2605.03403}\\
+  这是今天唯一直接把 \textbf{GRPO} 放进标题的方法。它把 test-time adaptation 里的类别 prompt 预测重写成 group-wise policy optimization，用 CLIP top-K 候选构造输出组，再用 alignment reward 和 dispersion reward 做无标签测试时视觉编码器调优。和图像生成后训练不是同一问题，但很适合补到“GRPO 变体/视觉侧 RL”索引里。
+
+  \item \textbf{Video Generation with Predictive Latents}\\
+  \textbf{arXiv}：\href{https://arxiv.org/abs/2605.02134}{2605.02134}\\
+  适合放进视频 latent / world model 主线。PV-VAE 的关键判断是：video VAE 只优化 reconstruction 不一定带来更好的 generative performance；通过随机丢弃未来帧、只编码部分过去观测，同时重建已观测帧并预测未来帧，可以让 latent 更具 temporal predictability 和 motion prior。
+\end{enumerate}
+
+\subsection{待粗读论文池}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \href{https://arxiv.org/abs/2605.04040}{2605.04040}：Large Language Models are Universal Reasoners for Visual Generation。
+  \item \href{https://arxiv.org/abs/2605.03877}{2605.03877}：DMGD: Train-Free Dataset Distillation with Semantic-Distribution Matching in Diffusion Models。
+  \item \href{https://arxiv.org/abs/2605.03849}{2605.03849}：Stream-R1: Reliability-Perplexity Aware Reward Distillation for Streaming Video Generation。
+  \item \href{https://arxiv.org/abs/2605.03790}{2605.03790}：Enhancing Visual Question Answering with Multimodal LLMs via Chain-of-Question Guided Retrieval-Augmented Generation。
+  \item \href{https://arxiv.org/abs/2605.03652}{2605.03652}：AniMatrix: An Anime Video Generation Model that Thinks in Art, Not Physics。
+  \item \href{https://arxiv.org/abs/2605.03403}{2605.03403}：GRPO-TTA: Test-Time Visual Tuning for Vision-Language Models via GRPO-Driven Reinforcement Learning。
+  \item \href{https://arxiv.org/abs/2605.02912}{2605.02912}：Reasoning-Guided Grounding: Elevating Video Anomaly Detection through Multimodal Large Language Models。
+  \item \href{https://arxiv.org/abs/2605.03252}{2605.03252}：Ortho-Hydra: Orthogonalized Experts for DiT LoRA。
+  \item \href{https://arxiv.org/abs/2605.03245}{2605.03245}：Text-Conditional JEPA for Learning Semantically Rich Visual Representations。
+  \item \href{https://arxiv.org/abs/2605.02134}{2605.02134}：Video Generation with Predictive Latents。
+\end{itemize}
+
+\subsection{单篇粗读卡片}
+
+\subsubsection{Large Language Models are Universal Reasoners for Visual Generation}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.04040}{2605.04040}；\href{https://arxiv.org/pdf/2605.04040}{PDF}\\
+\textbf{方向}：统一理解与生成 · 文生图组合泛化 · LLM-as-reasoner\\
+\textbf{一句话结论}：这篇的核心不是换更强 diffusion backbone，而是把 LLM 的理解/验证能力显式转成生成时的 corrective guidance。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：统一理解与生成模型虽然共享 LLM backbone，但仍存在 understanding-generation gap：判断图像是否满足 prompt 比真正生成满足 prompt 的图像容易。
+  \item \textbf{方法抓手}：UniReasoner 使用三阶段 Draft-Evaluate-Diffuse pipeline：LLM 先生成由离散视觉 token 组成的 coarse visual draft，再对 draft 做 prompt consistency self-critique，最后 diffusion model 联合条件化 prompt、draft 和 evaluation。
+  \item \textbf{主要结果}：摘要报告在相同 SANA diffusion backbone 下，GenEval 从 0.79 提升到 0.88，DPG-Bench 从 84.50 提升到 86.30，同时保持图像质量。
+  \item \textbf{和我的主线关系}：适合连接“verifier/reasoner 作为生成过程控制信号”。如果后续做图像/视频生成后训练，这篇提供了非 RL 的 process guidance 参照：先发现生成草图的错，再把错转成 denoising 条件。
+  \item \textbf{是否深读}：\textbf{A}。建议拆单篇，重点看 visual draft tokenization、evaluation prompt、diffusion conditioning 方式和失败案例。
+\end{itemize}
+
+\subsubsection{DMGD: Train-Free Dataset Distillation with Semantic-Distribution Matching in Diffusion Models}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.03877}{2605.03877}；\href{https://arxiv.org/pdf/2605.03877}{PDF}\\
+\textbf{方向}：dataset distillation · diffusion guidance · train-free synthetic data\\
+\textbf{一句话结论}：它把 diffusion-based dataset distillation 从“再训练/微调生成器”改成 train-free guidance，用语义匹配和分布匹配直接引导合成小数据集。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：现有 diffusion dataset distillation 通常需要额外 fine-tuning，而且 guidance 机制不足，容易只保证类别语义、不保证 synthetic set 的整体分布结构。
+  \item \textbf{方法抓手}：DMGD 包含 Semantic Matching 和 OT-based Distribution Matching；前者通过 conditional likelihood optimization 做类别语义约束，不依赖额外 classifier；后者用 optimal transport 对齐合成数据和目标数据的分布结构，并通过 Distribution Approximate Matching、Greedy Progressive Matching 降低计算开销。
+  \item \textbf{主要结果}：在 ImageNet-Woof、ImageNet-Nette、ImageNet-1K 上，相比需要额外 fine-tuning 的 SOTA 平均准确率提升约 2.1、5.4、2.4 个点。
+  \item \textbf{和我的主线关系}：不是后训练主线，但“semantic-distribution matching + train-free guidance”对构造 RL/GRPO 训练数据、压缩 prompt/data pool 有参考价值。
+  \item \textbf{是否深读}：\textbf{B}。可先作为 synthetic data / dataset distillation 索引保留。
+\end{itemize}
+
+\subsubsection{Stream-R1: Reliability-Perplexity Aware Reward Distillation for Streaming Video Generation}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.03849}{2605.03849}；\href{https://arxiv.org/pdf/2605.03849}{PDF}\\
+\textbf{方向}：视频生成加速 · reward distillation · spatiotemporal credit assignment\\
+\textbf{一句话结论}：这篇把 reward model 从“最终打分器”变成 distillation loss 的双层权重生成器：决定哪些 rollout 更可靠、哪些空间/时间位置更值得优化。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：DMD 等 streaming video diffusion distillation 方法通常把每个 rollout、每个 frame、每个 pixel 当作等权监督，忽略监督质量和可改进位置的差异。
+  \item \textbf{方法抓手}：Stream-R1 提出 Inter-Reliability 和 Intra-Perplexity 两层重加权。前者用预训练视频 reward 分数对 rollout loss 做指数缩放，让可靠监督主导训练；后者反传同一个 reward model 得到 per-pixel gradient saliency，再分解为空间和时间权重，集中优化最可能提升质量的位置。
+  \item \textbf{主要结果}：论文声称在标准 streaming video generation benchmarks 上，同时提升视觉质量、运动质量和文本对齐，且不改架构、不增加推理成本。
+  \item \textbf{和我的主线关系}：强相关。它和 DenseGRPO / E-GRPO / Chunk-GRPO 的共同点是都反对 uniform credit；区别是这里不是 policy optimization，而是 distillation loss reweighting。你的“rollout 早停 / 熵或收益不增长就停”的 idea 可以借鉴它的 reliability 维度：低可靠或低增益 rollout 不必完整消耗训练预算。
+  \item \textbf{是否深读}：\textbf{A}。建议拆单篇，重点看 reward saliency 如何分解为 spatial/temporal weights，以及 adaptive balancing 怎么防止 reward 某一轴主导。
+\end{itemize}
+
+\subsubsection{Enhancing Visual Question Answering with Multimodal LLMs via Chain-of-Question Guided Retrieval-Augmented Generation}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.03790}{2605.03790}；\href{https://arxiv.org/pdf/2605.03790}{PDF}\\
+\textbf{方向}：VQA · MLLM · RAG · question decomposition\\
+\textbf{一句话结论}：这篇主要是把 CoT 和 visual question decomposition 结合起来，引导开放域 VQA 的检索过程。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：open-domain VQA 依赖外部知识，但直接 RAG 往往检索目标不清，MLLM 对复杂视觉问题的知识需求也没有被结构化表达。
+  \item \textbf{方法抓手}：提出 CoVQD，将 Chain-of-Thought reasoning 与 Visual Question Decomposition 结合；再构建 CoVQD-guided RAG，让 MLLM 先拆解问题、形成更明确的检索查询，再整合外部知识回答。
+  \item \textbf{主要结果}：在 E-VQA、InfoSeek、OKVQA 上验证有效性，主要提升复杂跨域 VQA 的泛化和可靠性。
+  \item \textbf{和我的主线关系}：和生成后训练关系弱，但和 VLM reasoning、检索增强、test-time decomposition 有一定连接。可作为“视觉问题分解引导检索”的素材。
+  \item \textbf{是否深读}：\textbf{C/B-}。除非近期要做 VQA/RAG，否则日报记录即可。
+\end{itemize}
+
+\subsubsection{AniMatrix: An Anime Video Generation Model that Thinks in Art, Not Physics}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.03652}{2605.03652}；\href{https://arxiv.org/pdf/2605.03652}{PDF}\\
+\textbf{方向}：动画视频生成 · domain-specific reward · preference optimization\\
+\textbf{一句话结论}：它把 anime 的目标从“物理真实”改写成“艺术正确”，并为此重建了条件系统、训练 curriculum 和偏好优化信号。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：通用视频生成模型内化的是物理真实先验，而 anime 里常见的 smear、impact frame、夸张形变、chibi shift 本身就是违背物理的艺术语言；物理先验过强会抹平风格或把艺术形变误判成失败。
+  \item \textbf{方法抓手}：AniMatrix 使用 Production Knowledge System 把 anime 拆成 Style、Motion、Camera、VFX 等生产变量；AniCaption 从像素中抽取这些 directorial directives；结构化 tag encoder 保留 field-value taxonomy，冻结 T5 处理自由文本；cross-attention 负责细粒度控制，AdaLN 负责全局风格约束；再用 style-motion-deformation curriculum 和 deformation-aware preference optimization 区分有意艺术形变与病态崩坏。
+  \item \textbf{主要结果}：专业动画师从五个 production dimensions 做 human evaluation，AniMatrix 在五项中四项排名第一，尤其 Prompt Understanding 和 Artistic Motion 提升明显；作者计划公开模型权重和推理代码。
+  \item \textbf{和我的主线关系}：强相关于“domain-specific reward / preference optimization”。它说明视频 reward 不应只用通用审美/物理一致性，还要能表达领域内部的正确性标准。
+  \item \textbf{是否深读}：\textbf{A/B+}。如果你的视频生成主线包含 style、motion、domain reward，建议深读；如果只聚焦 Flow-GRPO credit assignment，可先列为 B+。
+\end{itemize}
+
+\subsubsection{GRPO-TTA: Test-Time Visual Tuning for Vision-Language Models via GRPO-Driven Reinforcement Learning}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.03403}{2605.03403}；\href{https://arxiv.org/pdf/2605.03403}{PDF}\\
+\textbf{方向}：GRPO · test-time adaptation · VLM robustness\\
+\textbf{一句话结论}：这篇把 GRPO 搬到无标签 test-time adaptation，让模型在测试时基于候选类别组和奖励函数微调视觉编码器。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：VLM 在自然分布偏移下容易退化；传统 TTA 多依赖熵最小化或伪标签，可能在没有标签时被错误置信度带偏。
+  \item \textbf{方法抓手}：GRPO-TTA 从 CLIP similarity distribution 采样 top-K class candidates 构造 output groups，把 class-specific prompt prediction 改成 group-wise policy optimization；奖励包括 alignment rewards 和 dispersion rewards，从而在无标签条件下引导 visual encoder tuning。
+  \item \textbf{主要结果}：摘要称在多个 benchmark 上稳定超过已有 TTA 方法，在 natural distribution shifts 下增益更明显。
+  \item \textbf{和我的主线关系}：方法层面和 GRPO 强相关，但任务是 VLM TTA，不是 diffusion/flow generation。适合补到“GRPO 的视觉侧迁移应用”列表中，用于观察 group-relative objective 如何脱离传统 RLVR 场景。
+  \item \textbf{是否深读}：\textbf{B+}。建议至少快速看公式和 reward 设计；如果后面要总结 GRPO family，可以深读。
+\end{itemize}
+
+\subsubsection{Reasoning-Guided Grounding: Elevating Video Anomaly Detection through Multimodal Large Language Models}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.02912}{2605.02912}；\href{https://arxiv.org/pdf/2605.02912}{PDF}\\
+\textbf{方向}：视频异常检测 · MLLM grounding · reasoning supervision\\
+\textbf{一句话结论}：VANGUARD 把视频异常检测从二分类/异常分数推进到“分类 + 空间 grounding + reasoning explanation”的统一 MLLM 框架。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：传统 VAD 缺少可解释推理和异常对象定位；VLM 虽然有语义理解，但空间 grounding 容易产生 hallucinated 或几何错误的 box。
+  \item \textbf{方法抓手}：三阶段 curriculum：先冻结 backbone 做 classifier warmup，再用 LoRA 适配 spatial grounding，最后生成 chain-of-thought；稀疏标注通过 teacher-student annotation pipeline 扩展，Qwen3-VL-4B 生成 subclip reasoning trajectories，GroundingDINO 提供 bounding box supervision。
+  \item \textbf{主要结果}：在 UCF-Crime 上达到 94\% ROC-AUC 和 84\% F1，同时输出解释和异常对象定位；对 XD-Violence、ShanghaiTech 做 zero-shot transfer。
+  \item \textbf{和我的主线关系}：和生成后训练弱相关，但和 multimodal reasoning supervision、grounding、teacher-student 数据构造有关。可作为“视频理解/安全”方向素材。
+  \item \textbf{是否深读}：\textbf{C/B-}。暂不拆单篇。
+\end{itemize}
+
+\subsubsection{Ortho-Hydra: Orthogonalized Experts for DiT LoRA}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.03252}{2605.03252}；\href{https://arxiv.org/pdf/2605.03252}{PDF}\\
+\textbf{方向}：DiT LoRA · multi-style adaptation · expert specialization\\
+\textbf{一句话结论}：它关注多风格 DiT LoRA 的 cold-start router deadlock，用正交共享基和专家不相交输出子空间让 MoE-LoRA 从训练初期就获得非退化路由信号。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：单一 LoRA residual 难以表示多个艺术风格，容易 style bleed；HydraLoRA/MoE-LoRA 如果所有 expert 零初始化，router 接收相同梯度，会长期停留在 uniform prior，专家对称演化，实际退化成更贵的单 LoRA。
+  \item \textbf{方法抓手}：Ortho-Hydra 使用 OFT-style Cayley-orthogonal shared basis，并从预训练权重的 top-\((Er)\) left singular vectors 中切分 per-expert disjoint output subspaces；这样 step 0 起每个 expert 的 score 就非退化，router 能更早开始 specialization。
+  \item \textbf{主要结果}：论文重点报告 cold-start mechanism 和 routing dynamics；对比 zero-init shared-basis 和 Gaussian-jitter baseline，Ortho-Hydra 在前几百步开始 de-uniformising，而 baseline 前 1k steps 仍接近 uniform。
+  \item \textbf{和我的主线关系}：和 post-training 关系在 parameter-efficient adaptation / style specialization；不是 reward/RL 方向，但对多 style 图像/视频模型微调很有参考价值。
+  \item \textbf{是否深读}：\textbf{B}。如果近期要做 style LoRA 或 DiT adapter，可升级为 A。
+\end{itemize}
+
+\subsubsection{Text-Conditional JEPA for Learning Semantically Rich Visual Representations}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.03245}{2605.03245}；\href{https://arxiv.org/pdf/2605.03245}{PDF}\\
+\textbf{方向}：vision-language pretraining · JEPA · representation learning\\
+\textbf{一句话结论}：TC-JEPA 用 caption 条件化 masked feature prediction，试图把 JEPA 从纯视觉自监督推进到更语义化的视觉-语言预训练。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：I-JEPA 做 masked feature prediction 时，遮挡位置存在天然视觉不确定性，单靠图像上下文预测容易学不到足够语义化的表示。
+  \item \textbf{方法抓手}：TC-JEPA 用 image captions 降低预测不确定性，通过 fine-grained text conditioner 对输入文本 token 做 sparse cross-attention，调制被预测 patch features，使预测目标成为 text-conditioned semantic features。
+  \item \textbf{主要结果}：摘要称 downstream performance 和训练稳定性提升，扩展性较好；在若干需要细粒度视觉理解与推理的任务上优于 contrastive methods。
+  \item \textbf{和我的主线关系}：和生成后训练不直接相关，但和世界模型/JEPA/predictive representation 有概念连接，尤其可与 PV-VAE 的 predictive latent 思路并列。
+  \item \textbf{是否深读}：\textbf{B}。适合作为 representation learning 索引。
+\end{itemize}
+
+\subsubsection{Video Generation with Predictive Latents}
+
+\textbf{链接}：\href{https://arxiv.org/abs/2605.02134}{2605.02134}；\href{https://arxiv.org/pdf/2605.02134}{PDF}\\
+\textbf{方向}：视频 VAE · predictive world modeling · latent diffusability\\
+\textbf{一句话结论}：PV-VAE 的关键观点是：好的 video latent 不只是能重建，更要能预测未来，这样才更适合后续 diffusion/video generation。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{核心问题}：现有 video VAE reconstruction 指标变好，不一定让下游 latent diffusion 更好；latent 的 diffusability 和 temporal dynamics 表征才是视频生成质量的关键。
+  \item \textbf{方法抓手}：随机丢弃未来帧，只编码部分过去观测；decoder 同时重建观测帧并预测未来帧，把 predictive learning 和 reconstruction 合成一个 predictive reconstruction objective。
+  \item \textbf{主要结果}：在 UCF101 上相比 Wan2.2 VAE 收敛快 52\%，FVD 改善 34.42；在 UCF101、RealEstate10K、Kinetics-400 等设置下分析 reconstruction、generation 和 video understanding 的收益。
+  \item \textbf{和我的主线关系}：适合放到视频生成基础表示/世界模型主线。它和 post-training 的联系在于：如果 latent 本身更具 temporal predictability，后续 reward alignment 或 Flow-GRPO 的学习信号可能更稳定。
+  \item \textbf{是否深读}：\textbf{A/B+}。如果近期关心视频生成底座和 latent 设计，建议深读。
+\end{itemize}
+
+\subsection{按方向归类}
+
+\subsubsection{后训练 / RL / Alignment}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Stream-R1}：reward-guided distillation，不是 GRPO，但非常贴近 credit assignment / selective optimization。
+  \item \textbf{GRPO-TTA}：GRPO 在 VLM test-time adaptation 中的迁移应用，重点看 group construction 和 reward 设计。
+  \item \textbf{AniMatrix}：deformation-aware preference optimization，说明 domain-specific reward 对视频生成很重要。
+\end{itemize}
+
+\subsubsection{视频生成、视频编辑与视频理解}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Stream-R1}：streaming video diffusion distillation 的 reward reweighting。
+  \item \textbf{AniMatrix}：anime video generation，强调艺术正确性而非物理正确性。
+  \item \textbf{Video Generation with Predictive Latents}：PV-VAE，让 video latent 具备未来预测能力。
+  \item \textbf{VANGUARD}：视频异常检测，分类、grounding、reasoning 三合一。
+\end{itemize}
+
+\subsubsection{图像生成编辑与统一理解生成}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{UniReasoner}：LLM 生成 visual draft 并自评，再作为 diffusion corrective guidance。
+  \item \textbf{DMGD}：train-free diffusion dataset distillation，用 semantic matching 和 distribution matching 引导合成数据。
+  \item \textbf{Ortho-Hydra}：DiT LoRA 多风格专家正交化，减少 style bleed 和 router deadlock。
+\end{itemize}
+
+\subsubsection{世界模型、3D 与空间智能}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Video Generation with Predictive Latents}：最接近 predictive world modeling，用未来预测目标塑造 latent。
+  \item \textbf{TC-JEPA}：用文本条件化 JEPA feature prediction，和 predictive representation learning 相关。
+\end{itemize}
+
+\subsubsection{具身智能、VLA 与机器人后训练}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 今日用户给的 10 篇里没有直接 VLA/robotics 后训练论文。
+\end{itemize}
+
+\subsubsection{Style / Voice / Identity / Design Workflow}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{AniMatrix}：艺术风格和生产知识系统最相关。
+  \item \textbf{Ortho-Hydra}：多风格 DiT LoRA，和 style specialization 相关。
+\end{itemize}
+
+\subsection{值得深读}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{优先级 A}：UniReasoner、Stream-R1。
+  \item \textbf{优先级 A-/B+}：AniMatrix、Video Generation with Predictive Latents、GRPO-TTA。
+  \item \textbf{优先级 B}：DMGD、Ortho-Hydra、TC-JEPA。
+  \item \textbf{优先级 C/B-}：CgRAG、VANGUARD。
+  \item \textbf{适合拆单篇笔记}：Stream-R1（reward distillation 与 selective credit）、UniReasoner（LLM reasoner for generation）、GRPO-TTA（GRPO 视觉侧迁移）、AniMatrix（domain-specific reward/preference optimization）、PV-VAE（predictive video latent）。
+\end{itemize}
+
+\subsection{暂时略过}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{CgRAG}：偏 VQA/RAG，除非近期做视觉问答或检索增强，否则暂不深读。
+  \item \textbf{VANGUARD}：偏视频异常检测和安全理解，和生成后训练主线距离较远。
+  \item \textbf{DMGD}：方法有用，但更偏 dataset distillation；可以等需要 synthetic data / data pruning 时再深读。
+\end{itemize}
+
+\subsection{后续动作}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 优先把 \textbf{Stream-R1} 拆成单篇深读，重点比较它和 DenseGRPO、E-GRPO、Chunk-GRPO 的共同点：都在寻找非均匀 credit / 非均匀优化预算。
+  \item 把 \textbf{UniReasoner} 放入统一理解与生成专题，和 BAGEL、Janus、BLIP3-o、Tuna-2 对比：它更像“LLM verifier/reasoner 驱动 diffusion”，不是单纯统一 tokenizer/backbone。
+  \item 把 \textbf{GRPO-TTA} 收进 GRPO family 索引，后续看它的 group construction 是否能迁移到图像/视频生成的 test-time optimization。
+  \item 若继续扩展视频方向，把 \textbf{AniMatrix} 和 \textbf{PV-VAE} 分别放进 domain-specific video reward 与 predictive video latent 两条支线。
+\end{itemize}
+
+\subsection{资料来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{UniReasoner}：\href{https://arxiv.org/abs/2605.04040}{arXiv abs}；\href{https://arxiv.org/pdf/2605.04040}{PDF}。
+  \item \textbf{DMGD}：\href{https://arxiv.org/abs/2605.03877}{arXiv abs}；\href{https://arxiv.org/pdf/2605.03877}{PDF}。
+  \item \textbf{Stream-R1}：\href{https://arxiv.org/abs/2605.03849}{arXiv abs}；\href{https://arxiv.org/pdf/2605.03849}{PDF}。
+  \item \textbf{CgRAG}：\href{https://arxiv.org/abs/2605.03790}{arXiv abs}；\href{https://arxiv.org/pdf/2605.03790}{PDF}。
+  \item \textbf{AniMatrix}：\href{https://arxiv.org/abs/2605.03652}{arXiv abs}；\href{https://arxiv.org/pdf/2605.03652}{PDF}。
+  \item \textbf{GRPO-TTA}：\href{https://arxiv.org/abs/2605.03403}{arXiv abs}；\href{https://arxiv.org/pdf/2605.03403}{PDF}。
+  \item \textbf{VANGUARD}：\href{https://arxiv.org/abs/2605.02912}{arXiv abs}；\href{https://arxiv.org/pdf/2605.02912}{PDF}。
+  \item \textbf{Ortho-Hydra}：\href{https://arxiv.org/abs/2605.03252}{arXiv abs}；\href{https://arxiv.org/pdf/2605.03252}{PDF}。
+  \item \textbf{TC-JEPA}：\href{https://arxiv.org/abs/2605.03245}{arXiv abs}；\href{https://arxiv.org/pdf/2605.03245}{PDF}。
+  \item \textbf{PV-VAE}：\href{https://arxiv.org/abs/2605.02134}{arXiv abs}；\href{https://arxiv.org/pdf/2605.02134}{PDF}。
+  \item \textbf{日报入口}：\href{https://huggingface.co/papers}{Hugging Face Daily Papers}；\href{https://arxiv.org/list/cs.CV/new}{arXiv cs.CV new submissions}；\href{https://arxiv.org/list/cs.LG/new}{arXiv cs.LG new submissions}；\href{https://arxiv.org/list/cs.AI/new}{arXiv cs.AI new submissions}。
+\end{itemize}

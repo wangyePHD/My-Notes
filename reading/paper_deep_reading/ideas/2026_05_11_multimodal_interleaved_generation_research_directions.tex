@@ -1,0 +1,441 @@
+\subsection*{Idea 调研：多模态交织生成的下一步科研走向}
+\phantomsection
+\addcontentsline{toc}{subsection}{Idea 调研：多模态交织生成的下一步科研走向}
+
+\begin{conceptbox}
+\textbf{调研日期：} 2026-05-11。\\
+\textbf{核心结论：} 多模态交织生成已经不再是“有没有模型能生成图文混排”的早期问题，而是进入了 \key{benchmark + 强 baseline + 后训练} 阶段。下一步不建议做泛泛的 ``GRPO for interleaved generation'' 或再造一个普通图文交织数据集。更有论文空间的切口是：\key{长序列状态一致性}、\key{过程级奖励与失败归因}、\key{检索/工具接入的 grounded interleaved generation}、\key{理解-生成能力闭环}，以及 \key{长上下文记忆与成本控制}。\\
+\textbf{最推荐方向：} 面向教育教程、视觉故事、科学解释等长序列场景，做 \key{state-aware interleaved post-training with process-level feedback}：显式维护角色、风格、叙事、知识和约束状态，并把 reward 从最终成品分数推进到跨步状态变化和错误归因。
+\end{conceptbox}
+
+\subsubsection*{1. Idea 重写}
+
+\textbf{用户原始 idea：}
+
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+调研多模态多交织生成领域下一步的科研走向。
+\end{lstlisting}
+
+\textbf{更准确的问题定义：}
+
+在统一多模态模型已经能够生成图文交织序列之后，下一步真正值得研究的问题不是“让模型输出更多图片和文字”，而是：
+
+\begin{quote}
+如何让模型在长序列、多轮、多对象、多知识约束下，持续决定“何时说、何时画、画什么、引用什么、如何校验”，并保持跨步骤状态一致、事实正确和可控？
+\end{quote}
+
+\textbf{可能的核心变量：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{Cross-step state consistency}：角色、身份、风格、场景、叙事、知识状态是否跨页保持。
+  \item \key{Process-level reward attribution}：最终失败能否归因到哪一步、哪张图、哪段文本、哪次工具调用。
+  \item \key{Modality action policy}：模型是否知道什么时候应该生成文本、图片、检索结果、编辑图像或调用外部工具。
+  \item \key{Grounding and verification}：生成内容是否能被检索、规则、代码执行、知识库或人工偏好校验。
+  \item \key{Long-context memory efficiency}：长交织历史不应全部粗暴塞回上下文，而需要可控的状态摘要和可选择记忆。
+\end{itemize}
+
+\subsubsection*{2. 趋势判断}
+
+\textbf{方向是否重要：} 重要，而且是长期方向。多模态模型正在从“理解图片 + 生成单张图”走向 \key{统一理解、规划、工具调用和多步内容生成}。Interleaved generation 是这个趋势的自然中间形态：它比单图生成更接近真实内容生产，比纯 VLM 问答更接近可交互系统。
+
+\textbf{为什么现在重要：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{任务已经被定义。} \href{https://arxiv.org/abs/2310.07749}{OpenLEAF} 把 open-domain interleaved image-text generation 形式化，并提供了 pipeline 和评测协议。
+  \item \textbf{数据与评测开始成熟。} \href{https://arxiv.org/abs/2406.10462}{CoMM}、\href{https://arxiv.org/abs/2406.14643}{InterleavedBench}、\href{https://arxiv.org/abs/2411.18499}{OpenING}、\href{https://arxiv.org/abs/2410.10139}{MMIE}、\href{https://arxiv.org/abs/2411.17188}{ISG}、\href{https://arxiv.org/abs/2506.09427}{InterSyn} 等工作已经覆盖数据、benchmark、judge 和细粒度一致性评估。
+  \item \textbf{模型 baseline 已经变强。} \href{https://arxiv.org/abs/2401.10208}{MM-Interleaved}、\href{https://arxiv.org/abs/2505.09568}{BLIP3-o}、\href{https://arxiv.org/abs/2505.14683}{BAGEL}、\href{https://arxiv.org/abs/2602.00508}{DuoGen} 等工作说明 interleaved output 已经不再只是 pipeline demo。
+  \item \textbf{后训练 baseline 已经出现。} \href{https://arxiv.org/abs/2603.09538}{Multimodal Interleaved Generation via GRPO} 直接把 GRPO 用到多模态交织生成上，意味着通用后训练已经不能作为主创新。
+  \item \textbf{产业需求真实。} 教育教程、儿童绘本、漫画/故事板、产品设计说明、科研可视化、数据报告、网页/文档生成，都天然需要图文交织、跨页一致和可验证事实。
+\end{itemize}
+
+\textbf{长期价值：} 如果这个方向被解决，它不是单个 benchmark 的提升，而会支撑下一代内容 agent：模型可以把复杂目标拆成章节、步骤、图像、表格、引用和交互组件，并持续检查每一步是否偏离目标。
+
+\subsubsection*{3. 本质判断}
+
+\begin{summarybox}
+\textbf{表面问题：} 提升多模态图文交织生成质量。\\
+\textbf{本质问题：} 长序列多模态内容生成中，模型需要维护一个跨模态、跨步骤、可验证的隐式状态，但现有训练和评测大多只看局部图文对齐或最终整体偏好。\\
+\textbf{关键瓶颈：} state tracking、process reward、failure attribution、grounded verification 和 memory compression。\\
+\textbf{一句话：} 下一步的核心不是“生成得更花”，而是“在长内容生产过程中不丢状态、不编事实、知道何时用什么模态，并能解释哪里错了”。
+\end{summarybox}
+
+\subsubsection*{4. 供需判断}
+
+\textbf{需求：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 内容生产需要长序列：教程、漫画、故事板、报告、设计稿都不是单张图。
+  \item 用户要求一致性：同一角色不能每页换脸，同一知识解释不能前后矛盾，同一风格不能中途漂移。
+  \item 工业系统需要可控性：生成系统不能只依赖“看起来不错”，还要能校验事实、版权、来源和安全。
+\end{itemize}
+
+\textbf{现有供给：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 已有任务定义、数据和 benchmark；
+  \item 已有统一模型和 pipeline baseline；
+  \item 已有 VLM judge、scene-graph judge、GRPO 后训练方法；
+  \item 已有工具/RAG 方向探索，例如 \href{https://arxiv.org/abs/2512.05119}{RAG-IGBench} 和 \href{https://arxiv.org/abs/2509.13642}{LLM-I}。
+\end{itemize}
+
+\textbf{供给不足：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item benchmark 多数仍偏静态成品评分，难以判断第几步开始状态漂移；
+  \item reward 多数是 final-only 或粗粒度多指标加权，难以做过程归因；
+  \item 模型可以生成交织格式，但不一定有稳定的跨步记忆和可检查状态；
+  \item 工具调用和生成模型还没有统一成可训练的 modality action policy；
+  \item 现有开放模型在长序列、多图、多知识约束下仍容易出现身份漂移、局部事实错误和上下文遗忘。
+\end{itemize}
+
+\subsubsection*{5. 领域时间线}
+
+{\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{longtable}{p{0.08\linewidth} p{0.20\linewidth} p{0.16\linewidth} p{0.31\linewidth} p{0.16\linewidth}}
+\toprule
+\textbf{时间} & \textbf{工作} & \textbf{阶段} & \textbf{主要贡献} & \textbf{对当前 idea 的影响} \\
+\midrule
+2023 &
+\href{https://arxiv.org/abs/2310.07749}{OpenLEAF} &
+Task / pipeline &
+定义 open-domain interleaved image-text generation，提出基于 LLM 的规划、检索和生成 pipeline，并构造自动评测协议。 &
+说明任务已经被提出，不能再把“图文交织生成”本身当新任务。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2401.10208}{MM-Interleaved} &
+Baseline model &
+提出端到端多模态交织模型，在同一框架内做理解和图文交织生成。 &
+端到端模型路线已经存在，后续应关注长序列能力和细粒度失败模式。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2406.10462}{CoMM} &
+Dataset / benchmark &
+构造 coherent interleaved image-text 数据，并提出图文交织理解与生成的评测设置。 &
+数据层已有供给；单纯扩数据需要非常清楚的新场景或新监督。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2406.14643}{InterleavedBench} &
+Benchmark &
+从 instruction following、coherence、quality、contextual relevance 等维度评估交织生成。 &
+通用质量评测已出现，下一步应补过程级、状态级评测。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2411.18499}{OpenING} &
+Benchmark / judge &
+构建开放域原生交织生成 benchmark，覆盖多任务、多类别，并提出 IntJudge。 &
+说明 judge 已是 baseline 条件；新工作需要超越普通 VLM-as-judge。 \\
+\midrule
+2024 &
+\href{https://arxiv.org/abs/2410.10139}{MMIE} &
+Knowledge-intensive benchmark &
+强调知识密集型多模态交织生成，关注图文质量、事实性和多样性。 &
+把研究空间推向 factuality 和 grounded generation。 \\
+\midrule
+2024--2025 &
+\href{https://arxiv.org/abs/2411.17188}{ISG} &
+Fine-grained evaluation &
+用 interleaved scene graph 做多粒度评估，解决传统指标难以解释语义错误的问题。 &
+支持把 scene graph / state graph 作为过程奖励和错误归因工具。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2505.09568}{BLIP3-o} &
+Unified model &
+开放 unified multimodal model，结合 autoregressive modeling 和 diffusion generation。 &
+统一理解/生成模型正在成为基础设施，研究重心应转向训练信号和任务设计。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2505.14683}{BAGEL} &
+Foundation model &
+提出开放的 unified multimodal foundation model，使用大规模 interleaved text、image、video、web 数据。 &
+强 base model 出现后，泛泛微调的空间收窄，二阶问题更重要。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2506.09427}{InterSyn} &
+Dataset / judge &
+构造大规模 tightly interleaved instruction 数据，并提出 SynJudge 做文本、图像质量和图文协同评估。 &
+说明高质量数据和专用 judge 已进入 baseline，单纯扩数据不够。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2512.05119}{RAG-IGBench} &
+Grounded benchmark &
+评估 retrieval-augmented interleaved generation，关注外部知识和图文内容组织。 &
+提示下一步不只是生成，还要把检索、证据和生成绑定起来。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2509.13642}{LLM-I} &
+Tool-use / RL &
+把 interleaved multimodal creation 建模为多工具使用问题，并指出单工具一次性调用的限制。 &
+提示未来系统需要 modality/tool action policy，而不是固定 pipeline。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2510.10969}{IUT-Plug} &
+State / memory &
+提出 interleaved generative multimodal LLMs 的 plug-and-play 改进，强调上下文漂移和结构化 memory。 &
+直接指向长序列 state tracking，是下一层问题的重要证据。 \\
+\midrule
+2025 &
+\href{https://arxiv.org/abs/2512.18254}{Loom} &
+Long-horizon generation &
+面向 interleaved text-image generation 的扩散 Transformer，显式关注 planning、prior-frame conditioning 和视觉上下文。 &
+说明长序列和跨图一致性正在成为模型结构层面的竞争点。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2602.00508}{DuoGen} &
+General-purpose model &
+提出面向通用 interleaved text-image generation 的数据、解耦架构和 benchmark。 &
+通用 interleaved generation baseline 进一步增强，泛泛做模型会更难区分贡献。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2603.09538}{Multimodal Interleaved Generation via GRPO} &
+Post-training baseline &
+把 GRPO 用于多模态交织生成，结合最终奖励与过程奖励，提升格式、图文质量和一致性。 &
+通用后训练已被覆盖；新方向必须更细粒度，例如 state-aware reward 或 failure-aware attribution。 \\
+\midrule
+2026 &
+\href{https://arxiv.org/abs/2603.23500}{UniGRPO} &
+Unified RL baseline &
+把文本推理 token 和 flow matching 图像生成统一到一个 GRPO 框架中。 &
+说明跨模态轨迹级 RL 正在成熟，但完整多轮交织状态优化仍有空间。 \\
+\bottomrule
+\end{longtable}
+}
+
+\subsubsection*{6. Baseline 判断}
+
+\textbf{当前社区 baseline：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Pipeline baseline：} LLM 规划 + 图像检索/生成 + VLM judge，例如 OpenLEAF 路线。
+  \item \textbf{End-to-end baseline：} MM-Interleaved、BLIP3-o、BAGEL、DuoGen 这类统一或半统一模型。
+  \item \textbf{Benchmark baseline：} OpenING、InterleavedBench、MMIE、ISG、RAG-IGBench。
+  \item \textbf{Post-training baseline：} interleaved generation via GRPO、UniGRPO 类跨模态轨迹优化。
+\end{itemize}
+
+\textbf{是否已有后训练工作：} 已有。尤其是 \href{https://arxiv.org/abs/2603.09538}{Multimodal Interleaved Generation via GRPO} 已经覆盖“用 GRPO 提升通用交织生成”这个一阶问题。因此不能再把通用 GRPO 作为主创新。
+
+\textbf{是否已有强 benchmark：} 已有通用 benchmark，但 \key{长序列状态一致性、过程级失败定位、检索证据绑定、工具调用策略} 仍没有被充分标准化。
+
+\textbf{该 idea 是否已经被覆盖：} 大方向已被覆盖，但下一层没有完全覆盖。可以做，但必须收敛到二阶问题。
+
+\begin{warnbox}
+\textbf{不建议直接做：} “收集一些图文交织数据 + 用 VLM judge 打分 + 跑 GRPO”。这条路线已经太接近现有 baseline，除非数据、reward、任务或理论假设有明显新意。
+\end{warnbox}
+
+\subsubsection*{7. 未解决问题}
+
+\textbf{问题 1：长序列状态一致性没有被显式建模。}
+
+现有模型能生成多页内容，但角色身份、服装、风格、空间关系、叙事进展和知识约束往往依赖隐式上下文。长到十几页后，错误不一定表现为单张图质量差，而是“第 7 页的人物和第 2 页不是同一个人”“图里步骤和文字步骤错位”“之前说过的定义被后面图像推翻”。
+
+\textbf{问题 2：reward 仍然缺少过程归因。}
+
+即使有 process reward，很多做法仍是把局部图文质量、格式、最终偏好简单加权。真正需要的是：如果最终序列失败，系统能判断是角色状态丢了、知识状态错了、图像工具没听懂，还是文本规划先错了。
+
+\textbf{问题 3：检索、工具调用和生成没有统一成可学习策略。}
+
+现实系统里，模型不应该总是从零生成图片。它有时应该检索真实图，有时应该画示意图，有时应该编辑上一张图，有时应该调用代码画图表，有时应该只写文字。当前很多系统仍是固定 pipeline，缺少可训练、可评估的 modality/tool action policy。
+
+\textbf{问题 4：理解与生成仍可能割裂。}
+
+统一模型不等于理解能力会自动提升生成能力。模型可能能回答图像问题，也能生成图像，但不能把“刚理解到的细粒度事实”稳定转移到后续生成中。这个 gap 已经被 \href{https://arxiv.org/abs/2511.20561}{UniSandbox} 和 \href{https://arxiv.org/abs/2602.02140}{GapEval} 这类理解-生成差距评测进一步凸显。
+
+\textbf{问题 5：长上下文成本和记忆选择没有解决。}
+
+交织序列越长，直接把所有文本、图像 tokens、历史草图都塞给模型越不可扩展。需要研究哪些历史状态必须保留，哪些可压缩成结构化 memory，哪些应该通过检索取回。
+
+\subsubsection*{8. 候选研究切口}
+
+\paragraph{切口 A：State-aware interleaved post-training}
+
+\textbf{核心假设：} 当前交织生成的主要失败不是单图质量不足，而是跨步状态维护不足。如果在后训练中显式优化角色、风格、叙事、知识和约束状态，长序列交织生成会显著更稳定。
+
+\textbf{方法思路：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把每一步内容解析成结构化状态：
+\[
+S_t = \{\text{entities}, \text{attributes}, \text{style}, \text{scene}, \text{narrative}, \text{knowledge}, \text{constraints}\}.
+\]
+  \item 用 VLM、scene graph parser、OCR、captioner 和 LLM verifier 共同抽取 \(S_t\)，并和目标状态 \(\hat{S}_t\) 比较。
+  \item 构造过程奖励：
+\[
+r_t = r_\text{local-align} + r_\text{state-consistency} + r_\text{knowledge-faithfulness} + r_\text{format}.
+\]
+  \item 用 GRPO / DPO / rejection sampling 做 post-training，但核心创新不是优化算法，而是 \key{state-aware reward + failure attribution}。
+\end{itemize}
+
+\textbf{与已有工作的区别：} 通用 GRPO 主要证明“交织生成可以被 RL 后训练提升”。这个切口要证明“真正限制长序列交织生成的是状态变量，而不是总体美观分数或单步图文对齐”。
+
+\textbf{实验设计：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 任务：视觉故事、教育教程、科学解释、漫画分镜；
+  \item baseline：SFT、final-only reward GRPO、普通 VLM judge GRPO、现有 interleaved GRPO；
+  \item 评测：OpenING / InterleavedBench / ISG + 自建 long-state split；
+  \item 消融：去掉 entity state、style state、knowledge state、process reward、failure-aware negatives；
+  \item 关键证明：随着序列长度增加，state-aware 方法的退化斜率更小。
+\end{itemize}
+
+\textbf{风险：} reward extraction 本身可能不可靠；state schema 过细会导致数据标注和评估成本高；VLM judge 可能偏好表面描述。缓解方式是用 human calibration、scene graph 交叉验证、OCR/规则检查和人工错误分类做校准。
+
+\paragraph{切口 B：Retrieval- and tool-grounded interleaved generation}
+
+\textbf{核心假设：} 真实交织生成不是纯生成问题，而是“生成、检索、编辑、画图、引用、校验”的混合决策问题。如果把这些动作统一建模成 modality/tool action policy，模型会在事实性、可控性和成本上优于固定 pipeline。
+
+\textbf{方法思路：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 定义动作空间：write text、generate image、retrieve image、edit previous image、draw chart、cite source、verify state。
+  \item 设计有可执行反馈的任务：科普说明、产品说明、医学/法律低风险说明、数据报告、网页生成。
+  \item 奖励来自证据覆盖率、引用正确性、图文对应、工具选择成本和最终用户偏好。
+  \item 用 offline data warmup + online GRPO / bandit optimization 学习工具选择策略。
+\end{itemize}
+
+\textbf{与已有工作的区别：} RAG-IGBench 强调检索增强评估，LLM-I 强调多工具创作能力；这个切口更进一步，把“何时检索、何时生成、何时编辑、何时验证”做成可训练策略，并把工具动作纳入交织序列的状态转移。
+
+\textbf{实验设计：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 对比固定 pipeline、always-generate、always-retrieve、tool-policy RL；
+  \item 评估 factuality、source grounding、image relevance、tool cost、用户偏好；
+  \item 做反事实测试：把可检索事实换成不可检索事实，看模型是否避免编造。
+\end{itemize}
+
+\textbf{风险：} 工具系统工程量大，训练成本高，reward 易被“引用很多但无用”欺骗。应先做小动作空间和高可验证任务，例如“带引用的图文教程生成”。
+
+\paragraph{切口 C：Understanding-to-generation consistency}
+
+\textbf{核心假设：} 统一模型的关键短板不是单独理解或单独生成，而是把理解阶段得到的细粒度信息稳定迁移到后续生成。显式训练“理解 \(\rightarrow\) 规划 \(\rightarrow\) 生成 \(\rightarrow\) 反向验证”的闭环，可以提升知识密集型交织生成。
+
+\textbf{方法思路：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 构造 paired task：先给模型图像/文档/网页，让它抽取事实和结构；再要求生成图文交织解释或改写。
+  \item 生成后再问模型或 verifier：新序列是否保留了原输入中的实体、关系、数值和约束。
+  \item 训练时加入 consistency loss 或 preference data：偏好“能被原始证据支持”的生成。
+\end{itemize}
+
+\textbf{与已有工作的区别：} 很多统一模型论文证明理解和生成都能做，但较少系统评估理解信息是否真的进入后续生成。这个切口把 gap 变成可测 benchmark 和训练目标。
+
+\textbf{实验设计：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 数据：论文图表解释、教材例题、网页信息转教程、产品手册转可视化说明；
+  \item 指标：entity preservation、relation preservation、numeric faithfulness、visual grounding；
+  \item baseline：只看 prompt 的生成、先摘要再生成、RAG 生成、state-aware 生成。
+\end{itemize}
+
+\textbf{风险：} 如果数据太像信息抽取，可能退化成普通 RAG；必须保留多模态生成难点，例如需要生成新示意图、步骤图或对比图。
+
+\paragraph{切口 D：Long-horizon memory and efficient context for interleaved generation}
+
+\textbf{核心假设：} 长交织生成失败的一部分来自上下文组织，而不是模型能力本身。显式的状态 memory、历史图像选择和上下文压缩可以在不增加太多 token 的情况下提升长序列一致性。
+
+\textbf{方法思路：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 把历史分成三类：必须逐字保留的 user constraints、可结构化压缩的 state、可按需检索的 past frames。
+  \item 学习一个 memory selector：决定当前步骤需要哪些历史图像、哪些实体状态、哪些风格 token。
+  \item 训练时加入 history dropout 和 state corruption，让模型学会从结构化 memory 恢复一致性。
+\end{itemize}
+
+\textbf{与已有工作的区别：} Loom、IUT-Plug 已经看到 long-horizon 和 memory 问题；这个切口可以把 memory selection 和 state-aware reward 结合，形成可验证的长序列机制。
+
+\textbf{实验设计：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 固定模型，只改上下文策略：full history、recent-only、summary memory、learned state memory；
+  \item 测试 4、8、16、32 步生成的身份、风格、知识一致性退化曲线；
+  \item 统计 token cost、latency 和一致性收益。
+\end{itemize}
+
+\textbf{风险：} 容易被认为是工程优化。需要把贡献压到一个清楚问题：长交织生成中哪些状态值得保留，如何证明 memory policy 影响最终一致性。
+
+\subsubsection*{9. 推荐方向}
+
+\textbf{最推荐切口：} \key{State-aware interleaved post-training with process-level feedback}。
+
+\textbf{推荐理由：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它直接避开通用 GRPO 撞车点，把问题推进到二阶核心变量：状态一致性。
+  \item 它和你已有的后训练、GRPO、视觉生成 reward、credit assignment 笔记主线高度一致。
+  \item 它可以从 evaluation-first 开始，不需要一开始就训练超大模型。
+  \item 它容易形成论文故事：现有方法提升总体交织质量，但没有解决长序列 state consistency；我们提出 state-aware reward 和 process attribution。
+\end{itemize}
+
+\textbf{建议组合：} A + D 是最自然组合：先定义状态一致性评测，再用结构化 memory 和 process reward 做 post-training。A + B 也有潜力，但工程复杂度更高，适合作为第二阶段。
+
+\textbf{不推荐方向：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 不推荐只做 generic interleaved SFT 数据；
+  \item 不推荐只把现有 VLM judge 换一个 prompt；
+  \item 不推荐只做 final reward GRPO；
+  \item 不推荐只宣称“面向教育/故事/漫画”而没有抽象出通用状态变量。
+\end{itemize}
+
+\textbf{下一步最小闭环：}
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item 选一个长序列场景：教育教程或视觉故事，长度控制在 6--12 步；
+  \item 定义 state schema：entities、style、scene、knowledge、narrative progress；
+  \item 构造 200--500 条评测样本，先做错误分类和 human calibration；
+  \item 用现有模型或 pipeline 生成 candidates，验证 final-only judge 是否漏掉 state drift；
+  \item 做一个 reward probe：state-aware reward 是否比普通 VLM score 更能预测人类对长序列一致性的偏好；
+  \item 再决定是否进入 LoRA / GRPO 后训练。
+\end{enumerate}
+
+\subsubsection*{10. 打分表}
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth} p{0.50\linewidth} c}
+\toprule
+\textbf{维度} & \textbf{判断} & \textbf{分数} \\
+\midrule
+趋势重要性 & 长内容 agent、统一理解生成、工具化创作都需要它。 & 5 \\
+本质程度 & state consistency 和 process attribution 抓住了长交织生成核心瓶颈。 & 5 \\
+供需缺口 & 通用供给多，但状态级/过程级供给不足。 & 4 \\
+新颖性 & 泛泛方向不新，state-aware 后训练有清晰差异。 & 4 \\
+可验证性 & 可用 long-state split、人评、scene graph、ablation 验证。 & 4 \\
+可行性 & evaluation-first 可行；大规模 RL 成本较高。 & 3 \\
+论文故事 & 能讲成“已有方法解决格式和局部对齐，但长序列状态仍失败”。 & 5 \\
+风险可控性 & reward 可靠性是主要风险，但可通过校准缓解。 & 3 \\
+个人壁垒 & 与后训练、视觉 reward、credit assignment 积累匹配。 & 5 \\
+\midrule
+\textbf{总分} & \textbf{建议重点推进，但先做评测和 reward probe。} & \textbf{38/45} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{11. 一句话论文故事}
+
+\begin{quote}
+Existing multimodal interleaved generation methods improve general format, local image-text alignment, and overall preference scores, but still struggle to maintain long-range entity, style, narrative, and knowledge states. We propose state-aware interleaved post-training with process-level feedback and failure attribution, improving long-form educational and storytelling generation under explicit state consistency evaluation.
+\end{quote}
+
+\subsubsection*{12. 调研来源索引}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item OpenLEAF：\href{https://arxiv.org/abs/2310.07749}{https://arxiv.org/abs/2310.07749}
+  \item MM-Interleaved：\href{https://arxiv.org/abs/2401.10208}{https://arxiv.org/abs/2401.10208}
+  \item CoMM：\href{https://arxiv.org/abs/2406.10462}{https://arxiv.org/abs/2406.10462}
+  \item InterleavedBench：\href{https://arxiv.org/abs/2406.14643}{https://arxiv.org/abs/2406.14643}
+  \item OpenING：\href{https://arxiv.org/abs/2411.18499}{https://arxiv.org/abs/2411.18499}
+  \item MMIE：\href{https://arxiv.org/abs/2410.10139}{https://arxiv.org/abs/2410.10139}
+  \item ISG：\href{https://arxiv.org/abs/2411.17188}{https://arxiv.org/abs/2411.17188}
+  \item BLIP3-o：\href{https://arxiv.org/abs/2505.09568}{https://arxiv.org/abs/2505.09568}
+  \item BAGEL：\href{https://arxiv.org/abs/2505.14683}{https://arxiv.org/abs/2505.14683}
+  \item InterSyn：\href{https://arxiv.org/abs/2506.09427}{https://arxiv.org/abs/2506.09427}
+  \item RAG-IGBench：\href{https://arxiv.org/abs/2512.05119}{https://arxiv.org/abs/2512.05119}
+  \item LLM-I：\href{https://arxiv.org/abs/2509.13642}{https://arxiv.org/abs/2509.13642}
+  \item IUT-Plug：\href{https://arxiv.org/abs/2510.10969}{https://arxiv.org/abs/2510.10969}
+  \item Loom：\href{https://arxiv.org/abs/2512.18254}{https://arxiv.org/abs/2512.18254}
+  \item DuoGen：\href{https://arxiv.org/abs/2602.00508}{https://arxiv.org/abs/2602.00508}
+  \item Multimodal Interleaved Generation via GRPO：\href{https://arxiv.org/abs/2603.09538}{https://arxiv.org/abs/2603.09538}
+  \item UniGRPO：\href{https://arxiv.org/abs/2603.23500}{https://arxiv.org/abs/2603.23500}
+  \item UniSandbox：\href{https://arxiv.org/abs/2511.20561}{https://arxiv.org/abs/2511.20561}
+  \item GapEval：\href{https://arxiv.org/abs/2602.02140}{https://arxiv.org/abs/2602.02140}
+\end{itemize}

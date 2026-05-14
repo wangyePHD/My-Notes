@@ -1,0 +1,437 @@
+% ============================================================
+% Paper deep reading: MaskFocus
+% Source: https://arxiv.org/abs/2512.18766
+% ============================================================
+
+\section{论文精读：MaskFocus}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2512.18766}{MaskFocus: Focusing Policy Optimization on Critical Steps for Masked Image Generation}\\
+\textbf{作者：} Guohui Zhang, Hu Yu, Xiaoxiao Ma, Yaning Pan, Hang Xu, Feng Zhao。\\
+\textbf{简称：} MaskFocus。\\
+\textbf{版本：} arXiv 2512.18766v1，submitted on 21 Dec 2025。\\
+\textbf{代码：} 论文页标注为 \href{https://github.com/zghhui/MaskFocus}{zghhui/MaskFocus}，但我阅读时仓库接口未返回有效公开信息，因此这里只把它作为论文给出的代码入口。\\
+\textbf{方向标签：} Masked Generative Models、Meissonic、GRPO、Critical Step Selection、Information Gain、Dynamic Routing Sampling。\\
+\textbf{阅读日期：} 2026-05-06。\\
+\textbf{阅读口径：} 这篇和 E-GRPO 都在问 ``哪些 step 值得优化''，但对象不同：E-GRPO 面向 flow / diffusion 的 denoising entropy，MaskFocus 面向 masked image generation 的 iterative unmasking trajectory。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+MaskFocus 的核心判断是：masked generative model 的每个 sampling step 对最终图像的贡献并不相同，所以 RL 不应该对整条 unmasking trajectory 均匀做 policy optimization，也不应该随机挑 step 训练；更合理的做法是先用 intermediate image 和 final image 的 embedding similarity 估计 step-level information gain，再只在最关键的 steps 上做 GRPO。
+
+\[
+\begin{aligned}
+\text{MaskFocus}
+&= \text{Critical Step Selection (CSS)}\\
+&\quad + \text{all-masked-token probability estimation}\\
+&\quad + \text{Dynamic Routing Sampling (DR-Sampling)}.
+\end{aligned}
+\]
+
+\begin{summarybox}
+\textbf{我的判断：} MaskFocus 是 masked generative model 版的 ``focused credit assignment''。它不是像 DenseGRPO 那样把 credit 分到所有 steps，而是先判断哪些 unmasking steps 真正改变了最终图像，再把 RL 更新预算集中到这些 critical steps 上。它和 E-GRPO 的共同点是减少无效 step 更新；差异是 E-GRPO 用 entropy 作为探索价值指标，MaskFocus 用 image embedding similarity change 作为信息增益指标。
+\end{summarybox}
+
+\subsection{1. 为什么 masked generative model 的 GRPO 不一样}
+
+Masked Generative Models，简称 MGM，例如 MaskGIT / Meissonic，并不是 diffusion 那种从噪声连续去噪，也不是 AR 模型那种从左到右逐 token 生成。它的基本机制是：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 初始图像 token 全部是 \([\mathrm{MASK}]\)。
+  \item 每一步并行预测所有 masked tokens 的分布。
+  \item 按 confidence / mask schedule 只保留一部分 token。
+  \item 剩余 token 继续保持 masked，留到后续步骤 refinement。
+\end{enumerate}
+
+预训练目标可以写成：
+
+\[
+p(z_M\mid z_V)
+=
+\prod_{i\in M}p(z_i\mid z_V),
+\]
+
+其中 \(z_M\) 是 masked tokens，\(z_V\) 是 visible tokens。
+
+这给 RL 后训练带来一个特殊问题：MGM 的 sampling 是多步 iterative refinement，每一步都有 mask、visible tokens、masked tokens、token probability；如果像 Mask-GRPO 那样把整个 unmasking trajectory 都纳入 policy optimization，就要沿整条轨迹估计 step likelihood，成本很高。
+
+\begin{warnbox}
+\textbf{关键矛盾：} MGM 的每个 step 都有 probability，可以做 policy gradient；但不是每个 step 都同等重要。全轨迹优化会很贵，随机挑 step 又可能挑到低价值 refinement step，导致训练不稳定或收益不足。
+\end{warnbox}
+
+MaskFocus 因此提出一个更直接的问题：
+
+\begin{quote}
+在 MGM 的 iterative unmasking 过程中，哪些 steps 真正决定最终图像的结构、主体和质量？能不能只在这些 steps 上做 RL？
+\end{quote}
+
+\subsection{2. 动机：sampling trajectory 的贡献是不均匀的}
+
+论文观察到，MGM 的 early steps 往往快速建立图像的整体 appearance 和 structure，而 later steps 更多是在补局部细节。这个现象和 diffusion / flow 中 ``前期决定语义、后期修细节'' 的直觉很像，但 MGM 的载体不是连续 latent，而是 masked visual tokens。
+
+为了量化这个不均匀性，论文记录每个 step 的 intermediate image embedding \(E_t\)，并和最终图像 embedding \(E_T\) 比较相似度。若某一步之后 similarity 变化很大，就说明这个 step 对最终图像的形成贡献更大。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{maskfocus/01_motivation.png}
+\caption{MaskFocus 的动机图：early steps 的 masked tokens 会更强地决定图像外观和结构；不同 step 到最终图像 embedding 的 cosine similarity 变化不均匀；不同样本的 entropy trajectory 也不同，低熵样本更确定、探索不足。图源：\href{https://arxiv.org/html/2512.18766v1}{MaskFocus arXiv HTML Figure 1}。}
+\label{fig:maskfocus-motivation}
+\end{figure}
+
+\begin{intubox}
+\textbf{直觉版：} 如果某一步之后 intermediate image suddenly becomes much closer to the final image，那么这一步很可能就是一个 ``结构决定点''。这种 step 比单纯的局部补纹理 step 更适合承载 reward credit。
+\end{intubox}
+
+\subsection{3. 方法一：Critical Step Selection (CSS)}
+
+\subsubsection{3.1 用 final-image similarity change 定义 information gain}
+
+MaskFocus 首先计算每个 sampling step 的 intermediate image embedding \(E_t\) 与 final image embedding \(E_T\) 的 cosine similarity：
+
+\[
+S_t
+=
+\mathrm{CosSim}(E_t,E_T).
+\]
+
+然后用相邻 step 的 similarity 变化来定义 step-level information gain：
+
+\[
+V_t
+=
+\left|\Delta S_t\right|
+=
+\left|S_{t+1}-S_t\right|.
+\]
+
+直觉上，\(V_t\) 越大，说明从 \(t\) 到 \(t+1\) 的 unmasking / refinement 让图像在语义 embedding 空间里发生了更明显的变化，因此这个 step 对最终图像更关键。
+
+接着，MaskFocus 从所有 steps 中选出 information gain 最大的 \(K\) 个 critical steps：
+
+\[
+\mathcal{C}
+=
+\operatorname{TopK}_{t\in\{1,\ldots,T-1\}} V_t.
+\]
+
+论文实验里使用的 backbone 是 Meissonic，sampling steps 为 \(T=64\)，critical steps 数量为 \(K=6\)。也就是说，它不是全 64 步都训练，而是把 RL 更新集中到少数最有信息增益的位置。
+
+\begin{summarybox}
+\textbf{这一步和 E-GRPO 的差别：} E-GRPO 的 step selection 主要来自 SDE entropy，回答 ``哪里有探索空间''；MaskFocus 的 CSS 来自 embedding similarity change，回答 ``哪里真正改变了最终图像''。前者偏 exploration informativeness，后者偏 generation trajectory informativeness。
+\end{summarybox}
+
+\subsubsection{3.2 为什么不是随机挑 early steps}
+
+一个看似合理的 baseline 是：既然 early steps 重要，那随机从前 40\% steps 里挑一些做训练即可。论文的讨论显示这种做法仍然不稳，因为 early stage 内部也不是均匀重要；有些 early step 只是 minor refinement，有些才是真正的结构转折点。
+
+更严重的是，随机 early-step selection 可能在后期训练中诱发 reward hacking：模型会过拟合某些容易提升 reward 的微小细节，而不是稳定改善图像结构和指令遵循。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{maskfocus/04_more_discussions.png}
+\caption{论文对 step selection、sampling strategy、CFG 和 mask strategy 的补充比较。重点是：固定区间或随机选择 early steps 不如基于 information gain 的 CSS 稳定。图源：\href{https://arxiv.org/html/2512.18766v1}{MaskFocus arXiv HTML Figure 4}。}
+\label{fig:maskfocus-more-discussions}
+\end{figure}
+
+\subsection{4. 方法二：critical step 上如何估计 probability}
+
+只选出 critical steps 还不够，还要解决一个 MGM 特有的问题：某个 step 实际上只会 unmask 一部分高 confidence tokens，但模型在该 step 对所有 masked tokens 都有预测分布。
+
+MaskFocus 的做法是：对 critical step \(k\) 记录生成结果 \(o_k\)、step index \(k\) 和该 step 的 mask \(M_k\)。训练时随机 shuffle mask 得到新的 \(M'_k\)，再重新构造 masked completion \(\hat{o}_i\)，让模型预测这些 masked tokens 的 probabilities，并计算 \(\pi_\theta\)、\(\pi_{\mathrm{old}}\)、\(\pi_{\mathrm{ref}}\) 的 log-likelihood。
+
+它的关键点是：
+
+\begin{quote}
+对每个 critical step，不只使用该步最终采出来的 token，而是把所有 masked tokens 的 probability 都纳入优化目标。
+\end{quote}
+
+这样做的理由是 MGM 的预训练目标本来就是并行预测所有 masked tokens；即使某些 token 在当前 step 没有被选中，它们的 probability distribution 仍然包含关于最终图像的有效估计。
+
+\begin{intubox}
+\textbf{直觉：} MGM 在每一步其实都 ``想象'' 了整张图，只是采样策略只兑现其中一部分 token。MaskFocus 利用这个特性，把 critical step 的全 masked-token prediction 变成更直接的 probability estimation。
+\end{intubox}
+
+\subsection{5. 方法三：Dynamic Routing Sampling (DR-Sampling)}
+
+\subsubsection{5.1 为什么需要 dynamic routing}
+
+MGM 常用 confidence-based sampling：优先保留高 confidence tokens。这个策略稳定，但容易导致早期大量生成简单区域，例如背景，而主体、复杂属性和细节的探索不足。
+
+论文认为这和 sample-level entropy 有关。低熵 trajectory 表示模型过于确定，采样路径更 deterministic，探索新 mask / token 的机会少；高熵 trajectory 已经不确定，如果再强行提高 temperature，反而容易引入不稳定甚至 reward hacking。
+
+所以 MaskFocus 使用 group 内动态路由：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{高熵样本：} 已经有足够不确定性，走 exploitation branch，使用标准 confidence-based MaskGIT sampling。
+  \item \textbf{低熵样本：} 过于确定，走 exploration branch，使用 entropy-based dynamic temperature modulation，温和增加探索。
+\end{itemize}
+
+\subsubsection{5.2 entropy 与 temperature 公式}
+
+论文先计算 sample / token 预测分布的 entropy：
+
+\[
+H_i
+=
+-
+\sum_{v\in\mathcal{V}}p(v)\log p(v),
+\]
+
+其中 \(\mathcal{V}\) 是 codebook，\(p(v)\) 是 token 的预测概率。
+
+对低熵样本，论文使用 entropy-based temperature：
+
+\[
+T_i
+=
+T\exp\left(-\frac{H_{i,j}}{\alpha}\right)+\theta,
+\]
+
+其中 \(T\) 是最大 temperature，\(\theta\) 是 lower bound，\(\alpha\) 控制 entropy 增大时 temperature 衰减的速度。这个公式的效果是：entropy 越低，temperature 越高；entropy 越高，temperature 越接近 lower bound。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{maskfocus/02_overview.png}
+\caption{MaskFocus 方法总览：先用 DR-Sampling 在组内平衡 exploration / exploitation，再通过 CSS 找出 information gain 最高的 critical steps，最后对这些 steps 的 masks 做 shuffle 与 re-mask，计算 masked-token likelihood 并更新 GRPO 目标。图源：\href{https://arxiv.org/html/2512.18766v1}{MaskFocus arXiv HTML Figure 2}。}
+\label{fig:maskfocus-overview}
+\end{figure}
+
+\begin{warnbox}
+\textbf{这里的 routing 很容易误解：} 它不是对高熵样本继续加噪，而是只对低熵样本增强探索。原因是高熵样本已经不稳定，继续升温会破坏训练；低熵样本才是真的 ``太确定、探索不足''。
+\end{warnbox}
+
+\subsection{6. MaskFocus 的 GRPO 目标怎么理解}
+
+论文仍然使用 GRPO / PPO 风格的 clipped objective。对同一个 prompt 采样 \(G\) 个 completions，reward 为 \(R^i\)，group-normalized advantage 为：
+
+\[
+A^i
+=
+\frac{
+R^i-\mathrm{mean}(\{R^i\}_{i=1}^{G})
+}{
+\mathrm{std}(\{R^i\}_{i=1}^{G})
+}.
+\]
+
+importance ratio 写作：
+
+\[
+r_t^i(\theta)
+=
+\frac{
+\pi_\theta(o_t^i\mid q,o_{<t}^i)
+}{
+\pi_{\theta_{\mathrm{old}}}(o_t^i\mid q,o_{<t}^i)
+}.
+\]
+
+然后 objective 仍然是 clipped surrogate 加 KL penalty：
+
+\[
+\begin{aligned}
+\mathcal{J}
+&=
+\mathbb{E}_{\{o^i\}\sim\pi_{\mathrm{old}}}
+\Bigg[
+\frac{1}{\sum_i |o^i|}
+\sum_i\sum_t
+\Bigg(
+\min\Big(
+ r_t^i(\theta)A^i,
+\mathrm{clip}(r_t^i(\theta),1-\epsilon,1+\epsilon)A^i
+\Big)\\
+&\qquad\qquad\qquad\qquad
+-
+\beta D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{\mathrm{ref}})
+\Bigg)
+\Bigg].
+\end{aligned}
+\]
+
+但和普通全轨迹 Mask-GRPO 不同的是，MaskFocus 并不把所有 \(t\) 都当成同等训练对象，而是在数据 buffer 中只保留 CSS 选出的 critical steps：
+
+\[
+D
+\leftarrow
+\{(o_k,k,M_k): k\in\mathcal{C}\}.
+\]
+
+\begin{summarybox}
+\textbf{所以它的本质不是换 objective，而是换训练样本分布：} GRPO 的数学外壳仍然熟悉，但被优化的 timestep / mask event 变成了 information-gain-filtered critical steps。
+\end{summarybox}
+
+\subsection{7. 算法流程：训练时到底怎么跑}
+
+可以把 Algorithm 1 压缩成下面几步：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 初始化 \(\pi_\theta\leftarrow\pi_{\mathrm{ref}}\)，准备 critical-step buffer \(C\) 和 data buffer \(D\)。
+  \item 对每个 prompt，用 \(\pi_{\mathrm{old}}\) 采样 \(G\) 个 completions；采样过程中使用 DR-Sampling，并记录每步 image embeddings \(\{E_t\}_{1:T}\) 与 masks \(\{M_t\}_{1:T}\)。
+  \item 对每个 completion 计算 reward、group-normalized advantage，以及每个 step 的 information gain \(V_t\)。
+  \item 用 CSS 选出 \(K\) 个 critical steps，并把 \((o_k,k,M_k)\) 放入训练 buffer。
+  \item 对 mini-batch 中的 critical-step samples，shuffle mask、re-mask completion，重新计算 \(\pi_\theta\)、\(\pi_{\mathrm{old}}\)、\(\pi_{\mathrm{ref}}\) 的 likelihood。
+  \item 用 clipped GRPO objective + KL penalty 更新 \(\pi_\theta\)。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{我会这样记：} DR-Sampling 负责在 rollout 时让低熵样本多探索；CSS 负责在 update 时只保留最有信息增益的 steps；all-masked-token likelihood 负责让 critical step 的 probability estimation 更贴合 MGM 的并行预测机制。
+\end{intubox}
+
+\subsection{8. 实验设置}
+
+论文实验主要围绕 Meissonic 这个 masked generative model：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Backbone：} Meissonic，开源 MGM，输出分辨率为 \(1024\times1024\)。
+  \item \textbf{Sampling steps：} \(T=64\)。
+  \item \textbf{Critical steps：} 默认 \(K=6\)。
+  \item \textbf{CFG：} training 和 inference 都设为 5。
+  \item \textbf{Compositional generation 数据：} 50K GenEval-style prompts，来自 Flow-GRPO，且不与官方 GenEval prompts 重叠。
+  \item \textbf{Preference alignment 数据：} HPS v2 的 10K training samples。
+  \item \textbf{Reward：} compositional task 使用 CLIP + GenEval reward；preference alignment task 使用 HPS。
+  \item \textbf{评测：} GenEval、T2I-CompBench、DrawBench；指标包括 DEQA、PickScore、HPS、ImageReward。
+\end{itemize}
+
+\subsection{9. 主要结果：MaskFocus 的收益在哪里}
+
+\subsubsection{9.1 GenEval：比 MaskGRPO 更强的组合生成能力}
+
+在 GenEval 上，MaskFocus 把 Meissonic 的 overall score 从 \textbf{0.54} 提升到 \textbf{0.76}，也高于 MaskGRPO 的 \textbf{0.73}。
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{方法} & \textbf{Overall} & \textbf{Single Obj.} & \textbf{Two Obj.} & \textbf{Counting} & \textbf{Color} & \textbf{Position} & \textbf{Color Attr.}\\
+\midrule
+FLUX.1-dev & 0.66 & 0.98 & 0.81 & 0.74 & 0.79 & 0.22 & 0.45\\
+Janus-Pro-1B & 0.73 & 0.98 & 0.82 & 0.51 & 0.89 & 0.65 & 0.56\\
+Mask-GRPO & 0.73 & 0.99 & 0.90 & 0.69 & 0.85 & 0.35 & 0.59\\
+Meissonic & 0.54 & 0.99 & 0.66 & 0.42 & 0.86 & 0.10 & 0.22\\
+Meissonic + MaskGRPO & 0.73 & 1.00 & 0.87 & 0.83 & 0.87 & 0.39 & 0.48\\
+Meissonic + MaskFocus & \textbf{0.76} & \textbf{1.00} & \textbf{0.91} & \textbf{0.85} & \textbf{0.87} & \textbf{0.42} & \textbf{0.54}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+这张表最值得关注的是 position 和 color attribute。它们通常更依赖结构化关系和属性绑定，而不是单纯的图像美观。MaskFocus 在这些子项上相对 Meissonic 和 MaskGRPO 都有提升，说明 critical-step optimization 确实更有利于指令遵循和组合关系。
+
+\subsubsection{9.2 Human preference：接近或超过强 diffusion baseline}
+
+在人类偏好相关指标上，MaskFocus 也提升了 Meissonic：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+\textbf{方法} & \textbf{DEQA} & \textbf{PickScore} & \textbf{HPS} & \textbf{ImageReward}\\
+\midrule
+SDXL & 4.17 & 22.27 & 30.06 & 0.56\\
+SD3.5-M & 4.24 & 22.50 & 30.17 & 0.98\\
+FLUX.1-dev & 4.37 & \textbf{22.97} & 31.13 & 1.06\\
+Meissonic & 4.00 & 21.63 & 28.89 & 0.39\\
+Meissonic + MaskGRPO & 4.35 & 22.34 & 35.48 & 1.06\\
+Meissonic + MaskFocus & \textbf{4.39} & 22.39 & \textbf{35.52} & \textbf{1.09}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+需要注意的是，MaskFocus 并不是所有指标都超过 FLUX.1-dev；例如 PickScore 仍低于 FLUX.1-dev。但它把 Meissonic 的 HPS 和 ImageReward 明显推高，说明 MGM 经过 focused RL 后训练之后，偏好指标可以接近强 diffusion model。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{maskfocus/03_qualitative.png}
+\caption{MaskFocus 的 qualitative comparison。论文展示了其在图像质量、人类偏好，以及 counting、color、attribute binding、position 等指令遵循任务上的可视化提升。图源：\href{https://arxiv.org/html/2512.18766v1}{MaskFocus arXiv HTML Figure 3}。}
+\label{fig:maskfocus-qualitative}
+\end{figure}
+
+\subsubsection{9.3 Ablation：CSS 和 DR-Sampling 都有贡献}
+
+论文消融如下：
+
+\begin{center}
+\resizebox{0.78\linewidth}{!}{
+\begin{tabular}{lccc}
+\toprule
+\textbf{方法} & \textbf{GenEval} & \textbf{DEQA} & \textbf{PickScore}\\
+\midrule
+MaskFocus & \textbf{0.76} & \textbf{4.39} & \textbf{22.39}\\
+w/o Critical Step Selection & 0.72 & 4.34 & 22.34\\
+w/o Dynamic Routing Sampling & 0.74 & 4.35 & 22.31\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+去掉 CSS 后，GenEval 从 0.76 降到 0.72，说明 information-gain-based critical steps 不是装饰项；去掉 DR-Sampling 后，GenEval 和偏好指标也下降，说明低熵样本的探索路由对训练同样有帮助。
+
+\subsection{10. Pre-/Post-RL trajectory：它到底改变了什么}
+
+论文还可视化了 RL 前后的 sampling trajectories。这个图的意义不是单看最终图，而是看 MGM 在每个 unmasking step 中如何逐渐形成图像。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{maskfocus/05_sampling_trajectories.png}
+\caption{Pre-/Post-RL sampling trajectories。MaskFocus 不只是提高最终 reward，而是改变了 masked generation 的中间演化路径，使关键 unmasking steps 更有利于最终图像质量和指令对齐。图源：\href{https://arxiv.org/html/2512.18766v1}{MaskFocus arXiv HTML Figure 5}。}
+\label{fig:maskfocus-trajectories}
+\end{figure}
+
+\begin{summarybox}
+\textbf{我的理解：} MaskFocus 的真正目标不是 ``让 64-step MGM 采样更少步''，而是 ``让 64-step 采样里被用于 RL 更新的 steps 更少、更准''。它主要省的是 policy optimization 的轨迹 likelihood / update 成本，而不是 necessarily 把 inference steps 从 64 降到 6。
+\end{summarybox}
+
+\subsection{11. 和 E-GRPO / MaskGRPO / DenseGRPO 的关系}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llll}
+\toprule
+\textbf{方法} & \textbf{生成范式} & \textbf{核心选择信号} & \textbf{解决的问题}\\
+\midrule
+DenseGRPO & diffusion / flow & dense reward gain & terminal reward 太粗，需要细粒度 credit\\
+E-GRPO & flow model & step entropy & 低熵 denoising steps 探索价值低\\
+MaskGRPO & masked generation & full / mask-ratio-related trajectory & MGM 如何做 stepwise policy optimization\\
+MaskFocus & masked generation & embedding similarity information gain & MGM 全轨迹优化太贵，随机 step 不稳定\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{和 E-GRPO：} 两者都不是简单追求更细 credit，而是减少无效 step。E-GRPO 通过 entropy-aware step merging 选择值得探索的 denoising steps；MaskFocus 通过 embedding similarity change 选择真正改变最终图像的 unmasking steps。
+  \item \textbf{和 DenseGRPO：} DenseGRPO 倾向于把 reward 更细地分给每个 step；MaskFocus 则认为并不是所有 steps 都值得分 credit，应该先筛 critical steps。
+  \item \textbf{和 MaskGRPO：} MaskGRPO 证明 MGM 可以做 GRPO，但全轨迹优化成本高；MaskFocus 在此基础上加入 CSS 和 DR-Sampling，把 update 集中到更有价值的 steps。
+\end{itemize}
+
+\begin{intubox}
+\textbf{和我们前面讨论的 ``10 个关键点'' idea 的关系：} MaskFocus 不是先完整跑 64 步再为了 inference 省步数，而是在 rollout 过程中记录 trajectory，再只把 high-information-gain steps 放进 RL update。它更像 ``update-efficient critical step selection''，不是 ``pre-scheduled fast sampler''。
+\end{intubox}
+
+\subsection{12. 我认为它的局限}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{它主要提升训练 / update 效率，不等于减少采样步数。} CSS 需要 intermediate embeddings 和 final image embedding，因此默认仍然要完成 rollout 后才能判断 critical steps。它不是直接把 64-step inference 变成 6-step inference。
+  \item \textbf{information gain 是后验指标。} \(E_t\) 和 \(E_T\) 的 similarity change 很适合解释哪一步重要，但 \(E_T\) 只有采样结束后才知道。若要进一步做采样加速，需要把 CSS 蒸馏成前验 schedule 或低成本 selector。
+  \item \textbf{embedding similarity 不等于 reward causality。} 某步让 image embedding 变化大，不一定说明它对 HPS / GenEval reward 的因果贡献最大；这仍然是一个 proxy。
+  \item \textbf{方法强依赖 MGM 的并行 masked-token prediction 结构。} all-masked-token probability estimation 很适合 MGM，但不一定能直接迁移到 flow / diffusion。
+  \item \textbf{代码可访问性需要再确认。} arXiv 页面给出 GitHub 链接，但我阅读时仓库元信息未能通过公开接口获取；复现实验时需要以论文发布后的实际仓库状态为准。
+\end{enumerate}
+
+\subsection{13. 读完后的记忆钩子}
+
+\begin{summarybox}
+\textbf{我最后会这样概括：} DenseGRPO 说 ``细粒度 credit 有用''；E-GRPO 说 ``低熵 denoising step 不值得都随机探索''；MaskFocus 说 ``MGM 的 unmasking steps 也不是都值得做 RL，应该只优化 information gain 最大的 critical steps''。它是 masked generation 方向上把 RL update 从 full trajectory 推向 critical-step trajectory 的代表工作。
+\end{summarybox}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文主页：} \href{https://arxiv.org/abs/2512.18766}{MaskFocus: Focusing Policy Optimization on Critical Steps for Masked Image Generation}。
+  \item \textbf{arXiv HTML：} \href{https://arxiv.org/html/2512.18766v1}{MaskFocus HTML version}，用于核对章节、图表、公式和实验结果。
+  \item \textbf{PDF：} \href{https://arxiv.org/pdf/2512.18766}{arXiv PDF}，用于核对方法公式、Algorithm 1 和实验设置。
+  \item \textbf{代码入口：} \href{https://github.com/zghhui/MaskFocus}{zghhui/MaskFocus}，来源于 arXiv 页面 comments；当前笔记未将其视为已验证可复现代码。
+\end{itemize}

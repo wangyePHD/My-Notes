@@ -1,0 +1,585 @@
+% ============================================================
+% Paper deep reading: LeapAlign
+% Source: https://arxiv.org/abs/2604.15311
+% ============================================================
+
+\section{论文精读：LeapAlign}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2604.15311}{LeapAlign: Post-Training Flow Matching Models at Any Generation Step by Building Two-Step Trajectories}\\
+\textbf{作者：} Zhanhao Liang, Tao Yang, Jie Wu, Chengjian Feng, Liang Zheng。\\
+\textbf{简称：} LeapAlign。\\
+\textbf{版本：} arXiv 2604.15311v2，CVPR 2026。\\
+\textbf{项目主页：} \href{https://rockeycoss.github.io/leapalign/}{LeapAlign project page}。\\
+\textbf{代码：} \href{https://github.com/RockeyCoss/LeapAlign_Code}{RockeyCoss/LeapAlign\_Code}。\\
+\textbf{方向标签：} Flow Matching、Rectified Flow、Direct Reward Backpropagation、Preference Alignment、Two-step Leap Trajectory、Gradient Discounting。\\
+\textbf{阅读日期：} 2026-05-06。\\
+\textbf{阅读口径：} 这篇不是 GRPO / policy-gradient 路线，而是 flow matching 的 \textbf{direct-gradient post-training} 路线：它问的是 ``能不能让 reward gradient 稳定传到任意生成步骤，尤其是早期构图步骤''。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+LeapAlign 的核心判断是：Flow Matching / Rectified Flow 的采样轨迹本身是连续可微的，所以偏好对齐不一定非要把生成过程改造成 stochastic policy 再做 GRPO；如果 reward model 可微，可以直接把 reward gradient 反传回 flow trajectory。
+
+问题是，完整多步采样轨迹太长，直接反传显存开销大、梯度也容易爆炸；而只训最后几步又会错过最决定全局布局的早期步骤。LeapAlign 的解法是：
+
+\[
+\begin{aligned}
+\text{LeapAlign}
+&= \text{two-step leap trajectory}\\
+&\quad + \text{latent connector}\\
+&\quad + \text{gradient discounting}\\
+&\quad + \text{trajectory-similarity weighting}.
+\end{aligned}
+\]
+
+\begin{summarybox}
+\textbf{我的判断：} LeapAlign 是 Flow 后训练里和 Flow-GRPO 很不一样的一条路线。Flow-GRPO / OP-GRPO / E-GRPO 关心的是如何构造 policy、logprob、advantage、ratio 和更高效的 rollout；LeapAlign 则绕开 logprob，直接利用 flow trajectory 可微性，把长反传路径压缩成两跳，让 reward gradient 能够到达任意 timestep。
+\end{summarybox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{leapalign/01_performance_overview.png}
+\caption{LeapAlign 的性能概览：在 compositional alignment 训练曲线、多种偏好评测指标和 GenEval 上，LeapAlign 都相对 Flux base 和 direct-gradient / GRPO baseline 有提升。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 1}。}
+\label{fig:leapalign-performance-overview}
+\end{figure}
+
+\subsection{1. 它为什么重要：Flow 后训练不只有 GRPO}
+
+在前面的 Flow-GRPO 主线里，我们一直在处理一个问题：flow matching 默认是 deterministic ODE，没有天然的 step-level logprob，所以要先把 ODE 改写成 SDE，再把每一步 transition 看成 Gaussian policy，最后才能做 GRPO / PPO-style ratio update。
+
+LeapAlign 站在另一个角度：既然 flow matching 的采样过程是连续可微的，那么如果 reward model 也是可微的，是否可以直接优化最终图像 reward？
+
+\[
+\max_{\theta} r(x_0),
+\]
+
+其中 \(x_0\) 是最终生成图像 latent，\(r(\cdot)\) 是偏好 / 对齐 reward。
+
+这条路线有明显吸引力：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{不需要 logprob：} 不必把 flow ODE 强行 SDE 化，也不需要计算 step transition ratio。
+  \item \textbf{不需要 group sampling：} 理论上不必为同一 prompt 采样一组候选来估计 advantage。
+  \item \textbf{信号更直接：} reward gradient 直接告诉模型 ``怎样改图像能提高 reward''。
+\end{itemize}
+
+但直接梯度路线的瓶颈也很明确：完整采样链可能有几十步。如果让 reward gradient 穿过完整链条：
+
+\[
+x_1 \rightarrow x_{t_{T-1}} \rightarrow \cdots \rightarrow x_{t_1} \rightarrow x_0,
+\]
+
+就要保存大量中间激活，显存开销很高；更麻烦的是长链式反传会让梯度数值不稳定。
+
+\begin{warnbox}
+\textbf{核心矛盾：} 早期 timestep 往往决定整体布局、主体关系和空间结构，但直接反传到早期最贵、也最不稳定；后期 timestep 容易训练，却更多是在修局部纹理和细节。
+\end{warnbox}
+
+所以 LeapAlign 真正要解决的问题是：
+
+\begin{quote}
+如何在不反传完整长轨迹的情况下，让最终 reward 的梯度稳定影响任意 generation step？
+\end{quote}
+
+\subsection{2. Flow Matching 基础：为什么可以 ``跳步''}
+
+论文采用的是 rectified flow / flow matching 视角。设 \(x_1\sim\mathcal{N}(0,I)\) 是噪声端，\(x_0\sim p_{\mathrm{data}}\) 是数据端，时间 \(t\in[0,1]\)，其中 \(t=1\) 对应噪声，\(t=0\) 对应干净图像。
+
+Rectified flow 的线性插值可以写成：
+
+\[
+x_t = (1-t)x_0 + t x_1.
+\]
+
+模型学习速度场 \(v_{\theta}(x_t,t,c)\)，采样时从 \(x_1\) 沿着 ODE 走到 \(x_0\)：
+
+\[
+\frac{dx_t}{dt}=v_{\theta}(x_t,t,c).
+\]
+
+离散采样时，普通 Euler 步是一步一步走：
+
+\[
+x_{t-\Delta t}
+=
+x_t - \Delta t\, v_{\theta}(x_t,t,c).
+\]
+
+LeapAlign 利用的关键性质是：如果速度场足够好，那么可以从较早的 \(k\) 时刻直接一步预测较晚的 \(j\) 时刻：
+
+\[
+\hat{x}_{j\mid k}
+=
+x_k - (k-j)v_{\theta}(x_k,k,c),
+\qquad k>j.
+\]
+
+同理，也可以从中间点 \(x_j\) 直接预测最终 clean latent：
+
+\[
+\hat{x}_{0\mid j}
+=
+x_j - j\,v_{\theta}(x_j,j,c).
+\]
+
+\begin{intubox}
+\textbf{直觉：} 普通采样是 ``小步走完整条路''；LeapAlign 训练时构造的是 ``从早期点直接跳到中间点，再从中间点直接跳到终点''。它不声称推理一定少走这些步，而是用这种跳跃路径来缩短 reward gradient 的反传链条。
+\end{intubox}
+
+\subsection{3. 方法一：Two-step Leap Trajectory}
+
+\subsubsection{3.1 从完整轨迹中随机挑两个点}
+
+先照常在线采样一条完整 flow trajectory：
+
+\[
+x_1 \rightarrow \cdots \rightarrow x_k \rightarrow \cdots \rightarrow x_j \rightarrow \cdots \rightarrow x_0,
+\qquad k>j>0.
+\]
+
+LeapAlign 不让 reward gradient 沿完整链条回传，而是在这条真实轨迹里随机选两个时间点 \(k,j\)，构造两跳：
+
+\[
+x_k
+\Rightarrow
+\hat{x}_{j\mid k}
+\Rightarrow
+x_j
+\Rightarrow
+\hat{x}_{0\mid j}
+\Rightarrow
+x_0.
+\]
+
+第一跳负责把早期点 \(x_k\) 连接到中间点 \(x_j\) 附近；第二跳负责把 \(x_j\) 连接到最终输出 \(x_0\) 附近。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{leapalign/02_method_overview.png}
+\caption{LeapAlign 方法总览：从完整生成轨迹中随机选择 \(k>j\)，构造 \(x_k\to\hat{x}_{j\mid k}\) 和 \(x_j\to\hat{x}_{0\mid j}\) 两个 leap，并用 latent connector 把跳跃估计接回真实轨迹点，使前向数值等于真实采样结果，反向梯度沿短路径传播。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 2}。}
+\label{fig:leapalign-method-overview}
+\end{figure}
+
+\subsubsection{3.2 为什么是 two-step，而不是 one-step / full-step}
+
+One-step 只从某个中间点直接预测 \(x_0\)，反传路径更短，但只能覆盖一个训练点，对 step interaction 的建模能力较弱。Full trajectory 能保留所有依赖，但显存和梯度稳定性都很差。
+
+Two-step 是中间折中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 比 full trajectory 短得多，反传成本基本固定。
+  \item 比 one-step 多保留一个中间交互点，可以让早期 step 和后续 step 的耦合关系进入梯度。
+  \item 随机选择 \(k,j\) 后，长期训练中所有 timestep 都有机会被更新。
+\end{itemize}
+
+论文消融也显示，two-step 在性能和显存成本之间最好；three-step 更贵，但收益不明显。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.70\linewidth]{leapalign/05_design_leap_steps.png}
+\caption{不同 leap step 数量的消融：two-step 在效果和内存之间取得最好折中。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 4(b)}。}
+\label{fig:leapalign-leap-steps}
+\end{figure}
+
+\subsection{4. 方法二：Latent Connector}
+
+如果只用 \(\hat{x}_{j\mid k}\) 和 \(\hat{x}_{0\mid j}\)，跳跃预测可能偏离真实长轨迹，导致 reward 其实对应的是一个近似图像，而不是模型真实采样出来的最终图像。
+
+LeapAlign 因此引入 latent connector：
+
+\[
+x_j
+=
+\hat{x}_{j\mid k}
++
+\operatorname{sg}\left(x_j-\hat{x}_{j\mid k}\right),
+\]
+
+\[
+x_0
+=
+\hat{x}_{0\mid j}
++
+\operatorname{sg}\left(x_0-\hat{x}_{0\mid j}\right),
+\]
+
+其中 \(\operatorname{sg}(\cdot)\) 表示 stop-gradient。
+
+这个技巧的作用非常关键：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{前向数值：} 等式右边精确等于真实轨迹点 \(x_j\) 和 \(x_0\)。所以 reward 看的是完整采样得到的真实最终图像。
+  \item \textbf{反向梯度：} stop-gradient 项不传梯度，梯度会把 \(x_j\) 和 \(x_0\) 当作由 leap prediction 产生。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{这一步是 LeapAlign 的工程核心：} 前向用真实长轨迹保证 reward input 可靠；反向用短 leap trajectory 保证梯度路径短且能覆盖早期步骤。
+\end{summarybox}
+
+\subsection{5. 方法三：Nested Gradient 与 Gradient Discounting}
+
+\subsubsection{5.1 两步 leap 会产生跨步骤依赖梯度}
+
+沿两步 leap trajectory 反传时，最终 \(x_0\) 对参数 \(\theta\) 的梯度不只是两个单步梯度，还会出现一个跨步骤交互项。论文将其展开为：
+
+\[
+\frac{\partial x_0}{\partial \theta}
+=
+- j\frac{\partial v_{\theta}(x_j)}{\partial \theta}
+-
+(k-j)\frac{\partial v_{\theta}(x_k)}{\partial \theta}
++
+j(k-j)
+\frac{\partial v_{\theta}(x_j)}{\partial x_j}
+\frac{\partial v_{\theta}(x_k)}{\partial \theta}.
+\]
+
+前两项是比较直观的 single-step gradients：一个更新 \(j\) 点，一个更新 \(k\) 点。最后一项是 nested gradient，它表示 \(x_k\) 处的变化会先影响 \(x_j\)，再通过 \(x_j\) 处的速度场影响最终 \(x_0\)。
+
+\begin{intubox}
+\textbf{直觉：} nested gradient 捕捉的是 ``早期一步怎么改变后续一步的输入，从而影响最终图像''。如果把它完全删掉，就等于假设不同 generation steps 之间相互独立，这显然不符合 flow 生成过程。
+\end{intubox}
+
+\subsubsection{5.2 为什么不能直接完整保留 nested gradient}
+
+Nested gradient 有用，但数值上也危险。它包含 \(\partial v_{\theta}(x_j)/\partial x_j\) 这样的 Jacobian 项，乘上 \(j(k-j)\) 后可能带来很大的梯度范数，导致训练不稳定。
+
+过去一些 direct-gradient 方法倾向于直接截断这类跨步梯度。LeapAlign 的选择更温和：不删除，而是打折。
+
+\subsubsection{5.3 Gradient Discounting 的写法}
+
+LeapAlign 在第二跳速度场输入处使用：
+
+\[
+\hat{x}_{0\mid j}
+=
+x_j
+-
+j\,v_{\theta}\left(
+\alpha x_j + (1-\alpha)\operatorname{sg}(x_j), j, c
+\right),
+\qquad \alpha\in[0,1].
+\]
+
+前向时，因为 \(\alpha x_j+(1-\alpha)x_j=x_j\)，所以数值不变；反向时，经过 \(x_j\) 的梯度会被乘上 \(\alpha\)。于是 nested gradient 变成：
+
+\[
+\alpha\,j(k-j)
+\frac{\partial v_{\theta}(x_j)}{\partial x_j}
+\frac{\partial v_{\theta}(x_k)}{\partial \theta}.
+\]
+
+三个极端很好理解：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \(\alpha=1\)：完整保留 nested gradient，信息最多，但最不稳定。
+  \item \(\alpha=0\)：完全截断 nested gradient，稳定但丢掉跨步依赖。
+  \item \(0<\alpha<1\)：保留跨步信号，但降低幅度。
+\end{itemize}
+
+论文主实验中，HPSv2.1 reward 下 \(\alpha=0.3\) 表现最好；附录中对 nested gradient 的单独分析也支持 ``适度折扣比完整保留或完全删除更好''。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.78\linewidth]{leapalign/04_design_gradient_discount.png}
+\caption{Gradient discounting 的主文消融：\(\alpha=0.3\) 在保留跨步骤信号和控制梯度幅度之间取得较好平衡。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 4(a)}。}
+\label{fig:leapalign-gradient-discount}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.78\linewidth]{leapalign/11_nested_gradient_analysis.png}
+\caption{Nested gradient 的附录分析：直接使用完整 nested gradient 会显著增大梯度范数并损害性能；适度 discount 能降低梯度范数并改善结果。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 6}。}
+\label{fig:leapalign-nested-gradient}
+\end{figure}
+
+\subsection{6. 方法四：Reward Objective 与 Trajectory-Similarity Weighting}
+
+\subsubsection{6.1 Reward 打在真实最终图像 \(x_0\) 上}
+
+LeapAlign 不是把 reward 打在近似的一步预测 \(\hat{x}_{0\mid j}\) 上，而是打在完整 rollout 得到的真实最终图像 \(x_0\) 上。
+
+这是一个重要选择。因为 \(\hat{x}_{0\mid j}\) 只是 one-step approximation，可能存在模糊、伪影或轨迹偏差；如果 reward model 在这种近似图像上打分，信号可能不可靠。真实 \(x_0\) 才是模型实际会输出的图像。
+
+论文使用 hinge-style reward objective：
+
+\[
+\mathcal{L}_{\mathrm{raw}}
+=
+\max(0,\lambda-r(x_0)).
+\]
+
+如果 reward 已经超过阈值 \(\lambda\)，loss 为 0；如果 reward 不够高，就继续推动模型提升 reward。这个阈值式写法比无上限地最大化 reward 更克制，可以缓解过度优化和 reward hacking 风险。
+
+论文默认设置中，HPSv2.1 的阈值为 \(\lambda=0.55\)。附录阈值消融显示 \(\lambda=0.55\) 在 HPSv2.1、HPSv3、PickScore 和 ImageReward 上整体最好。
+
+\subsubsection{6.2 不是每条 leap trajectory 都同样可信}
+
+如果两步 leap 预测与真实长轨迹差距很大，那么沿这条短路径反传的梯度可能会误导训练。LeapAlign 因此计算 leap approximation 和真实轨迹点之间的偏差：
+
+\[
+d_j
+=
+\operatorname{mean}\left(|x_j-\hat{x}_{j\mid k}|\right),
+\]
+
+\[
+d_0
+=
+\operatorname{mean}\left(|x_0-\hat{x}_{0\mid j}|\right).
+\]
+
+然后定义 trajectory-similarity weight：
+
+\[
+w_{\mathrm{sim}}
+=
+\frac{1}{\max(d_j,\tau)+\max(d_0,\tau)},
+\]
+
+最终损失为：
+
+\[
+\mathcal{L}
+=
+\operatorname{sg}(w_{\mathrm{sim}})\,\mathcal{L}_{\mathrm{raw}}.
+\]
+
+其中 \(\tau\) 是下限，论文经验值为 \(0.1\)，用于防止权重无限变大。
+
+\begin{summarybox}
+\textbf{直觉：} 如果 two-step leap 跳得很像真实长轨迹，就更信任这条短路径传回来的梯度；如果跳得很偏，就降低它对训练的影响。
+\end{summarybox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.78\linewidth]{leapalign/06_design_reward_input.png}
+\caption{Reward input 的消融：使用真实最终图像 \(x_0\) 作为 reward 输入优于使用 one-step approximation。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 4(c)}。}
+\label{fig:leapalign-reward-input}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.78\linewidth]{leapalign/07_design_similarity_weight.png}
+\caption{Trajectory-similarity weighting 的消融：同时使用 \(d_j\) 和 \(d_0\) 衡量 leap 与真实轨迹的偏差，比只看单个偏差或不加权更好。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 4(d)}。}
+\label{fig:leapalign-similarity-weight}
+\end{figure}
+
+\subsection{7. 算法流程：训练时到底怎么跑}
+
+把 LeapAlign 压缩成训练流程，可以写成下面几步：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 用当前 flow model 对 prompt \(c\) 正常在线采样，得到完整 trajectory \(x_1,\ldots,x_0\)。
+  \item 在完整 timestep 范围内随机选择 \(k>j>0\)。
+  \item 在 \(x_k\) 处计算速度，构造 \(\hat{x}_{j\mid k}=x_k-(k-j)v_{\theta}(x_k,k,c)\)。
+  \item 用 latent connector 将 \(\hat{x}_{j\mid k}\) 接回真实 \(x_j\)。
+  \item 在 \(x_j\) 处用 gradient-discounted 输入计算速度，构造 \(\hat{x}_{0\mid j}=x_j-jv_{\theta}(\cdot,j,c)\)。
+  \item 用 latent connector 将 \(\hat{x}_{0\mid j}\) 接回真实 \(x_0\)。
+  \item 用真实 \(x_0\) 计算 reward hinge loss，并乘上 trajectory-similarity weight。
+  \item 沿 two-step leap trajectory 反传更新模型。
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.78\linewidth]{leapalign/08_design_timestep_range.png}
+\caption{训练 timestep 范围的消融：在完整 \([0,1]\) 范围内随机选择 timestep 更好，说明早期步骤确实需要被覆盖。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 4(e)}。}
+\label{fig:leapalign-timestep-range}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.78\linewidth]{leapalign/09_design_kj_selection.png}
+\caption{\(k,j\) 选择策略的消融：随机选择优于固定间距，说明多样化的 leap pair 对训练有帮助。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 4(f)}。}
+\label{fig:leapalign-kj-selection}
+\end{figure}
+
+\subsection{8. 实验设置}
+
+论文主要在 FLUX.1-dev 上做实验，并补充验证到 SD3.5-M。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{主模型：} FLUX.1-dev。
+  \item \textbf{补充模型：} Stable Diffusion 3.5 Medium。
+  \item \textbf{默认 reward：} HPSv2.1。
+  \item \textbf{额外 reward：} PickScore、HPSv3。
+  \item \textbf{训练数据：} HPDv2 的 50K prompts；组合对齐使用 GenEval-style training prompts；额外也在 MJHQ-30K 上验证。
+  \item \textbf{训练采样：} 720\(\times\)720，25 steps，CFG=3.5。
+  \item \textbf{评测采样：} 720\(\times\)720，50 steps，CFG=3.5。
+  \item \textbf{优化器：} AdamW，学习率 \(1\times10^{-5}\)，batch size 64，weight decay \(1\times10^{-4}\)，EMA 0.995。
+  \item \textbf{训练轮数：} 300 iterations。
+  \item \textbf{关键超参：} trajectory similarity 的 \(\tau=0.1\)，HPSv2.1 下 gradient discounting 默认 \(\alpha=0.3\)，hinge threshold \(\lambda=0.55\)。
+\end{itemize}
+
+\subsection{9. 主结果：LeapAlign 强在哪里}
+
+\subsubsection{9.1 一般偏好对齐：HPSv2.1 训练也能提升 OOD 指标}
+
+在 FLUX 上用 HPSv2.1 训练时，LeapAlign 在多个指标上都超过 direct-gradient baseline 和 policy-gradient baseline。核心数字如下：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{方法} & \textbf{HPSv2.1} & \textbf{HPSv3} & \textbf{PickScore} & \textbf{UR-Align} & \textbf{UR-IQ} & \textbf{ImageReward}\\
+\midrule
+Flux & 0.3078 & 13.5020 & 22.7902 & 3.4514 & 3.5708 & 1.0455\\
+DanceGRPO & 0.3451 & 14.8336 & 23.1186 & 3.4660 & 3.6199 & 1.2347\\
+MixGRPO & 0.3692 & 14.7530 & 23.5184 & 3.4393 & 3.6241 & \textbf{1.6155}\\
+DRTune & 0.3882 & 15.5606 & 23.5185 & 3.4793 & 3.6679 & 1.3562\\
+LeapAlign & \textbf{0.4092} & \textbf{15.7678} & \textbf{23.7137} & \textbf{3.4984} & \textbf{3.7244} & 1.5104\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+这里最值得注意的是：LeapAlign 只用 HPSv2.1 训练，但 HPSv3、PickScore、UnifiedReward 等 out-of-domain metrics 也同步提升。这说明它不只是简单刷训练 reward，至少在论文设置下有一定泛化收益。
+
+\subsubsection{9.2 GenEval：组合生成受益于早期步骤更新}
+
+GenEval 上，LeapAlign 的 overall score 达到 \textbf{0.7420}，高于 Flux base 的 0.6535，也高于 MixGRPO 的 0.7232 和 DRTune 的 0.7101。
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{方法} & \textbf{Overall} & \textbf{Single Obj.} & \textbf{Two Obj.} & \textbf{Count} & \textbf{Color} & \textbf{Position} & \textbf{AttrB}\\
+\midrule
+Flux & 0.6535 & 99.38 & 86.62 & 66.88 & 74.47 & 19.50 & 45.25\\
+DanceGRPO & 0.6775 & 99.38 & 90.15 & 69.38 & 76.33 & 22.25 & 49.00\\
+MixGRPO & 0.7232 & \textbf{99.69} & 93.69 & \textbf{80.00} & 80.05 & 24.25 & 56.25\\
+DRTune & 0.7101 & 99.38 & 93.69 & 73.12 & 76.86 & 27.50 & 55.50\\
+LeapAlign & \textbf{0.7420} & 99.38 & \textbf{96.46} & 72.50 & \textbf{80.59} & \textbf{30.25} & \textbf{66.00}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+这个结果和论文动机是对齐的：two objects、position、attribute binding 这些任务更依赖全局结构和对象关系；如果方法真的能更新早期构图步骤，就应该在这些子任务上更明显。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{leapalign/03_qualitative_geneval.png}
+\caption{LeapAlign 在 GenEval 上的定性比较。论文强调，ReFL / DRaFT-LV 这类偏后期步骤的方法更难改变整体布局，而 LeapAlign 可以更明显地修正全局 composition。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 3}。}
+\label{fig:leapalign-qualitative-geneval}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.82\linewidth]{leapalign/10_geneval_improvement_curve.png}
+\caption{GenEval 分数提升曲线：LeapAlign 相比 ReFL、DRaFT-LV、DRTune 有更强的 compositional alignment 提升。图源：\href{https://arxiv.org/html/2604.15311v2}{LeapAlign arXiv HTML Figure 5}。}
+\label{fig:leapalign-geneval-curve}
+\end{figure}
+
+\subsubsection{9.3 换 reward / prompt set 仍然有效}
+
+论文还验证了不同 reward 和 prompt set：在 HPDv2 上用 PickScore 训练、在 MJHQ-30K 上用 HPSv3 训练时，LeapAlign 仍然优于 ReFL、DRaFT-LV 和 DRTune。
+
+\begin{center}
+\resizebox{0.78\linewidth}{!}{
+\begin{tabular}{lccc}
+\toprule
+\textbf{方法} & \textbf{HPSv2.1} & \textbf{PickScore} & \textbf{HPSv3}\\
+\midrule
+Flux & 0.3078 & 22.7902 & 10.7624\\
+ReFL & 0.3852 & 25.2373 & 11.7642\\
+DRaFT-LV & 0.3859 & 24.9596 & 11.2701\\
+DRTune & 0.3882 & 25.1021 & 12.0023\\
+LeapAlign & \textbf{0.4092} & \textbf{25.7589} & \textbf{12.5855}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\subsubsection{9.4 换到 SD3.5-M 也有提升}
+
+在 Stable Diffusion 3.5 Medium 上，LeapAlign 也保持最好或接近最好的结果：HPSv2.1 为 0.3915，HPSv3 为 15.5780，PickScore 为 23.6180，ImageReward 为 1.4736。这个补充实验说明它不是只适用于 FLUX.1-dev。
+
+\subsection{10. 和 ReFL / DRaFT-LV / DRTune 的差别}
+
+论文把 direct-gradient 方法的差别总结成四个维度：是否能更新早期步骤、是否保留 nested gradient、是否构造 leap trajectory、是否能每条轨迹更新多个 step。
+
+\begin{center}
+\resizebox{0.86\linewidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+\textbf{方法} & \textbf{Early Steps} & \textbf{Nested Gradient} & \textbf{Leap Trajectory} & \textbf{Multi-Step}\\
+\midrule
+ReFL & \(\times\) & \(\times\) & \(\times\) & \(\times\)\\
+DRaFT-LV & \(\times\) & \(\times\) & \(\times\) & \(\times\)\\
+DRTune & \(\checkmark\) & \(\times\) & \(\times\) & \(\checkmark\)\\
+LeapAlign & \(\checkmark\) & \(\checkmark\) & \(\checkmark\) & \(\checkmark\)\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{ReFL / DRaFT-LV：} 更偏向 late-step direct optimization，容易改善细节，但难以稳定改早期构图。
+  \item \textbf{DRTune：} 能覆盖早期和多步，但会丢掉 nested gradient，即丢掉一部分 step interaction。
+  \item \textbf{LeapAlign：} 通过 two-step leap 缩短路径，通过 discount 保留但控制 nested gradient，通过 similarity weighting 抑制不可信 leap。
+\end{itemize}
+
+\subsection{11. 和 Flow-GRPO / OP-GRPO / E-GRPO / MaskFocus 的关系}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llll}
+\toprule
+\textbf{方法} & \textbf{路线} & \textbf{核心对象} & \textbf{解决的问题}\\
+\midrule
+Flow-GRPO & policy gradient & SDE transition logprob & Flow ODE 如何变成可做 GRPO 的 policy\\
+OP-GRPO & off-policy GRPO & replay trajectory & 高质量历史轨迹能否安全复用\\
+E-GRPO & entropy-aware GRPO & high-entropy / merged step & 哪些 denoising steps 值得随机探索和更新\\
+MaskFocus & focused GRPO & MGM critical unmasking step & masked generation 哪些 step 值得更新\\
+LeapAlign & direct gradient & two-step leap trajectory & reward gradient 如何稳定传到任意 flow step\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{和 Flow-GRPO：} Flow-GRPO 需要把 ODE 改成 SDE，利用 reward 形成 advantage，再通过 logprob ratio 更新；LeapAlign 不需要 logprob，而是直接反传 reward gradient。
+  \item \textbf{和 OP-GRPO：} OP-GRPO 提高的是 policy-gradient 路线的样本复用效率；LeapAlign 提高的是 direct-gradient 路线的反传可达性和稳定性。
+  \item \textbf{和 E-GRPO：} E-GRPO 通过 entropy-aware step selection 减少无效随机探索；LeapAlign 通过随机 two-step leap 让所有 timestep 都有机会接收 reward gradient。
+  \item \textbf{和 MaskFocus：} 两者都承认 step importance 不均匀，但 MaskFocus 是 masked generation 里选择 critical update steps，LeapAlign 是 flow matching 里构造短反传路径。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{不要混淆：} LeapAlign 不是 ``少采样几步生成图像'' 的 fast sampler。它训练时仍然需要完整 rollout 得到真实 \(x_0\) 和中间 latents；它省的是 reward-gradient 反传路径，而不是 necessarily 省掉 inference / rollout 的全部中间步骤。
+\end{warnbox}
+
+\subsection{12. 我认为它的局限}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{它依赖可微 reward。} 如果 reward 来自黑盒 VLM judge、规则系统、人类反馈或不可微 API，LeapAlign 就不如 GRPO / policy-gradient 路线自然。
+  \item \textbf{仍然需要完整 rollout。} Latent connector 和真实 \(x_0\) reward 都要求先跑出完整采样轨迹，所以它主要减少的是反传成本，不是直接减少采样成本。
+  \item \textbf{leap trajectory 是近似路径。} 如果 \(\hat{x}_{j\mid k}\) 或 \(\hat{x}_{0\mid j}\) 偏离真实轨迹太大，梯度会变得不可靠；trajectory-similarity weighting 只能缓解，不能完全消除这个问题。
+  \item \textbf{超参数仍然敏感。} \(\alpha\)、\(\lambda\)、\(\tau\) 都需要根据 reward、模型和数据重新校准。
+  \item \textbf{reward hacking 仍然存在。} Hinge loss 可以缓和过度优化，但 direct-gradient 对 reward model 的梯度依赖更强，一旦 reward model 有漏洞，模型可能沿着梯度方向更快钻空子。
+\end{enumerate}
+
+\subsection{13. 对我们当前主线的启发}
+
+我觉得 LeapAlign 对前面关于 ``关键 step / 跳步 / credit assignment'' 的讨论有三个启发：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{跳步不一定用于推理加速，也可以用于训练反传加速。} 我们之前担心 ``先找 10 个关键点也要跑完整 50 步''，这个问题在 LeapAlign 里仍然存在；但它说明即使完整 rollout 不省，仍然可以通过短反传路径降低训练显存和稳定性成本。
+  \item \textbf{早期 step 的价值不只是 entropy 高，也在于控制全局结构。} E-GRPO 用 entropy 判断探索价值；LeapAlign 从 direct-gradient 角度说明，能更新早期步骤会更影响 composition。
+  \item \textbf{跨步骤依赖不能简单切断。} Dense / critical step credit 很容易只看单个 step 的贡献，但 LeapAlign 的 nested gradient 提醒我们：早期 step 的作用往往通过后续 step 间接体现。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{我最后会这样概括：} Flow-GRPO 让 flow model 可以做 policy-gradient RL；OP-GRPO 和 E-GRPO 分别提高轨迹复用效率和 timestep 探索效率；LeapAlign 则开辟另一条 direct-gradient 路线，用 two-step leap trajectory 把 reward gradient 稳定送到任意生成步骤，尤其是早期决定构图的步骤。
+\end{summarybox}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文主页：} \href{https://arxiv.org/abs/2604.15311}{LeapAlign: Post-Training Flow Matching Models at Any Generation Step by Building Two-Step Trajectories}。
+  \item \textbf{arXiv HTML：} \href{https://arxiv.org/html/2604.15311v2}{LeapAlign HTML version}，用于核对方法公式、图表、表格和实验结果。
+  \item \textbf{PDF：} \href{https://arxiv.org/pdf/2604.15311}{arXiv PDF}，用于核对论文正文、附录和算法描述。
+  \item \textbf{项目主页：} \href{https://rockeycoss.github.io/leapalign/}{LeapAlign project page}，用于核对项目入口与可视化说明。
+  \item \textbf{代码仓库：} \href{https://github.com/RockeyCoss/LeapAlign_Code}{RockeyCoss/LeapAlign\_Code}，来源于项目主页。
+\end{itemize}

@@ -79,6 +79,7 @@ SigLIP、VAE 可以理解为进 LLM 之前的\textbf{翻译器}（像素 $\leftr
 
 % 依赖宏包：\usepackage{tikz}  \usetikzlibrary{arrows.meta, positioning, fit}
 \begin{center}
+\begin{adjustbox}{max width=\linewidth}
 \begin{tikzpicture}[
   node distance=0.6cm and 1.2cm,
   box/.style={draw, rounded corners, minimum width=3.2cm, minimum height=0.7cm,
@@ -137,6 +138,7 @@ SigLIP、VAE 可以理解为进 LLM 之前的\textbf{翻译器}（像素 $\leftr
 \draw[arr] (o_b.south) -- ++(0,-0.2) -| (out.north);
 
 \end{tikzpicture}
+\end{adjustbox}
 \end{center}
 
 \subsubsection{伪代码}

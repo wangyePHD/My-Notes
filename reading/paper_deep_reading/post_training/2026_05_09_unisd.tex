@@ -1,0 +1,413 @@
+% ============================================================
+% Paper deep reading: UniSD
+% Source: https://arxiv.org/abs/2605.06597
+% ============================================================
+
+\section{论文精读：UniSD}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2605.06597}{UniSD: Towards a Unified Self-Distillation Framework for Large Language Models}\\
+\textbf{作者/机构：} Yiqiao Jin, Yiyang Wang, Lucheng Fu, Haoxin Liu, B.\,A.\,Prakash, Josiah Hester, Srijan Kumar (Georgia Tech)；Yijia Xiao (UCLA)；Yinyi Luo (CMU)；Jindong Wang (William \& Mary)。\\
+\textbf{简称：} UniSD / UniSD$^{*}$。\\
+\textbf{版本：} arXiv 2605.06597v1（2026-05-07）。\\
+\textbf{方向标签：} LLM Self-Distillation、Multi-teacher Agreement、EMA Teacher、Token Contrastive、Feature Matching、Divergence Clipping。\\
+\textbf{阅读日期：} 2026-05-09。\\
+\textbf{阅读口径：} 这篇不是 RL/RLVR 路线，而是 \textbf{无外部更强教师} 的 LLM adaptation 路线——和我已经记的 POPO 同属 ``rollout 侧靠正样本驱动'' 这条思路，但用的是蒸馏机制而不是策略梯度。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+UniSD 的目标是把已有 self-distillation（SD）方法里 \textbf{各自孤立的} 设计选项，整合进同一个目标函数，做一次系统性的因果研究：哪些组件真的有用、它们各自在哪类任务上贡献最大、能否复合叠加。它给出的统一目标（Eq.~1）覆盖三个关注维度：
+
+\[
+\begin{aligned}
+\text{UniSD} &= \underbrace{\text{Multi-teacher Agreement}}_{\text{监督可靠性}}
+              + \underbrace{\text{EMA Teacher}}_{\text{监督稳定性}}\\
+&\quad + \underbrace{\text{Token Contrastive} + \text{Feature Matching}}_{\text{表征对齐}}\\
+&\quad + \underbrace{\text{Divergence Clipping}}_{\text{训练稳定性}}.
+\end{aligned}
+\]
+
+把它们组合成 \key{UniSD$^{*}$} 后，在 Qwen2.5-7B 上比 base 提升 \textbf{+5.4} 总分、比最强 baseline GKD 提升 \textbf{+2.8}，并在三个模型家族（Qwen / Llama / Gemma）的 18 个 model-dataset 配对里 15 个提升、2 个持平、仅 1 个 OOD 退步。
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇的真正价值不在 ``又一个 SD 方法''，而在它把 SD 拆成 \key{监督可靠性 / 表征对齐 / 训练稳定性} 三个维度，并给出每个组件 ``主导哪个任务'' 的定性结论。这是一篇可以直接当 \textbf{设计手册} 用的论文。
+\end{summarybox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{unisd/fig1_overview.png}
+\caption{UniSD 总览（论文 Fig.~1）。把 self-distillation 的设计空间分成 supervision reliability / representation alignment / training stability 三块，对应五个互补组件，最终融合为 UniSD$^{*}$。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 1}。}
+\label{fig:unisd-overview}
+\end{figure}
+
+\subsection{1. 为什么读这篇}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{和当前主线的关系：} 我已记的 POPO 是 ``RLVR 下不显式用负样本''，UniSD 是 ``self-distillation 下不依赖外部更强教师''。两者都属于 ``LLM 后训练里如何在没有完美 supervision 时仍然学出更好策略'' 这个母问题，互为对照。
+  \item \textbf{它可能补上的知识缺口：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item Self-distillation 在自回归 LLM 上为什么 \textbf{容易不稳定}？
+      \item Multi-teacher / EMA / contrastive / feature matching / divergence clipping 这五条 ``各家用过的招'' 在统一 setup 下到底谁有用？
+      \item 各组件的收益是叠加的、互补的、还是会互相抵消？
+    \end{itemize}
+  \item \textbf{我希望读完回答的问题：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item 在哪类任务（生成密集 / 多选 / 工具使用 / 代码）上，哪一个组件是必装项？
+      \item 这个框架能否搬到 \textbf{视觉生成 self-distillation}（FLUX、SD3.5、Flow-matching distillation）？
+    \end{itemize}
+\end{itemize}
+
+\subsection{2. 问题定义与背景}
+
+\textbf{问题：} 给定一个已经 instruction-tuned 的 LLM $\pi_\theta$，没有更强的外部教师，如何 \textbf{用模型自己的轨迹} 进一步提升它在下游任务上的能力？
+
+\textbf{Self-distillation 的核心难点：} 在自回归 LLM 上，自蒸馏面临三个原生问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{自由形式轨迹。} 学生生成的 trajectory 没有 ground truth，正确性需要由任务度量决定；
+  \item \textbf{表面合理 $\ne$ 可靠。} 看起来 plausible 的 rationale 可能仍然提供 ``似是而非'' 的不稳定监督；
+  \item \textbf{孤立设计选择。} 已有 SD 方法（SDFT / GKD / SSD / OPSD 等）各自只调一个轴，没人系统比过。
+\end{enumerate}
+
+\textbf{统一目标（Eq.~1）：} UniSD 把所有 SD 变体都框进同一个 token 级散度损失：
+
+\[
+\mathcal{L} =
+\mathbb{E}_x\,\mathbb{E}_{y\sim\pi_\theta(\cdot\mid x)}\Bigg[
+\sum_{t=1}^{T}
+\underbrace{m_t}_{\text{token mask}}\,
+\underbrace{w_t}_{\text{reliability}}\,
+D\!\bigl(\pi_\theta(\cdot\mid x,\hat y_{<t})\,\big\|\,\pi_*^{T}(\cdot\mid x,c,\hat y_{<t})\bigr)
++\lambda_{\text{aux}}\mathcal{L}_{\text{aux}}
+\Bigg].
+\]
+
+不同 SD 方法的差异，本质上就是 ``如何选 $w_t$ / 怎么定 $\pi_*^{T}$ / 加什么 $\mathcal{L}_{\text{aux}}$''。这一步框架化是这篇论文最重要的贡献。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{unisd/fig2_components.png}
+\caption{UniSD 五大组件结构图（论文 Fig.~2）。左侧：multi-teacher agreement 通过多个辅助上下文 $c^k$ 给同一个学生 token 打分，统计 $\delta_t$ 当 reliability weight；中部：EMA teacher 给主蒸馏一个慢慢漂移的稳定目标分布；右侧：token-level contrastive、feature matching、divergence clipping 分别从对比学习、表征对齐和训练稳定性角度补充。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 2}。}
+\label{fig:unisd-components}
+\end{figure}
+
+\subsection{3. 方法拆解：五个组件}
+
+\subsubsection{3.1 Multi-Teacher Agreement（监督可靠性）}
+
+\textbf{思路：} 同一个学生轨迹，让 \key{同一个教师在 $K$ 个不同上下文 $c^k$ 下} 各打一次分；上下文之间分歧大的 token 不可靠，分歧小的 token 才是可靠监督。
+
+每个上下文给 token-level log-prob（Eq.~2）：
+
+\[
+\ell_t^{k} = \log \pi_k^{T}(\hat y_t\mid x, c^k, \hat y_{<t}),\quad t\in[1,T].
+\]
+
+两种聚合方式：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Token 级（局部）}：$\delta_t=A(\{\ell_t^{k}\}_k)$，其中 $A$ 是变异度统计量（方差 / 极差）；用 $\delta_t$ 反向作为 $w_t$。
+  \item \textbf{Sequence 级（全局）}：$L^{k}=\sum_t m_t\ell_t^{k}/\sum_t m_t$，再做 $\delta_{\text{seq}}=A(\{L^k\}_k)$。
+\end{itemize}
+
+\textbf{三种辅助上下文 $c^k$：}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item retrieval-based few-shot（检索式）；
+  \item random few-shot（随机式）；
+  \item instruction induction（从 train set 归纳出的高层指令）。
+\end{enumerate}
+
+\begin{warnbox}
+\textbf{为什么不直接训多个教师？} 一是成本，二是发散方向不可控。Multi-teacher agreement 的妙处在于 \key{只用同一个模型，但用上下文制造 diversity}，相当于 ``低成本 ensemble of views''。
+\end{warnbox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\linewidth]{unisd/fig4_agree_views.png}
+\caption{Token-level Agreement 在三种辅助上下文构造下的对比（论文 Fig.~4）：retrieval-based、random few-shot、instruction induction。可以看到不同任务偏好的 view 不一样：ScienceQA / GPQA / HumanEval 偏 retrieval，ToolAlpaca 偏 induction。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 4}。}
+\label{fig:unisd-agree-views}
+\end{figure}
+
+\subsubsection{3.2 EMA Teacher Stabilization（监督稳定性）}
+
+学生模型自己做教师时，最大的风险是 ``教师的 distribution 跟着学生一起漂''——一旦学生进入 mode collapse，教师也跟着塌缩。EMA 给一个慢动量的稳定锚（Eq.~3）：
+
+\[
+\bar\theta_n = \beta\,\bar\theta_{n-1} + (1-\beta)\,\theta_n,\qquad \beta\in[0,1].
+\]
+
+教师分布换成 $\pi_{\bar\theta_n}(\cdot\mid x,c^*,\hat y_{<t})$。这个机制和 BYOL / POPO 的 EMA target 是同一族思想——\key{训练时所引用的目标，应该比当前 online 模型更慢变}。
+
+\subsubsection{3.3 Token-Level Contrastive Learning（表征对齐 I）}
+
+构造负样本 $y^-$ 三种方式：让 LLM 自己生成 ``似是而非'' 的错误版、破坏 $y^+$ 中的 reasoning、用 WordNet/PPDB/TextAttack 词级扰动。
+
+打三个分（Eq.~4）：
+
+\[
+\ell_t^\theta = \log\pi_\theta(\hat y_t\mid x,\hat y_{<t}),\;
+\ell_t^{+}=\log\pi^{T}(\hat y_t\mid x,y^{+},\hat y_{<t}),\;
+\ell_t^{-}=\log\pi^{T}(\hat y_t\mid x,y^{-},\hat y_{<t}).
+\]
+
+Margin loss（Eq.~5）：
+
+\[
+\mathcal{L}_{\text{aux}}(\theta;x,y,c) =
+\sum_{t=1}^{T}m_t\,\max\!\bigl(0,\;\gamma + d_t^{+} - d_t^{-}\bigr),
+\quad d_t^{\pm}=|\ell_t^\theta-\ell_t^{\pm}|.
+\]
+
+要求 $\pi_\theta$ 对 token 的打分 \key{靠近正条件下教师的打分，远离负条件下教师的打分}，余量 $\gamma$。
+
+\subsubsection{3.4 Feature Matching（表征对齐 II）}
+
+直接对齐 hidden state（Eq.~6）：
+
+\[
+\mathcal{L}_{\text{feat}}
+= \sum_{t=1}^{T}m_t \,\|\mathbf{f}_t^\theta - \mathbf{f}_t^{*}\|_2^{2}.
+\]
+
+实现里默认对齐 \key{completion tokens 上的最后一层 hidden states}。可选对象还包括 layer-wise 表征、self-attention 关系、attention-derived features。
+
+\subsubsection{3.5 Divergence Clipping（训练稳定性）}
+
+把 forward-KL 换成加权 JSD（Eqs.~7--8）：
+
+\[
+\mathcal{D}_t^{(\alpha)} = \alpha\,D(\pi_*^{T}\|M_t)+(1-\alpha)\,D(\pi_\theta\|M_t),
+\quad
+M_t=(1-\alpha)\pi_\theta+\alpha\pi_*^{T}.
+\]
+
+再硬裁剪：$\widetilde{\mathcal{D}}_t = \min(\mathcal{D}_t^{(\alpha)},\kappa)$，最终蒸馏目标 (Eq.~9):
+
+\[
+\mathcal{L}_{\text{clip}}
+= \frac{\sum_{t=1}^{T}m_t w_t \widetilde{\mathcal{D}}_t}{\sum_{t=1}^{T}m_t w_t}.
+\]
+
+\begin{intubox}
+\textbf{直觉：} 学生分布偏离教师分布过远的 token，是 ``超大 gradient + 极不可靠 supervision'' 的源头；clipping 不是在限制学习信号，而是在 \key{限制单 token 的最大破坏力}，这一招在 GRPO/PPO 的 ratio clipping 里也是同源思想。
+\end{intubox}
+
+\subsubsection{\texorpdfstring{3.6 完整算法 UniSD$^{*}$}{3.6 完整算法 UniSD*}}
+
+把以上 5 个组件全开：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 用学生 $\pi_\theta$ 采样轨迹 $\hat y$；
+  \item 同一个 frozen 教师在 $K$ 个上下文下打分，得 $w_t$；
+  \item 主蒸馏 loss：相对 \textbf{EMA teacher} 的 clipped JSD；
+  \item 辅助 loss：token contrastive margin + feature matching；
+  \item 总 loss = 主项 $+$ $\lambda_{\text{aux}}$($\mathcal{L}_{\text{contrast}}+\mathcal{L}_{\text{feat}}$)；
+  \item 每步更新后做 EMA $\bar\theta\leftarrow\beta\bar\theta+(1-\beta)\theta$。
+\end{enumerate}
+
+\subsection{4. 实验与证据}
+
+\subsubsection{4.1 设置}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{六个基准（4 类任务）：} ScienceQA / GPQA（科学推理；GPQA test-only 做 OOD）、CoS-E（常识）、MBPP / HumanEval（代码；HumanEval 做 OOD）、ToolAlpaca（工具使用）。
+  \item \textbf{六个模型 / 三家族：} Qwen2.5-Instruct 0.5B / 1.5B / 3B / 7B；Llama-3.1-8B-Instruct；gemma-3-4b-it。主表用 Qwen2.5-7B。
+  \item \textbf{训练：} LoRA rank=64, $\alpha=128$, dropout=0.05；AdamW, lr=2e-5, cosine, 10\% warmup, 1 epoch；bf16；grad accum=4；vLLM colocate sample, $\tau=0.7$；max prompt/completion 3072/1024；6$\times$A100 80GB。
+  \item \textbf{评测：} 代码 pass@1（沙盒，10s 超时）；多选 accuracy；ToolAlpaca 完整 accuracy（动作名 + 全部参数 exact match）；解码贪心。
+\end{itemize}
+
+\subsubsection{4.2 主表（Qwen2.5-7B，Table~1）}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{方法} & \textbf{ScienceQA} & \textbf{MBPP} & \textbf{CoS-E} & \textbf{ToolAlpaca} & \textbf{GPQA(OOD)} & \textbf{HumanEval(OOD)} & \textbf{Avg.}\\
+\midrule
+Raw            & 81.5 & 70.8 & 81.9 & 61.8 & 31.0 & 80.5 & 67.9\\
+SFT            & 80.8 & 70.4 & 82.6 & 66.2 & 30.6 & 79.3 & 68.3\\
+SDFT           & 81.6 & 71.6 & 81.2 & 73.5 & 34.2 & 78.7 & 70.1\\
+GKD            & 81.2 & 72.8 & 81.8 & 72.1 & 33.0 & 82.3 & 70.5\\
+SSD            & 80.8 & 72.4 & 79.9 & 55.9 & 33.7 & 81.1 & 67.3\\
+OPSD           & 81.2 & 72.8 & 82.0 & 61.8 & 31.5 & 79.9 & 68.2\\
+\midrule
+Agree (Tok.)   & \textbf{85.2} & 71.2 & \textbf{82.2} & 75.0 & 36.2 & \textbf{83.5} & 72.2\\
+Agree (Seq.)   & 84.4 & 73.2 & 81.9 & 76.5 & 35.7 & \textbf{83.5} & 72.5\\
+EMA            & 84.3 & 73.2 & 81.4 & \textbf{77.9} & 35.3 & 82.9 & 72.5\\
+Contrast       & 83.9 & 73.5 & 82.0 & 75.0 & 34.6 & 82.3 & 71.9\\
+Match (Joint)  & 84.8 & 73.2 & 81.8 & 76.5 & 33.5 & 82.9 & 72.1\\
+Match (Repr.)  & 83.7 & 73.2 & 81.7 & 72.1 & 35.9 & 82.3 & 71.5\\
+Clip           & 82.8 & 73.2 & 81.7 & 70.6 & 31.5 & 81.7 & 70.3\\
+\midrule
+\textbf{UniSD$^{*}$} & 85.0 & \textbf{74.7} & \textbf{82.2} & \textbf{77.9} & \textbf{36.4} & \textbf{83.5} & \textbf{73.3}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\textbf{核心数字：} UniSD$^{*}$ 比 Raw +5.4，比最强 baseline GKD +2.8；并且 \key{在所有 6 个 benchmark 上都不比当前最佳的单组件版本差}。
+
+\subsubsection{4.3 跨家族泛化（Fig.~7 / Fig.~12）}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Qwen2.5-7B：+5.4；Llama-3.1-8B：+3.1；Gemma-3-4B：+2.2。
+  \item 18 个 model-dataset 配对里，\textbf{15 提升 / 2 持平 / 1 OOD 退步}。
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{unisd/fig7_three_families.png}
+\caption{三个家族（Qwen2.5 / Llama-3.1 / Gemma-3）下 UniSD$^{*}$ 相对各自 Raw 的提升（论文 Fig.~7）。Qwen 提升最大（+5.4），Gemma 最小（+2.2）；尺寸更大的模型反而提升更多，符合 ``更强 base 更能消化自蒸馏信号'' 的直觉。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 7}。}
+\label{fig:unisd-three-families}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{unisd/fig12_per_dataset_gain.png}
+\caption{UniSD 各变体相对 Raw Qwen2.5-7B 的逐数据集提升（论文 Fig.~12）。可以看到 \key{ToolAlpaca 是受益最大的任务（EMA 单独就 +16.1）}，而代码 OOD（HumanEval）则是几乎所有变体都能稳定 +2$\sim$+3 的任务；CoS-E 几乎无提升空间。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 12}。}
+\label{fig:unisd-per-dataset-gain}
+\end{figure}
+
+\subsubsection{4.4 Scaling 与 retention（Fig.~3）}
+
+\begin{figure}[htbp]
+\centering
+\begin{minipage}{0.62\linewidth}
+\centering
+\includegraphics[width=\linewidth]{unisd/fig3a_scaling.png}
+\end{minipage}\hfill
+\begin{minipage}{0.34\linewidth}
+\centering
+\includegraphics[width=\linewidth]{unisd/fig3b_retention.png}
+\end{minipage}
+\caption{论文 Fig.~3。左：Qwen2.5 在 0.5B/1.5B/3B/7B 四个尺寸下，UniSD 在 ScienceQA 与 GPQA(OOD) 上一致提升，且尺寸越大相对收益越大。右：base-distribution retention perplexity；UniSD$^{*}$ 比 SFT 更接近原始 base 分布（PPL 退化更小），证明它没有把 base 知识冲掉。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 3}。}
+\label{fig:unisd-scaling-retention}
+\end{figure}
+
+\subsubsection{4.5 训练时间 / 损失曲线（Fig.~5）}
+
+\begin{figure}[htbp]
+\centering
+\begin{minipage}{0.32\linewidth}
+\centering
+\includegraphics[width=\linewidth]{unisd/fig5a_train_time.png}\\
+{\footnotesize (a) 训练时间 vs 准确率}
+\end{minipage}\hfill
+\begin{minipage}{0.32\linewidth}
+\centering
+\includegraphics[width=\linewidth]{unisd/fig5b_components_eff.png}\\
+{\footnotesize (b) 组件有效性}
+\end{minipage}\hfill
+\begin{minipage}{0.32\linewidth}
+\centering
+\includegraphics[width=\linewidth]{unisd/fig5c_loss_curve.png}\\
+{\footnotesize (c) 训练 loss 曲线}
+\end{minipage}
+\caption{论文 Fig.~5（三联）。(a) 显示 UniSD$^{*}$ 用相近训练时间换更高准确率；(b) 各组件单独的有效性；(c) UniSD$^{*}$ 的训练 loss 比单组件方案更平滑稳定，说明 EMA + clipping 的稳定化机制确实生效。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 5}。}
+\label{fig:unisd-fig5}
+\end{figure}
+
+\subsubsection{4.6 分布保留（Fig.~6 / Table~5）}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item EMA Teacher 比 SFT 让 retention PPL 降 \textbf{33.9\%}；
+  \item UniSD$^{*}$ 的 token-level JSD 比 SFT 低（0.041 vs 0.054），\key{70.3\% 的样本上更接近 base 分布}。
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{unisd/fig6_jsd_distribution.png}
+\caption{Base-scored perplexity 与 token-level JSD 分布（论文 Fig.~6）。UniSD$^{*}$ 的分布更靠近 base，说明它在 ``学新任务'' 与 ``不冲掉原有能力'' 之间取得了更好平衡。图源：\href{https://arxiv.org/html/2605.06597v1}{arXiv HTML Figure 6}。}
+\label{fig:unisd-jsd}
+\end{figure}
+
+\subsubsection{4.7 各组件 ``主导哪个任务''}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lll}
+\toprule
+\textbf{组件} & \textbf{主导/最佳任务} & \textbf{机理}\\
+\midrule
+Agree (Tok.)   & ScienceQA / HumanEval / CoS-E & 局部可靠性，峰值最强\\
+Agree (Seq.)   & 总分稳健 (72.5)              & 全局保守、噪声更小\\
+EMA            & ToolAlpaca (+16.1) / MBPP / HumanEval & 生成密集 / 格式严格任务最受益\\
+Contrast       & 6 项均提升（最均衡）         & 区分 plausible-but-wrong\\
+Match (Joint)  & 优于单 representation        & 输出 + 隐状态联合\\
+Match (Repr.)  & 辅助正则                     & 单独使用收益有限\\
+Clip           & 最轻量稳定器（+2.4）          & 防极端 token 破坏\\
+\textbf{UniSD$^{*}$} & MBPP/ToolAlpaca/GPQA/HumanEval 最佳；ScienceQA/CoS-E 第二 & 最一致提升\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{这张表是这篇论文最值钱的输出。} 它意味着：
+\begin{itemize}[leftmargin=1.5em]
+  \item 工具使用 / 代码 / 严格格式任务 → \textbf{先开 EMA}；
+  \item 多选 / 推理 → \textbf{先开 Agree (Tok.)} 配 retrieval 上下文；
+  \item 怕 mode collapse → \textbf{先加 Clip}；
+  \item 想要进一步 +1 个点 → \textbf{加 Contrast 或 Joint Match}。
+\end{itemize}
+这张组件--任务对应表可以直接当工程 checklist 用。
+\end{summarybox}
+
+\subsection{5. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{超参未给具体值。} 论文没明确给出 $\lambda_{\text{aux}}$、$\beta$、$\alpha$、$\kappa$、$\gamma$ 的实际数值，复现需要照 Appendix A 的 Algorithm 1 反推或自调；
+  \item \textbf{Agreement 对上下文构造敏感。} retrieval 在 ScienceQA/GPQA/HumanEval 最强，induction 在 ToolAlpaca 最强——\key{需要按任务挑 view，没有一招通用}；
+  \item \textbf{Match (Repr.) 单独不够。} 仅对齐最后一层 hidden 收益有限，要和 contrastive 一起用才划算；
+  \item \textbf{Gemma-3 上提升明显较小（+2.2）。} 论文没深入解释，可能跟 instruction-tuning 风格 / token izer / 模型容量都有关；
+  \item \textbf{只测了相对小规模数据集。} 训练样本 100$\sim$12K 这一档次；当训练数据扩到 100K+ 时，retention 优势是否会被 ``更长训练'' 抵消还未知；
+  \item \textbf{没和 RL/RLVR 路线直接比。} 这篇刻意避开了 RL，所以无法回答 ``UniSD vs.\ POPO / RLVR'' 谁更好。
+\end{itemize}
+
+\subsection{6. 与已有工作的关系}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{直接前作（baseline）：} SFT、SDFT、GKD、SSD、OPSD。UniSD 把它们都放进 Eq.~1 的统一框架里做对照实验；
+  \item \textbf{相近思想：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item \textbf{POPO：} 同样依赖 ``EMA / Siamese 锚 + 表征对齐 + 不显式负样本''，但走的是 RLVR 路线；UniSD 是蒸馏路线下的对偶版本；
+      \item \textbf{BYOL / SimSiam：} EMA target + 不对称 predictor 是这套组件的祖师爷；
+      \item \textbf{Contrastive Decoding / DoLa：} 这些走的是 inference-time，UniSD 把对比信号搬到 training-time。
+    \end{itemize}
+  \item \textbf{真正差异：} UniSD 是第一篇 \key{在统一 token-level 散度损失下} 系统比较所有 SD 组件、并给出 ``组件--任务'' 对应表的工作；它的贡献更像 ``benchmark + design guideline'' 而不是 ``又一个新方法''。
+\end{itemize}
+
+\subsection{7. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{可复用 idea 1（Multi-view agreement 替代 multi-teacher ensemble）：} 用同一个模型 + 多种上下文制造 diversity，作为可靠性权重——这套做法可以直接搬到 \textbf{视觉生成 self-distillation}（用不同 prompt rewriting / 不同 CFG scale 当 view）；
+  \item \textbf{可复用 idea 2（EMA teacher 防 mode collapse）：} 任何 ``学生即教师'' 的设置都可以加，\textbf{尤其在 ToolAlpaca 这种格式严格任务上 EMA 单独就 +16.1}，这是非常便宜的工程 trick；
+  \item \textbf{可复用 idea 3（divergence clipping）：} 把 token 级 KL 换成 clipped JSD，几乎是 ``一个 if 语句'' 的代价但能稳定训练；这一招完全可以加进 \key{Flow-GRPO / DGPO / POPO} 的实现里；
+  \item \textbf{可复用实验设计：} ``一张组件--任务热力图'' 的展示方式，直接当模板用；
+  \item \textbf{值得追的 follow-up：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item UniSD $\times$ Flow-Matching distillation（把它的五件套搬到 SD3.5 / FLUX 蒸馏）；
+      \item UniSD $\times$ POPO（蒸馏 + 隐式负梯度叠加）；
+      \item UniSD 在 100K+ 训练样本规模下的扩展行为。
+    \end{itemize}
+\end{itemize}
+
+\subsection{8. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Eq.~1 里 $w_t$ 由 agreement 直接给出，但没有保证 $\sum w_t$ 在不同 batch 间稳定——是否做了 batch normalization？
+  \item Token contrastive 的负样本 $y^-$ 通过 LLM 自己生成 / WordNet 扰动构造，\textbf{论文没给负样本质量校验}，这部分是否对结果敏感？
+  \item EMA teacher 的 $\beta$ 在 1 epoch 训练里大小如何取？$\beta$ 太大 EMA 跟不上，太小又失去稳定作用；
+  \item Gemma-3 上提升明显较小，这是 base 模型问题、tokenizer 问题，还是 retrieval-view 在 Gemma 上覆盖不够？
+  \item UniSD$^{*}$ 是否会在 100K 训练样本规模下退化成 ``重新发现 SFT''？这是 self-distillation 类方法的共性疑问。
+\end{itemize}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文主页：} \href{https://arxiv.org/abs/2605.06597}{UniSD: Towards a Unified Self-Distillation Framework for Large Language Models}。
+  \item \textbf{arXiv HTML：} \href{https://arxiv.org/html/2605.06597v1}{arXiv HTML version}（全部公式 Eq.~1--9、Table~1、Fig.~1--12 均来自此版本）。
+  \item \textbf{对照阅读：} POPO（RLVR 下不显式用负样本）；BYOL / SimSiam（EMA target + 不对称 predictor 的祖师爷）；GKD / SDFT / SSD / OPSD（被它统一进 Eq.~1 的所有 SD 前作）。
+\end{itemize}

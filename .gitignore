@@ -2,6 +2,7 @@
 
 # Local assistant/editor settings
 .claude/
+.vscode/
 
 # Python
 __pycache__/

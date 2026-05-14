@@ -1,0 +1,422 @@
+% ============================================================
+% Paper deep reading: Qwen-Image-2.0
+% Source: https://arxiv.org/abs/2605.10730
+% ============================================================
+
+\section{论文精读：Qwen-Image-2.0}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2605.10730}{Qwen-Image-2.0 Technical Report}\\
+\textbf{机构：} 阿里巴巴 Qwen 团队（75 位作者；含 Junyang Lin / Jingren Zhou / An Yang / Dayiheng Liu / Shuai Bai 等）。\\
+\textbf{简称：} Qwen-Image-2.0；蒸馏版 Qwen-Image-2.0-Distillation；RL 版 Qwen-Image-2.0-RL。\\
+\textbf{版本：} arXiv 2605.10730v1（2026-05-11，PDF 45MB）。\\
+\textbf{方向标签：} T2I + Image Editing 统一模型、MMDiT、高压缩 VAE、Qwen3-VL 条件编码、超长文本渲染、多语言排版、2K 原生分辨率、多阶段训练、GRPO RLHF、DMD 蒸馏。\\
+\textbf{阅读日期：} 2026-05-12。\\
+\textbf{阅读口径：} 这篇是\textbf{基础模型技术报告}风格——不去强调单点 SOTA，而是呈现一整套从数据策展到训练管线再到 RL/蒸馏部署的工业级配方。我按你要求的三视角（数据 / 模型 / 训练）来组织本笔记。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+Qwen-Image-2.0 把 ``T2I 生成 + 指令式编辑'' 在 \textbf{同一个 MMDiT} 里 unify 起来，并用三件事把生产可用度拉满：
+
+\[
+\begin{aligned}
+\text{Qwen-Image-2.0}
+&= \text{Qwen3-VL（冻结）作 condition encoder}\\
+&\quad + \text{f16c64 高压缩 VAE（残差 AE + VA-VAE 语义对齐）}\\
+&\quad + \text{MMDiT 主干（MSRoPE / 纯乘性 modulation / SwiGLU）}\\
+&\quad + \text{多阶段渐进训练（256$\rightarrow$2048p）+ GRPO RLHF + DMD 4-NFE 蒸馏}\\
+&\quad + \text{Closed-loop Data Flywheel（错误归因到 RL/数据/PE 三条 track）}.
+\end{aligned}
+\]
+
+LMArena 上 ELO=1168，全球 \#9、中文模型 \#1，超过 NanoBanana。但更值得记的是它的 \key{工程范式}——不是公式上的 novelty，而是 ``如何把一个统一图像基础模型从零做到生产可用'' 的完整 playbook。
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇值得当 \textbf{基础设施手册} 读。它的每个组件单独看都有学术对应物（VA-VAE、MMDiT、MSRoPE、GRPO、DMD），但把它们全部串起来并给出 ``哪一阶段用什么数据、配什么超参、什么时候做 RL''，正是技术报告这种文体最稀缺的输出。
+\end{summarybox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\linewidth]{qwen_image2/fig1_lmarena_dimension_elo.jpg}
+\caption{LMArena 在 8 个能力维度上的 ELO（论文 Fig.~1）。Qwen-Image-2.0 相对前代 Qwen-Image-2512 在 product / 3D / cartoon / photorealism / art / portraits / text rendering 全部维度都有 50$\sim$110 ELO 的提升，其中 \key{photorealism (+103)} 与 \key{portraits (+83)} 提升最大。图源：arXiv 2605.10730 Figure 1。}
+\label{fig:qi2-elo}
+\end{figure}
+
+\subsection{1. 数据侧（Data）}
+
+\subsubsection{1.1 数据收集：T2I + TI2I 双轨}
+
+数据构造遵循三条原则：\textbf{广覆盖} / \textbf{强指令质量} / \textbf{强 source-target 一致性}。
+
+\paragraph{T2I 数据。} 覆盖真实摄影、平面设计、艺术内容、合成图像；保留长尾概念与多样场景；额外引入 \key{slides / posters / 渲染资产} 这类 ``排版敏感、文本密集'' 的内容来支持视觉文本生成。
+
+\paragraph{TI2I 数据（编辑）。} 分为两块：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{单图编辑：} attribute 修改 / 背景替换 / 风格迁移 / 文字编辑 / 图像修复 / structure-aware 操作。
+  \item \textbf{多图编辑：} reference-based 生成、跨图主体一致性、跨图风格迁移、组合合并。
+\end{itemize}
+
+\subsubsection{1.2 标注：四类 caption 互补}
+
+为不同类型图像设计了 \key{四套不同 captioning 模板}，这是这篇论文里非常工程化但很值钱的设计：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lll}
+\toprule
+\textbf{Caption 类型} & \textbf{适用图像} & \textbf{重点强调}\\
+\midrule
+General      & 任意分辨率/复杂度    & 主体、场景、空间关系；同时支持多语言 + 多长度\\
+Text         & slides / 漫画 / 海报 / 教育材料 & dense 文字内容、版面结构、视觉符号、语义关系\\
+Knowledge    & 需注入背景知识的图像 & 把图像无关的世界知识注入 caption（隐含 condition）\\
+Structured   & 关系图 / 流程图 / diagram & 显式建模实体--属性--关系的结构化描述\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{为什么要分四套：} 单一 caption 模板会让 ``slides 的版面结构'' 和 ``自然图像的语义对齐'' 在同一损失下被平均化。这个设计直接把 \key{caption 模板分桶} 当成一种 prior，是它能把超长文本渲染做对的前提之一。
+\end{warnbox}
+
+\subsubsection{1.3 多阶段数据策略：6 个 filter stage}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\linewidth,height=0.42\textheight,keepaspectratio]{qwen_image2/fig6_data_pipeline.jpg}
+\caption{Qwen-Image-2.0 数据处理 pipeline（论文 Fig.~6）。S1$\sim$S6 沿 \key{从低分辨率到高分辨率} + \key{从粗过滤到细过滤} 两条轴递进；每阶段加入新过滤器（aesthetics / image quality / compression quality）和新数据来源（edit data / synthetic data）。图源：arXiv 2605.10730 Figure 6。}
+\label{fig:qi2-data-pipeline}
+\end{figure}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Stage 1（256p T2I 预训练）} 八个串行过滤器：Broken Files / Resolution / Deduplication / NSFW / Rotation / Entropy / CLIP / Token Length。
+  \item \textbf{Stage 2（256p T2I + TI2I）} 引入 edit data，开始统一训练 T2I + 编辑。
+  \item \textbf{Stage 3（512p）} 引入 synthetic data，提升分布多样性。
+  \item \textbf{Stage 4（512p / 1024p）} 加入 \key{Image Quality / Aesthetic / Compression Quality} 三个新 filter，确保高分辨率训练样本质量。
+  \item \textbf{Stage 5（512p / 1024p / 2048p）} 引入专门的 2048p Resolution Filter。
+  \item \textbf{Stage 6（SFT）} 复用前几阶段的 filter 但 \key{用更严格阈值}，做高分辨率高质量数据的 ``distribution filter''。
+\end{itemize}
+
+\subsubsection{1.4 Closed-loop Data Flywheel}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.9\linewidth,height=0.45\textheight,keepaspectratio]{qwen_image2/fig7_data_flywheel.jpg}
+\caption{Qwen-Image-2.0 的闭环数据飞轮（论文 Fig.~7）。把失败案例按 \key{错误归因} 路由到三条 track，每条 track 有完全不同的修复手段。图源：arXiv 2605.10730 Figure 7。}
+\label{fig:qi2-flywheel}
+\end{figure}
+
+\textbf{三阶段飞轮：}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{多源信号收集：} 模型自评 + 主动 bad case mining + 真实用户反馈。
+  \item \textbf{Case Routing \& Targeted Optimization}（最关键）：把每个 bad case 路由到三条 track 之一：
+    \begin{itemize}[leftmargin=1.5em]
+      \item \textbf{RL track：} 模型本来 ``知道但没对齐''——通过 reward / policy 调整解决。
+      \item \textbf{Pre-training track：} 模型 ``根本没见过''——通过 vector retrieval engine 从外部 corpus 中检索 / 增广相似样本，再人工 review 后入库。
+      \item \textbf{PE track：} 模型 ``有能力但 prompt 没说清楚''——通过 prompt enhancer 重写解决。
+    \end{itemize}
+  \item \textbf{Model Update：} 聚合三条 track 的策略 / 数据 / 参数更新，启动下一轮训练，新 checkpoint 回到 Stage 1。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{这个错误归因机制是这篇技术报告里最值得抄作业的设计。} 它把一个 case 的失败映射到三种完全不同的修复手段，避免了 ``凡是 bad case 就堆数据'' 的低效。我会在自己的训练管道里直接照搬这个三 track 路由结构。
+\end{intubox}
+
+\subsection{2. 模型侧（Model）}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth,height=0.45\textheight,keepaspectratio]{qwen_image2/fig8_architecture.jpg}
+\caption{Qwen-Image-2.0 整体架构（论文 Fig.~8）。冻结的 Qwen3-VL 提取 \key{多模态条件特征}（同时编码 system prompt、参考图、用户 prompt），VAE encoder 把图像 token 化成 latent；二者经过 projection 后拼接成统一 token 流送入 $L$ 层 MMDiT block。图源：arXiv 2605.10730 Figure 8。}
+\label{fig:qi2-arch}
+\end{figure}
+
+\subsubsection{2.1 三大组件}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{MLLM Condition Encoder：} \key{冻结的 Qwen3-VL}，承担 system prompt + 用户 prompt + 参考图三方理解。
+  \item \textbf{VAE：} f16c64 高压缩 VAE（见 §2.2）。
+  \item \textbf{MMDiT 主干：} text token + image latent 共享同一 transformer，做 joint condition-target denoising。
+\end{enumerate}
+
+输入构造（Eq.~1）：
+
+\[
+h = \mathrm{Concat}\bigl(E_x,\ h_y\bigr),
+\]
+
+其中 $E_x$ 是 VAE encoder 给的图像 latent（替换原本的 Qwen3-VL 视觉表征 $h_x$），$h_y$ 是 Qwen3-VL 给的文本表征。
+
+\subsubsection{2.2 VAE：f16c64 + 残差 AE + 语义对齐损失}
+
+\textbf{压缩比：} 16$\times$ 空间下采样（多数开源 VAE 是 8$\times$）；同时把 latent 通道扩到 \key{64}，使得总 ``通道 bottleneck'' 等价于 f8c16，但生 token 长度只剩 1/4 → DiT 训练直接快 4$\times$。
+
+\textbf{三件事缓解 ``高压缩 VAE 三难权衡''}（compression vs reconstruction vs diffusability）：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{残差 AE} (Chen et al., 2025)：非参数 shortcut 保细节；
+  \item \textbf{大规模文本图像专项语料}（PDF / slides / posters，含 alphabetic + logographic 双系）；
+  \item \textbf{语义对齐损失}（仿 VA-VAE）：把 latent 对齐到一个语义表征空间。这一项是 \key{动态调度} 的——早期约束强（保证 diffusability），后期放松（保证 reconstruction），论文亲测有效。
+\end{itemize}
+
+\textbf{抛掉的：} adversarial loss——他们和 Qwen-Image v1 一样，发现大规模 VAE 训练里 GAN loss \key{基本冗余} 还会破坏稳定性，直接去掉。
+
+\textbf{重建质量}（Table~1）：
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llcccc}
+\toprule
+\textbf{模型} & \textbf{Setting} & \textbf{ImageNet PSNR} & \textbf{ImageNet SSIM} & \textbf{Text PSNR} & \textbf{Text SSIM}\\
+\midrule
+SD-3.5         & f8c16  & 31.22 & 0.8839 & 29.93 & 0.9658\\
+FLUX.1-dev     & f8c16  & 32.84 & 0.9155 & 32.65 & 0.9792\\
+Qwen-Image (v1)& f8c16  & 33.42 & 0.9159 & 36.63 & 0.9839\\
+HunyuanImage-3 & f16c32 & 31.08 & 0.8655 & 29.23 & 0.9521\\
+Wan2.2         & f16c48 & 31.30 & 0.8784 & 28.19 & 0.9508\\
+Stepvideo-T2V  & f16c64 & 31.54 & 0.8973 & 29.62 & 0.9641\\
+\textbf{Qwen-Image-2.0} & \textbf{f16c64} & \textbf{33.42} & \textbf{0.9225} & 32.81 & 0.9795\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{这一行才是关键：} 在 16$\times$ 高压缩档位下，Qwen-Image-2.0-VAE 的 ImageNet PSNR/SSIM 反超所有 8$\times$ baseline，唯一例外是 ``超细文本'' 上略输前代 v1 的 f8c16；说明高压缩 VAE 的难点 \key{已经被攻克}，DiT 可以放心用 4$\times$ 短的 latent。
+\end{summarybox}
+
+\subsubsection{2.3 MMDiT 关键设计}
+
+\paragraph{MSRoPE 跨模态位置编码。} 直接复用 Qwen-Image v1 的 MSRoPE，使文本 token 和图像 latent 共享一个统一的位置编码空间。
+
+\paragraph{纯乘性 modulation。} 把传统 affine modulation $h'=\alpha h + \beta$ 简化为（Eq.~2）：
+
+\[
+h' = \alpha h.
+\]
+
+\textbf{丢掉了 bias 项。} 论文没解释具体动机但给出现象：bias-free 形式在大规模 joint text-image 训练下更稳。
+
+\paragraph{SwiGLU 替代标准 MLP。} 论文观察到 joint text-image 训练会导致 ``activation magnitude 异常大 → premature neuron saturation''；引入 SwiGLU（Eq.~3）：
+
+\[
+h = \Phi_1(x)\otimes\sigma\bigl(\Phi_2(x)\bigr).
+\]
+
+\paragraph{QK-Norm = RMSNorm。} attention 内部的 Q/K 用 RMSNorm 而非 LayerNorm，其它 norm 仍用 LayerNorm。
+
+\subsubsection{2.4 Prompt Enhancer（PE）}
+
+PE 是一个 \key{独立的 9B 重写模型}（从 Qwen3.5-9B 初始化），不是主图像模型一部分，但被嵌进推理 pipeline 和 Data Flywheel 的 PE track。
+
+\paragraph{数据构造：reverse engineering。} 从 fine-grained 标注 $P_{\text{fine}}$ 出发，先用 LLM 分类成 General / Portrait / Text / Complex Text 四类；按类别从 strategy pool 采样 ``退化策略'' $S$（stylistic simplification、colloquialization、underspecification 等），生成 colloquial 退化版 $P_{\text{short}}$；同时把 ``退化的逆过程'' 当作 \key{Chain-of-Thought} 监督信号。最终训练样本是 $(P_{\text{short}},\,\text{CoT},\,P_{\text{fine}})$ 三元组。
+
+\paragraph{训练：SFT $\rightarrow$ GRPO。}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item SFT：$P_{\text{short}}\rightarrow P_{\text{fine}}$ 的 next-token 预测；
+  \item GRPO：把 PE 接到 \key{冻结的图像生成器} 上，PE 输出 prompt 后跑生成，再用 (a) MLLM-based 视觉一致性 + (b) MLLM-based 美学 + (c) 规则化文本约束 三种 reward 优化 PE。
+\end{itemize}
+
+\begin{intubox}
+\textbf{为什么要专门做 PE：} 真实用户 prompt 长度 / 信息密度差异极大，主图像模型只能接受一个分布。PE 的存在等价于把用户分布 \key{映射到训练分布}——这是 Data Flywheel ``PE track'' 能成立的前提。
+\end{intubox}
+
+\subsection{3. 训练侧（Training）}
+
+\subsubsection{3.1 三阶段主训练（Table~2）}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & \textbf{Pre-training} & \textbf{Continual Pre-training} & \textbf{SFT}\\
+\midrule
+Steps (K)            & 700               & 250                          & 10\\
+Resolution           & 256/512           & 512/1024/2048                & 512/1024/2048\\
+Batch Size (K)       & 32/16             & 16/8/4                       & 16/8/4\\
+T2I : TI2I 比例      & 0.9 : 0.1         & 0.7 : 0.3                    & 0.7 : 0.3\\
+Optimizer            & Adam              & Adam                         & Adam\\
+Weight Decay         & 0.001             & 0.001                        & 0.001\\
+Grad. Norm Clip      & 1.0               & 1.0                          & 1.0\\
+Uncond. Dropout      & 0.1               & 0.1                          & 0.1\\
+Learning Rate        & $1\times 10^{-4}$ & $2\times 10^{-5}$            & $1\times 10^{-5}$\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\textbf{Pre-training（256/512p, 700K 步, lr=1e-4）：} \key{T2I:TI2I = 9:1}，主任务还是学语义；选低分辨率换吞吐量。
+
+\textbf{Continual Pre-training（512--2048p, 250K 步, lr=2e-5）：} 把分辨率推到 2048p；\key{T2I:TI2I 调到 7:3}，开始重训练编辑能力；学习率降一个量级稳住高分辨率训练。
+
+\textbf{SFT（512--2048p, 10K 步, lr=1e-5）：} 用 strict filter + 人工 curate 的高美学数据 + 极低学习率，目标是 \key{细节质量 + 世界知识不退化} 的双重保留。
+
+\begin{warnbox}
+\textbf{我会这样记这张表：} 三阶段的核心 axis 不是 ``学什么''，而是 ``\key{学习率}'' + ``\key{分辨率 curriculum}'' + ``\key{T2I/TI2I 比例 curriculum}''——每一阶段都同步调这三个变量。这是大模型训练里非常标准但又总被忽略的工程美学。
+\end{warnbox}
+
+\subsubsection{3.2 RLHF：5 reward + 适配版 GRPO}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth,height=0.5\textheight,keepaspectratio]{qwen_image2/fig10_rl_comparison.jpg}
+\caption{Qwen-Image-2.0-Base vs Qwen-Image-2.0-RL（论文 Fig.~10）。RL 阶段在 portrait / 海报 / 自然场景上一致改善 texture fidelity 与 visual consistency。图源：arXiv 2605.10730 Figure 10。}
+\label{fig:qi2-rl}
+\end{figure}
+
+\paragraph{五个任务相关 reward：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Aesthetic reward}（T2I）：构图 / 光影 / 纹理 / 整体艺术性；
+  \item \textbf{Image-text alignment reward}（T2I）：覆盖 prompt 中的对象、显式惩罚遗漏 / 误读 / 矛盾；
+  \item \textbf{Portrait reward}（T2I）：人体解剖正确性、面部比例、身份保持、皮肤/头发纹理；
+  \item \textbf{Instruction-following reward}（TI2I）：编辑指令是否被准确执行；
+  \item \textbf{Visual consistency reward}（TI2I）：未编辑区域的 identity 与几何拓扑一致性。
+\end{itemize}
+
+各 reward \key{动态权重调整}，避免单维度 over-optimization；这一点和我笔记里 PCPO / ChunkGRPO 的 multi-objective credit 思路是同源的。
+
+\paragraph{适配版 GRPO 的 CFG 处理。} 论文把现有方法的两种做法（rollout+training 都用 CFG / 都不用 CFG）合并成 hybrid：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Rollout 阶段使用 CFG} → 高质量候选 → 更可靠的 reward 评估；
+  \item \textbf{Policy optimization 阶段排除 unconditional branch} → 显著降低优化开销。
+\end{itemize}
+
+\begin{intubox}
+\textbf{这个 hybrid CFG 策略是个非常实用的工程发现：} ``rollout 要 CFG（影响 reward 信号质量），但 policy update 不需要 CFG（影响计算和稳定性）''。它和 DGPO 的 ``rollout 用 CFG / 训练不用 CFG'' 默认配置完全一致——可以视为 DGPO 经验在工业大模型上的二次确认。
+\end{intubox}
+
+\subsubsection{3.3 Few-step Distillation：DMD 4-NFE}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth,height=0.5\textheight,keepaspectratio]{qwen_image2/fig11_distill_comparison.jpg}
+\caption{40-step 教师 vs 4-NFE 学生（论文 Fig.~11）。DMD 蒸馏后 4 步学生在 portrait / 自然场景 / 复杂 prompt 上视觉效果与 40 步教师 ``难以区分''。图源：arXiv 2605.10730 Figure 11。}
+\label{fig:qi2-distill}
+\end{figure}
+
+\paragraph{方法选择：} 在 trajectory-based distillation 与 distribution-matching distillation 之间，选择 DMD（Yin et al., 2024）——理由是它在 SD 等异构架构上表现一致稳定。
+
+\paragraph{形式（Eq.~4）：}
+
+\[
+\nabla_\theta\,\ell_{\text{DMD}}(\theta)
+=\mathbb{E}_{c,\epsilon,\xi,t}\Bigl[\,
+s_{\text{fake}}(x_t,t,c)
+- s_{\text{real}}(x_t,t,c)
+\,\Bigr]\nabla_\theta x_\theta,
+\]
+
+其中 $x_t=(1-t)x_\theta + t\xi$（学生 clean state $x_\theta=G_\theta(\epsilon,c)$ 与独立噪声 $\xi$ 的线性插值），$s_{\text{real}}$ 来自冻结教师，$s_{\text{fake}}$ 由一个用 flow matching loss 训练的 \key{auxiliary fake score model} 给出（在学生当前生成上拟合）。
+
+\paragraph{结果：} Qwen-Image-2.0-RL（40-step 教师）→ Qwen-Image-2.0-Distillation（4-NFE 学生），portrait / landscape / 文本几乎无肉眼可见质量损失。
+
+\subsubsection{3.4 训练管线总结}
+
+把三步训练 + RL + 蒸馏 + 数据飞轮合在一起：
+
+\[
+\underbrace{\text{Pretrain}}_{700\text{K}}
+\rightarrow \underbrace{\text{Continual Pretrain}}_{250\text{K}}
+\rightarrow \underbrace{\text{SFT}}_{10\text{K}}
+\rightarrow \text{GRPO RLHF}
+\rightarrow \text{DMD 4-NFE Distill}
+\;\;\circlearrowleft\;\; \text{Data Flywheel}.
+\]
+
+每一段输出一个独立的 named checkpoint：\key{Qwen-Image-2.0-Base / -RL / -Distillation}。
+
+\subsection{4. 实验与证据}
+
+\subsubsection{4.1 LMArena（主战场）}
+
+ELO=1168，全球 \#9，中文模型 \#1，超过 NanoBanana。LMArena 是真实人类盲投，T2I leaderboard，因此这个数字 \key{比 GenEval 之类的自动化指标更难刷}。
+
+\subsubsection{4.2 八维度 ELO 提升（Fig.~1）}
+
+相对前代 Qwen-Image-2512 的提升幅度：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Photorealism：1052 → 1155（\textbf{+103}，最大）
+  \item Portraits：1046 → 1129（\textbf{+83}）
+  \item 3D Modeling / Cartoon / Art / Text Rendering：均 +50$\sim$+90 区间
+  \item Overall：1057 → 1133（\textbf{+76}）
+\end{itemize}
+
+\subsubsection{\texorpdfstring{4.3 定性强项（论文 Fig.~13$\sim$17）}{4.3 定性强项（论文 Fig. 13-17）}}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{超长中文文本渲染：} 唯一同时做到 ``字体准 + 版面合理 + 语义不重复'' 的模型；竞品（GPT-Image-2 / NanoBanana Pro / Seedream 5.0 Lite / Wan2.7 Pro）都至少踩中一种典型失败模式；
+  \item \textbf{多语言排版：} 字符保真度 + 复杂排版（详见 Fig.~18）；
+  \item \textbf{TI2I 编辑：} 单图属性修改 + 多图主体一致性 + 风格迁移上保留 identity（详见 Fig.~16$\sim$17）。
+\end{itemize}
+
+\subsection{5. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{超参数披露不足。} GRPO 的 reward 权重、各阶段实际数据规模、PE 模型大小（声称从 Qwen3.5-9B 起）等关键数字没在正文给出；同期开源生态难以复现。
+  \item \textbf{无 GenEval / DPG-Bench / OneIG-Bench 等自动化对比。} 论文几乎只汇报 LMArena ELO + 定性图，回避了所有 \key{automatic instruction-following benchmark}。这一点和它强调的 ``robust instruction following'' 形成微妙矛盾。
+  \item \textbf{语义对齐损失的 schedule 没具体公式。} ``早期强、后期弱'' 描述清楚，但什么 schedule、什么阈值，未公开。
+  \item \textbf{Prompt Enhancer 隐含锁定。} 实测时主图像模型严重依赖 PE 的重写——意味着 \key{用户 prompt $\ne$ 图像模型实际看到的 prompt}，对比公平性会被影响。
+  \item \textbf{Data Flywheel 没给规模数字。} ``三 track 自动路由'' 听起来很美好，但每条 track 每周新增多少 case、覆盖多少 capability gap，没有数据。
+  \item \textbf{4-NFE 蒸馏的极端 prompt 行为不明。} 论文只展示了 portrait / landscape，但 \key{超长文本渲染} 在 4-NFE 下能否守住没明示——这恰恰是它最强的卖点。
+\end{itemize}
+
+\subsection{6. 与已有工作的关系}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{直接前作：} Qwen-Image v1（Wu et al., 2025）—— MMDiT、MSRoPE、四类 caption 框架、f8c16 VAE 都从 v1 继承；2.0 在 \key{VAE 压缩比、TI2I 统一、闭环数据飞轮、4-NFE 蒸馏} 上做了三件事的扩展。
+  \item \textbf{平行竞品：} HunyuanImage-3 / Wan2.2 / Stepvideo-T2V / FLUX.1 / SD-3.5 / NanoBanana Pro / GPT-Image-2 / Seedream 5.0 Lite。论文直接对比的是它们的 LMArena ELO 与 VAE 重建质量。
+  \item \textbf{方法论上的对应：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item RLHF 阶段的 GRPO + multi-reward $\Leftrightarrow$ 我笔记里 PCPO / ChunkGRPO（多目标 credit）；
+      \item Hybrid CFG（rollout 用、training 不用）$\Leftrightarrow$ DGPO 的默认配置（这等于 DGPO 在工业大模型上的二次确认）；
+      \item DMD 4-NFE 蒸馏 $\Leftrightarrow$ LeapAlign 的两步直接梯度路线（DMD 走分布匹配，LeapAlign 走梯度 backprop，是同问题不同解法）。
+    \end{itemize}
+\end{itemize}
+
+\subsection{7. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{可复用 idea 1（四类 caption 模板分桶）：} ``单一 caption 模板'' 是大量视觉生成数据集的隐性瓶颈。General / Text / Knowledge / Structured 四桶法可以直接搬到任何 T2I 数据 pipeline。
+  \item \textbf{可复用 idea 2（Closed-loop Data Flywheel 的三 track 错误归因）：} 把 bad case 路由到 RL / 数据 / PE 三条 track 这件事，比 ``凡是 bad case 就堆数据'' 高效很多。下一次自己设计训练管线时直接照搬。
+  \item \textbf{可复用 idea 3（高压缩 VAE 三件套）：} 残差 AE + 大通道 latent + 动态语义对齐 schedule，可以让 f16c64 VAE 不输 f8c16；这一组合可以直接用到视频 VAE 上把 token 数再砍 4$\times$。
+  \item \textbf{可复用 idea 4（Hybrid CFG GRPO）：} ``rollout 用 CFG，training 不用 CFG''——这是非常实用的 RLHF 工程默认值。
+  \item \textbf{可复用实验设计（per-dimension ELO）：} 分 8 个能力维度独立报告 ELO，比单数字 overall 更能 surface 出 ``哪部分提升大、哪部分没动''。
+  \item \textbf{值得追的 follow-up：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item PE 与主图像模型的 \key{联合训练}（目前是冻结主模型 + 优化 PE，反过来如何）；
+      \item 4-NFE 蒸馏在超长文本渲染上的表现量化；
+      \item Data Flywheel 的 \key{失败归因分类器} 如何训练（论文没说）。
+    \end{itemize}
+\end{itemize}
+
+\subsection{8. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Pre-training 700K / Continual 250K / SFT 10K 步的 batch=32K (token-equivalent) 总计 \key{多少 image-token 训过}？以此估算 compute / data scale。
+  \item GRPO 阶段的 group size、rollout 数、单步成本？论文没给。
+  \item PE GRPO 的 reward 是否会和主图像模型 RLHF 的 reward \key{竞争 over-optimize}？两个 GRPO 阶段是否串行训？
+  \item ``动态 schedule 的语义对齐损失'' 具体形式是什么？（早期强、后期弱）
+  \item DMD 蒸馏使用的 ``logit-normal $p(t)$'' 具体参数？
+  \item Closed-loop Flywheel 的失败归因分类器准确率没披露——三条 track 路由错了会怎样？
+\end{itemize}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文主页：} \href{https://arxiv.org/abs/2605.10730}{Qwen-Image-2.0 Technical Report}；\href{https://arxiv.org/pdf/2605.10730}{PDF}（45MB）。
+  \item \textbf{对照阅读：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item \textbf{Qwen-Image v1}（Wu et al., 2025）：MMDiT、MSRoPE、四类 caption 的源头；
+      \item \textbf{VA-VAE}（Yao et al., 2025）：高压缩 VAE 的语义对齐损失；
+      \item \textbf{Residual Autoencoder}（Chen et al., 2025）：高压缩 VAE 的非参数 shortcut；
+      \item \textbf{DMD / DMD2}（Yin et al., 2024）：4-NFE 蒸馏的方法论来源；
+      \item \textbf{Flow-GRPO / DGPO}：本笔记 RLHF 段对照阅读。
+    \end{itemize}
+\end{itemize}

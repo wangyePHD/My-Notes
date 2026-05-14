@@ -1,0 +1,395 @@
+% ============================================================
+% Paper deep reading: DGPO
+% Source: https://arxiv.org/abs/2510.08425
+% ============================================================
+
+\section{论文精读：DGPO}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2510.08425}{Reinforcing Diffusion Models by Direct Group Preference Optimization}\\
+\textbf{作者/机构：} Yihong Luo (HKUST), Tianyang Hu (CUHK-SZ), Jing Tang (HKUST-GZ / HKUST)\\
+\textbf{简称：} DGPO。\\
+\textbf{版本：} arXiv 2510.08425v1，\textbf{ICLR 2026} 已接收。\\
+\textbf{代码：} \href{https://github.com/Luo-Yihong/DGPO}{Luo-Yihong/DGPO}（训练代码已开源，集成进 Flow-Factory）。\\
+\textbf{方向标签：} Flow Matching、Diffusion RL、GRPO、DPO、Group Preference、ODE Sampler、Timestep Clip、SD3.5。\\
+\textbf{阅读日期：} 2026-05-09。\\
+\textbf{阅读口径：} 这篇是 Flow-GRPO 视觉后训练主线上第一次 \textbf{彻底抛弃 policy-gradient 框架} 的工作。它的问题不是 ``怎么更好地做 SDE rollout''，而是 \key{``我们真的需要 SDE 吗''}。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+DGPO 把 GRPO 成功的那部分拆成两块：``policy-gradient 形式''（可有可无）和 ``组内细粒度相对偏好''（这才是核心），然后只保留后者。它的结果是：
+
+\[
+\begin{aligned}
+\text{DGPO}
+&= \text{group-level preference 最大似然}\\
+&\quad + \text{Diffusion-DPO 的 denoising-based reward 参数化}\\
+&\quad + \text{advantage-based weighting（自动消 } Z(c)\text{）}\\
+&\quad + \text{ODE rollout + timestep clip}.
+\end{aligned}
+\]
+
+落到训练上就是：\key{同组里的正负样本，不再去做 SDE 采样、不再算整条轨迹的 logprob ratio}，而是沿 Diffusion-DPO 的做法，用随机 timestep 上的 denoising loss 差值近似 ``组内 reward 差''，再套一个 Bradley--Terry sigmoid 做最大化。
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇是 Flow-GRPO 这条线里少见的 ``换路径'' 工作。Flow-GRPO / DanceGRPO / MixGRPO / E-GRPO / OP-GRPO 都在 \key{policy-gradient 框架内} 修 credit assignment / sample efficiency / exploration；DGPO 直接说 ``不用 policy gradient 也行，而且训练快约 20 倍''。值得精读，而且要和 OP-GRPO、E-GRPO 并列记：它们代表了 \key{同一症状的三种不同治法}。
+\end{summarybox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\linewidth]{dgpo/fig1_speed_curve.png}\\[4pt]
+\includegraphics[width=0.58\linewidth]{dgpo/fig1_ood_radar.png}
+\caption{DGPO 总览（论文 Fig.~1）。上：在 GenEval 上 DGPO 的训练速度接近 Flow-GRPO 的 30 倍。下：同时在 DrawBench 的 OOD 指标（Aesthetic / DeQA / ImageReward / UnifiedReward / PickScore）上全部优于或持平 Flow-GRPO，说明速度收益不是以 OOD 质量为代价。图源：\href{https://arxiv.org/html/2510.08425v1}{arXiv HTML Figure 1}。}
+\label{fig:dgpo-overview}
+\end{figure}
+
+\subsection{1. 为什么读这篇}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{和当前主线的关系：} Flow-GRPO 把 ODE 改写成 SDE 才能做 policy gradient，这是整条 Flow-GRPO 后训练主线的默认前提。DGPO 直接质疑这个前提。
+  \item \textbf{它可能补上的知识缺口：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item DPO 类方法（Diffusion-DPO）和 GRPO 类方法在数学上能否统一？
+      \item 组级偏好怎样在数学上消掉 DPO 里那个难算的配分函数 $Z(c)$？
+      \item ``用 ODE 采样去做 RL'' 实践上能否稳定训练？
+    \end{itemize}
+  \item \textbf{我希望读完回答的问题：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item DGPO 是不是真的不依赖随机策略？
+      \item 它能替代 Flow-GRPO 吗，还是只在某些任务上有优势？
+      \item 它和 OP-GRPO / E-GRPO 是互斥还是可叠加？
+    \end{itemize}
+\end{itemize}
+
+\subsection{2. 问题定义与背景}
+
+\textbf{问题：} 给定预训练扩散 / flow-matching 模型 $f_\theta$、一个可计算 reward $r(c,x_0)$ 的奖励模型，用 RL 去后训练 $f_\theta$ 使生成结果对齐 reward，同时不破坏原模型的 OOD 质量（aesthetic / image-reward / picks-core）。
+
+\textbf{前作限制（GRPO 线）：} 论文指出 GRPO 迁移到扩散模型有三个痛点：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{SDE rollout 效率低。} GRPO 需要随机策略，逼迫使用 SDE 采样器取代更高效的 ODE，\key{相同 NFE 下样本质量更差}。
+  \item \textbf{收敛慢。} 随机性来源是 ``model-agnostic 高斯噪声''，它在高维空间提供的学习信号非常弱。
+  \item \textbf{训练昂贵。} 必须在整条采样轨迹上算 logprob ratio 和梯度，单次迭代成本高。
+\end{enumerate}
+
+\textbf{前作限制（DPO 线）：} Diffusion-DPO 已经做到 ``不需要随机策略''，但它只有 \key{成对偏好（pairwise）}，完全丢掉 GRPO 的 \key{组内细粒度相对信息}。
+
+\begin{intubox}
+\textbf{直觉版：} GRPO 有组信息但被迫用 SDE；DPO 用 ODE 友好但只认两两比较。DGPO 要的是 ``ODE 友好 + 组级偏好''，所以它把 DPO 从 pairwise 扩到 \key{pairwise of groups}。
+\end{intubox}
+
+\subsection{3. 方法拆解}
+
+\subsubsection{3.1 关键一步：把 DPO 从 pair 扩到 group pair}
+
+Bradley--Terry 偏好模型本来写在 \textbf{一对样本上}：
+
+\[
+p_{\text{BT}}(x_0^w\succ x_0^l\mid c) = \sigma\bigl(r(c,x_0^w)-r(c,x_0^l)\bigr).
+\]
+
+DGPO 把 ``一对样本'' 换成 ``一对样本组''。对一个 prompt $c$ 生成 $G$ 条样本 $\mathcal{G}=\{x_0^1,\ldots,x_0^G\}$，按 reward 切成 $\mathcal{G}^{+}$（偏好）和 $\mathcal{G}^{-}$（非偏好），目标（Eq.~8）：
+
+\[
+\max_\theta\ \mathbb{E}_{(\mathcal{G}^{+},\mathcal{G}^{-},c)\sim\mathcal{D}}
+\log\sigma\bigl(R_\theta(\mathcal{G}^{+}\mid c)-R_\theta(\mathcal{G}^{-}\mid c)\bigr),
+\]
+
+组级 reward 定义为加权和（Eq.~9）：
+
+\[
+R_\theta(\mathcal{G}\mid c)=\sum_{x_0\in\mathcal{G}}w(x_0)\cdot r_\theta(c,x_0).
+\]
+
+\subsubsection{3.2 单样本 reward：沿用 Diffusion-DPO 的 denoising 近似}
+
+DGPO 沿用 Diffusion-DPO 的 reward 参数化（Eq.~10）：
+
+\[
+r_\theta(c,x_0)\approx
+\beta\,\mathbb{E}_{q(x_{1:T}\mid x_0)}\!
+\log\frac{p_\theta(x_{0:T}\mid c)}{p_{\text{ref}}(x_{0:T}\mid c)}
+\;+\;\beta\log Z(c).
+\]
+
+用 \textbf{前向扩散分布} $q(x_{1:T}\mid x_0)$ 近似反向链，把 ``要跑完整条采样轨迹'' 换成 ``随机采一个 $t$ 的 denoising loss''。
+
+\begin{warnbox}
+\textbf{这一步继承自 DPO：} 昂贵的反向链被近似成加噪前向链，DGPO 训练时 \key{只需要对随机 $t$ 做一次 denoising loss}，和 DPO 一样便宜。这是 DGPO 比 Flow-GRPO 快约 20 倍的主要来源——后者要对轨迹上每个 $t$ 都算 transition logprob。
+\end{warnbox}
+
+\subsubsection{\texorpdfstring{3.3 关键设计：用 advantage 做权重，让 $Z(c)$ 自动消掉}{3.3 关键设计：用 advantage 做权重，让 Z(c) 自动消掉}}
+
+把 Eq.~9 + Eq.~10 代回 Eq.~8，$\beta\log Z(c)$ 在 $R_\theta(\mathcal{G}^{+})-R_\theta(\mathcal{G}^{-})$ 里留下 $\bigl(\sum_{\mathcal{G}^{+}}w-\sum_{\mathcal{G}^{-}}w\bigr)\log Z(c)$。要让 $Z(c)$ 彻底消去，权重需满足：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 越好的正样本 / 越差的负样本应得更大权重（保留组内相对偏好信息）；
+  \item $\sum_{x_0\in\mathcal{G}^{+}}w(x_0)=\sum_{x_0\in\mathcal{G}^{-}}w(x_0)$（两侧权重等质量）。
+\end{enumerate}
+
+它直接复用 GRPO 风格的组内归一化 advantage（Eqs.~12--14）：
+
+\[
+A(x_0^i)=\frac{r_i-\mathrm{mean}(\{r_j\})}{\mathrm{std}(\{r_j\})},
+\quad
+\mathcal{G}^{+}=\{A>0\},\;\mathcal{G}^{-}=\{A\le 0\},
+\quad
+w(x_0)=|A(x_0)|.
+\]
+
+因为 advantage 零均值（$\sum A=0$），所以 $|A|$ 在正负两侧自然满足 $\sum_{+}|A|=\sum_{-}|A|$，\textbf{$Z(c)$ 干净地抵消}。
+
+\begin{intubox}
+\textbf{直觉：} advantage 的 ``零均值'' 本来只是 GRPO 里做 variance reduction 的工程选择；在 DGPO 里它变成 \key{让 DPO 里讨厌的 $Z(c)$ 项自动消掉} 的数学条件。这是非常漂亮的复用。
+\end{intubox}
+
+\subsubsection{3.4 最终损失（Eq.~17）}
+
+经 Jensen 不等式把期望挪到 sigmoid 外后，DGPO 的实际训练损失：
+
+\[
+\begin{aligned}
+\mathcal{L}_{\text{DGPO}}(\theta)
+=\;&-\mathbb{E}_{(\mathcal{G}^{+},\mathcal{G}^{-},c),t,\epsilon}
+\log\sigma\!\Big(-\lambda_t\beta T\cdot\\
+&\quad \Big[
+\sum_{x_0\in\mathcal{G}^{+}}w(x_0)\bigl(\mathcal{L}_{\text{dsm}}^{\theta}-\mathcal{L}_{\text{dsm}}^{\theta_{\text{ref}}}\bigr)\\
+&\qquad -\sum_{x_0\in\mathcal{G}^{-}}w(x_0)\bigl(\mathcal{L}_{\text{dsm}}^{\theta}-\mathcal{L}_{\text{dsm}}^{\theta_{\text{ref}}}\bigr)
+\Big]\Big),
+\end{aligned}
+\]
+
+其中 $\mathcal{L}_{\text{dsm}}^{\theta}(x,x_t,c)=\|f_\theta(x_t,t,c)-x\|_2^2$ 是 denoising score-matching loss，$\lambda_t$ 是 DPO 里常用的 timestep 加权，\textbf{同组样本共享一个 $\epsilon$} 以减小方差。
+
+\begin{warnbox}
+\textbf{形式上很 GRPO 但本质更像 DPO：} sigmoid 的自变量是 ``加权 denoising loss 差''——正样本要比 ref 模型 denoise 得更好（loss 差更负），负样本要比 ref 模型 denoise 得更差。这和 GRPO 的 clipped advantage 已经没有结构关系了，\key{它是 ``组内版的 Diffusion-DPO''}。
+\end{warnbox}
+
+\subsubsection{3.5 Timestep Clip：不让模型去学坏样本的伪影}
+
+10 步 ODE rollout 采出来的训练样本会带 blurriness / 细节丢失。若从 $t\in[0,T]$ 均匀采，模型会在小 $t$ 处被迫拟合低质量细节，导致生成质量退化。
+
+DGPO 的处理很直接：训练时 \key{只在 $[t_{\min},T]$ 内采样 $t$}，$t_{\min}>0$，把 ``对齐细节'' 的小 $t$ 区间从训练里排除。
+
+\begin{intubox}
+\textbf{直觉：} 用 10-step ODE 生成的样本，\key{大 $t$ 上是 ``语义/构图层面信息干净''，小 $t$ 上是 ``低层细节不干净''}。RL 只需要调语义 / 指令跟随，不需要调低层细节。这个设计和 E-GRPO 的 ``只训 high-entropy early steps'' 从不同角度指向同一结论：后期低 $t$ / 低熵步骤不是 RL 的好战场。
+\end{intubox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\linewidth]{dgpo/fig4_timestep_clip_ablation.png}
+\caption{Timestep Clip 的视觉消融（论文 Fig.~4）。左列为 SD3.5-M 基线，中列为没有 timestep clip 的 DGPO 变体——可以看到指令跟随仍然 OK，但视觉质量明显退化（画面变 blurry、颜色偏灰）；右列是完整 DGPO。说明 \key{低 $t$ 区间里 RL 会被 rollout 自带的伪影拖着走，必须排除}。图源：\href{https://arxiv.org/html/2510.08425v1}{arXiv HTML Figure 4}。}
+\label{fig:dgpo-timestep-clip}
+\end{figure}
+
+\subsubsection{3.6 训练流程（Algorithm 1）}
+
+一次 iteration 做的事：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 从 prompt 集采 $c$；
+  \item 用 $p_{\theta^{-}}$ 跑 \textbf{ODE} 采样得 $\mathcal{G}=\{x_0^1,\ldots,x_0^G\}$（$G=24$，10 步 Flow-DPM-Solver）；
+  \item 查 reward $r_i=r_\phi(c,x_0^i)$；
+  \item 组内归一化得 advantage $A_i$，划分 $\mathcal{G}^{+},\mathcal{G}^{-}$，权重 $w=|A|$；
+  \item 采 $t\sim\mathcal{U}[t_{\min},T],\,\epsilon\sim\mathcal{N}(0,I)$，\textbf{同组共享 $\epsilon$}，构造 $x_t^i=\alpha_t x_0^i+\sigma_t\epsilon$；
+  \item 在 online 与 ref 模型上算 denoising loss，代入 Eq.~17，一步梯度更新；
+  \item 参考模型 $\theta^{-}$：前 200 步直接拷贝 $\theta$，之后走 EMA（decay=0.3）。
+\end{enumerate}
+
+\subsection{4. 实验与证据}
+
+\subsubsection{4.1 设置}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Backbone：} SD3.5-M（Stable Diffusion 3.5 Medium），LoRA rank=32，分辨率 512。
+  \item \textbf{Rollout：} Flow-DPM-Solver，10 步 ODE，$G=24$；$\beta=100$，text dropout 0.05，A100 训练。
+  \item \textbf{三任务 / 三 reward：}
+    \begin{enumerate}[leftmargin=1.5em]
+      \item 组合图像生成：GenEval（objects / counting / position / attributes）。
+      \item 视觉文字渲染：``A sign that says `text''' 模板，reward 由 OCR 编辑距离给出 $r=\max(1-N_e/N_{\text{ref}},0)$。
+      \item 人类偏好对齐：PickScore。
+    \end{enumerate}
+  \item \textbf{OOD 指标（DrawBench 上评估，防 reward hacking）：} Aesthetic、DeQA、ImageReward、UnifiedReward、PickScore。
+\end{itemize}
+
+\subsubsection{4.2 主结果：GenEval 上超越 GPT-4o}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{模型} & \textbf{Overall} & \textbf{Single} & \textbf{Two Obj} & \textbf{Counting} & \textbf{Colors} & \textbf{Position} & \textbf{Attr.}\\
+\midrule
+GPT-4o          & 0.84 & 0.99 & 0.92 & 0.85 & 0.92 & 0.75 & 0.61\\
+FLUX.1 Dev      & 0.66 & 0.98 & 0.81 & 0.74 & 0.79 & 0.22 & 0.45\\
+SANA-1.5 4.8B   & 0.81 & 0.99 & 0.93 & 0.86 & 0.84 & 0.59 & 0.65\\
+SD3.5-M (base)  & 0.63 & 0.98 & 0.78 & 0.50 & 0.81 & 0.24 & 0.52\\
++ Flow-GRPO     & 0.95 & 1.00 & 0.99 & 0.95 & 0.92 & 0.99 & 0.86\\
++ \textbf{DGPO} & \textbf{0.97} & \textbf{1.00} & \textbf{0.99} & \textbf{0.97} & \textbf{0.95} & \textbf{0.99} & \textbf{0.91}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+从 base 0.63 拉到 0.97，\key{比 GPT-4o 高 13 个点}；Position 从 0.24 拉到 0.99 是最戏剧的。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{dgpo/fig2_qualitative_vs_flowgrpo.png}
+\caption{与 Flow-GRPO 的定性对比（论文 Fig.~2，相同初始噪声）。DGPO 在指令跟随上和 Flow-GRPO 接近，但保留了更好的视觉质量，对应综合表里 \key{in-domain 提升但 OOD 不掉} 的现象。图源：\href{https://arxiv.org/html/2510.08425v1}{arXiv HTML Figure 2}。}
+\label{fig:dgpo-qualitative}
+\end{figure}
+
+\subsubsection{4.3 三任务综合表：in-domain 赢 Flow-GRPO，OOD 也不掉}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llcccccccc}
+\toprule
+\textbf{任务} & \textbf{方法} & \textbf{GenEval} & \textbf{OCR} & \textbf{Pick} & \textbf{Aes.} & \textbf{DeQA} & \textbf{ImgRwd} & \textbf{Pick-OOD} & \textbf{UniRwd}\\
+\midrule
+--        & SD3.5-M    & 0.63 & 0.59 & 21.72 & 5.39 & 4.07 & 0.87 & 22.34 & 3.33\\
+组合生成  & Flow-GRPO  & 0.95 & --   & --    & 5.25 & 4.01 & 1.03 & 22.37 & 3.51\\
+组合生成  & \textbf{DGPO} & \textbf{0.97} & -- & -- & \textbf{5.31} & \textbf{4.03} & \textbf{1.08} & \textbf{22.41} & \textbf{3.60}\\
+文字渲染  & Flow-GRPO  & --   & 0.92 & --    & 5.32 & 4.06 & 0.95 & 22.44 & 3.42\\
+文字渲染  & \textbf{DGPO} & -- & \textbf{0.96} & -- & \textbf{5.37} & \textbf{4.09} & \textbf{1.02} & \textbf{22.52} & \textbf{3.48}\\
+偏好对齐  & Flow-GRPO  & --   & --   & 23.31 & 5.92 & 4.22 & 1.28 & 23.53 & 3.66\\
+偏好对齐  & \textbf{DGPO} & -- & -- & \textbf{23.89} & \textbf{6.08} & \textbf{4.40} & \textbf{1.32} & \textbf{23.91} & \textbf{3.74}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{这张表最值得记的点：} 不是 ``DGPO 在 in-domain 赢了 Flow-GRPO''，而是 \key{Flow-GRPO 在组合生成任务上为了刷 GenEval 牺牲了 Aesthetic（5.39\,→\,5.25）和 DeQA（4.07\,→\,4.01）}，DGPO 则在 GenEval 更高的同时 OOD 指标全部不降反升。这说明 DGPO 的 ``组级偏好 + denoising loss 差'' 损失不那么容易 reward-hack。
+\end{summarybox}
+
+\subsubsection{\texorpdfstring{4.4 速度：训练快约 20 倍（GenEval 上近 30$\times$）}{4.4 速度：训练快约 20 倍（GenEval 上近 30x）}}
+
+速度收益来自三点：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 不需要在整条轨迹上算 transition ratio，而是随机单个 $t$ 做 denoising loss；
+  \item ODE rollout 比 SDE rollout 在相同 NFE 下更有信息量；
+  \item 不需要 model-agnostic 高斯噪声作为探索源，真正的 ``信号'' 来自 reward 的组内相对差。
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{dgpo/fig3_training_speed.png}
+\caption{Flow-GRPO 与 DGPO 训练速度对比（论文 Fig.~3）。横轴是 wall-clock 时间 / 训练步数，纵轴是各任务的 in-domain reward。DGPO 在 GenEval 上达到 Flow-GRPO 同等水平只需约 1/30 时间，在 OCR 和 PickScore 上也有约 10--20$\times$ 加速。图源：\href{https://arxiv.org/html/2510.08425v1}{arXiv HTML Figure 3}。}
+\label{fig:dgpo-training-speed}
+\end{figure}
+
+\subsubsection{4.5 消融：哪个设计真的重要}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{消融项} & \textbf{结论}\\
+\midrule
+Timestep Clip       & 去掉 → OCR Acc 0.96\,→\,0.95（微降），但视觉质量显著退化\\
+ODE vs.\ SDE rollout & ODE 在收敛速度与最终指标上都显著优于 SDE\\
+Offline DGPO        & 用 $p_{\text{ref}}$ 预采数据集能赢 baseline，但显著弱于 online\\
+vs.\ Diffusion DPO  & Online/offline 两种设置下 DGPO 都显著优于 DPO\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{dgpo/fig5_text_rendering_variants.png}
+\caption{视觉文字渲染任务上各变体的对比（论文 Fig.~5）。依次展示：SD3.5-M 基线、SDE rollout、offline DGPO、Diffusion-DPO 与完整 DGPO。可以看到 \key{ODE rollout 的字体清晰度一致更好}；offline 版本能改善 OCR 但丢视觉质量；Diffusion-DPO 的 pairwise 偏好不足以把文字 ``写准''。图源：\href{https://arxiv.org/html/2510.08425v1}{arXiv HTML Figure 5}。}
+\label{fig:dgpo-text-variants}
+\end{figure}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{ODE vs.\ SDE} 这个消融非常重要：它把 ``Flow-GRPO 必须用 SDE'' 的假设实验性地证伪了，\key{SDE 不是方法论必须，只是 policy-gradient 框架的被迫选择}。
+  \item \textbf{vs.\ Diffusion DPO} 说明 DGPO 的提升不全靠 ``换成 DPO 式 objective'' 这一步，更来自 \key{``pair → group pair'' 的组级扩展}。
+\end{itemize}
+
+\subsection{5. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{reward model 决定上限。} DGPO 的 advantage 权重只用了 $|A|$，没有做类似 PCPO / ChunkGRPO 的 multi-objective 组合；如果 reward 模型本身 bias 大，``组内自归一'' 会把这个 bias 等比例放大。
+  \item \textbf{ODE rollout 的 ``坏样本伪影'' 仍是隐患。} Timestep Clip 只是缓解，没有根治。如果换一个更少步数的 ODE（比如 4~6 步），$t_{\min}$ 需要重新标定。
+  \item \textbf{组划分是 hard 阈值（$A>0$ vs.\ $A\le 0$）。} 在 reward 方差极小的 group（几乎没有信号的 prompt）上，正负划分会变成纯噪声；论文没有像 DAPO 那样给 ``全同组'' 的降权策略。
+  \item \textbf{只在 SD3.5-M 文生图上验证。} 作者自己也把 ``T2V'' 列为 future work；视频场景 ODE rollout 成本更高，能否保持 20$\times$ 优势仍待证。
+  \item \textbf{KL / CFG 设定复杂。} README 里给了三种训练模式（带/不带 CFG、是否 EMA-ref），不同模式的 $\beta_{\text{dpo}}$ 差一个数量级。调参负担并不小。
+\end{itemize}
+
+\subsection{6. 与已有工作的关系}
+
+\begin{center}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+\textbf{方法} & \textbf{需要随机策略} & \textbf{rollout} & \textbf{训练粒度} & \textbf{用到组信息}\\
+\midrule
+Flow-GRPO / DanceGRPO & 是（SDE）   & SDE（低效） & 整条轨迹 & 是\\
+E-GRPO               & 是（SDE）   & ODE/SDE hybrid & consolidated step & 是\\
+OP-GRPO              & 是（SDE）   & SDE + replay & 整条轨迹 & 是\\
+Diffusion DPO        & 否          & 离线成对     & 随机 timestep & 否（只成对）\\
+\textbf{DGPO}        & \textbf{否} & \textbf{ODE（高效）} & \textbf{随机 timestep} & \textbf{是（组级）}\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{直接前作：} Flow-GRPO（policy-gradient 路线的代表）、Diffusion-DPO（denoising-reward 近似的起点）。DGPO 的身份正好是 ``把两者优势合并''。
+  \item \textbf{和 E-GRPO / OP-GRPO 的关系：} 三者都是在解 Flow-GRPO 的效率问题。E-GRPO 改 \key{探索发生在哪些 step}，OP-GRPO 改 \key{采样能否跨 iteration 复用}，DGPO 直接 \key{换整个优化框架}。逻辑上 DGPO 不需要 E-GRPO / OP-GRPO——它不做 SDE，所以 E-GRPO 的 entropy-aware step merging 没有意义；它不需要 logprob ratio，所以 OP-GRPO 的 sequence-level 纠偏也没有必要。
+  \item \textbf{真正差异：} DGPO 是 Flow-GRPO 线上第一篇在数学层面 \key{完全脱离 policy gradient} 的方法，但仍然保留 GRPO 最有价值的那部分——\key{组内细粒度相对偏好}。
+\end{itemize}
+
+\subsection{7. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{可复用 idea 1（advantage 零均值做 $Z(c)$ 消元）：} 任何带配分函数的 DPO-like 方法都可以复用这个技巧——只要把权重设计成 ``正负两侧等总权重''，$Z(c)$ 就自动消掉。这个套路可以迁到 video DPO、3D DPO 等场景。
+  \item \textbf{可复用 idea 2（timestep clip）：} ``不让 RL 去学 rollout 低质量细节''，这个思路和 E-GRPO 的 high-entropy step training 是同一族观察。它可以成为 \key{所有 few-step ODE rollout 后训练方法的默认预处理}。
+  \item \textbf{可复用 idea 3（组共享 $\epsilon$ 做方差缩减）：} 同组样本共享同一条 $\epsilon$，在 DGPO 里是为了让 $\mathcal{L}_{\text{dsm}}^{\theta}-\mathcal{L}_{\text{dsm}}^{\theta_{\text{ref}}}$ 在 prompt+noise 上配对。这个 trick 在 ``任何带 ref 模型的扩散后训练'' 里都可以白用。
+  \item \textbf{值得追的 follow-up：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item DGPO $\times$ 视频生成（T2V / I2V）：作者自己说的 future work。
+      \item DGPO $\times$ multi-reward（PCPO / ChunkGRPO 风格的 credit 组合）：DGPO 的组级权重天然可以接多 reward aggregation。
+      \item DGPO $\times$ 统一多模态生成后训练（BAGEL / Z-Image / Chameleon 这类）。
+    \end{itemize}
+\end{itemize}
+
+\subsection{8. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Eq.~17 用 Jensen 不等式把期望移到 sigmoid 外，得到的是 \key{原目标的下界}。这个下界在训练末期是否足够紧？论文有无实证比较 ``用下界'' 和 ``用原始期望内形式''？
+  \item $w(x_0)=|A(x_0)|$ 保证了 $\sum_{+}|A|=\sum_{-}|A|$，但如果组内正负样本数量严重失衡（比如 23 条负、1 条正），这一条正样本会拿走所有正权重质量。DGPO 有没有对失衡 group 做保护？
+  \item DGPO 在 10 步 ODE 下成立；如果 base 模型本身只是 2\,--\,4 步蒸馏模型，$t_{\min}$ 的标定、ref 模型的 EMA 都可能要重新设计。
+  \item 论文只用 LoRA 训了 SD3.5-M，若直接 full-finetune 更大模型（FLUX-12B / SD3.5-L），DGPO 的 20$\times$ 速度优势是否依然保持？
+\end{itemize}
+
+\subsection{9. 附录定性对比}
+
+论文附录 B 给了两组完整的定性对比，分别对应 OCR Accuracy 和 PickScore 作为训练 reward 的情况：
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{dgpo/fig6_appendix_ocr_qual.png}
+\caption{以 OCR Accuracy 为训练 reward 的定性对比（论文 Fig.~6，相同初始噪声）。可以看到 DGPO 在 ``写得对的同时画得也好''；Flow-GRPO 虽然写对但画质明显退化（笔画粗糙、背景纹理丢失）。图源：\href{https://arxiv.org/html/2510.08425v1}{arXiv HTML Figure 6}。}
+\label{fig:dgpo-appendix-ocr}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{dgpo/fig7_appendix_pickscore_qual.png}
+\caption{以 PickScore 为训练 reward 的定性对比（论文 Fig.~7，相同初始噪声）。在主观偏好对齐任务里，DGPO 的整体审美和构图更协调，且 OOD 风格不像 Flow-GRPO 那样收敛到 ``高 PickScore 模板化构图''。图源：\href{https://arxiv.org/html/2510.08425v1}{arXiv HTML Figure 7}。}
+\label{fig:dgpo-appendix-pickscore}
+\end{figure}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文主页：} \href{https://arxiv.org/abs/2510.08425}{Reinforcing Diffusion Models by Direct Group Preference Optimization}（ICLR 2026）。
+  \item \textbf{arXiv HTML：} \href{https://arxiv.org/html/2510.08425v1}{arXiv HTML version}（全部 equations、消融与图表均来自此版本）。
+  \item \textbf{代码：} \href{https://github.com/Luo-Yihong/DGPO}{Luo-Yihong/DGPO}；已集成进 Flow-Factory。
+  \item \textbf{对照阅读：} Flow-GRPO（policy-gradient 代表）、Diffusion-DPO（pairwise 代表）、E-GRPO / OP-GRPO（同样攻击 Flow-GRPO 效率但仍留在 policy gradient 框架内）。
+\end{itemize}

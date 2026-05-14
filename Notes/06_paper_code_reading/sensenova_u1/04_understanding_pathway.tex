@@ -1,0 +1,506 @@
+% ============================================================
+% SenseNova-U1 / NEO-Unify visual understanding pathway notes
+% ============================================================
+
+\section{VQA / Understanding Pathway：从图片和问题到文本回答}
+
+\begin{conceptbox}
+\textbf{这一节的目标：} 沿着官方 VQA 推理脚本，把 SenseNova-U1 的 visual understanding 链路从外到内走一遍：\key{图片如何变成视觉 token，问题如何变成 chat query，\texttt{<IMG\_CONTEXT>} 如何被视觉 embedding 替换，\texttt{t/h/w} 位置索引如何进入 Qwen3 attention，最后如何自回归生成答案。}\\
+\textbf{当前阅读基准：} 本节基于官方仓库 commit \texttt{2e339f94e992464d468794286af34ca759cb7ac0} 的 \texttt{examples/vqa/inference.py}、\texttt{modeling\_neo\_chat.py}、\texttt{modeling\_neo\_vit.py}、\texttt{modeling\_qwen3.py}、\texttt{utils.py} 与 \texttt{conversation.py}。
+\end{conceptbox}
+
+\subsection{一、先给最终调用栈}
+
+\begin{summarybox}
+\textbf{VQA 的主路径可以概括为：}
+\[
+\begin{aligned}
+\texttt{answer()} &\rightarrow \texttt{load\_image\_native()} \rightarrow \texttt{model.chat()} \\
+&\rightarrow \texttt{model.generate()} \rightarrow \texttt{extract\_feature()} \\
+&\rightarrow \texttt{language\_model.generate()} \rightarrow \texttt{batch\_decode()}
+\end{aligned}
+\]
+真正的“理解”发生在两次融合里：第一，视觉 encoder 把图片 patch 编码成和 LLM hidden size 对齐的视觉 token；第二，这些视觉 token 被写入文本序列里的 \texttt{<IMG\_CONTEXT>} 槽位，然后统一进入 Qwen3 decoder attention。
+\end{summarybox}
+
+\begin{center}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tikzpicture}[
+  node distance=1.35cm,
+  box/.style={draw, rounded corners, align=center, inner sep=5pt, font=\small},
+  arr/.style={->, thick}
+]
+\node[box] (input) {image + question};
+\node[box, right=1.6cm of input] (pre) {\texttt{load\_image\_native}\\\texttt{pixel\_values}, \texttt{grid\_hw}};
+\node[box, right=1.6cm of pre] (chat) {\texttt{chat()}\\拼 query + 展开 \texttt{<image>}};
+\node[box, below=1.05cm of chat] (vision) {\texttt{extract\_feature()}\\视觉 token};
+\node[box, right=1.6cm of chat] (replace) {替换\\\texttt{<IMG\_CONTEXT>} embedding};
+\node[box, right=1.6cm of replace] (llm) {\texttt{Qwen3ForCausalLM.generate}\\自回归解码};
+\node[box, right=1.6cm of llm] (out) {decode\\answer};
+\draw[arr] (input) -- (pre);
+\draw[arr] (pre) -- (chat);
+\draw[arr] (chat) -- (replace);
+\draw[arr] (pre) |- (vision);
+\draw[arr] (vision) -- (replace);
+\draw[arr] (replace) -- (llm);
+\draw[arr] (llm) -- (out);
+\end{tikzpicture}
+\end{adjustbox}
+\end{center}
+
+\subsection{二、VQA wrapper：它只是很薄的一层}
+
+官方入口 \texttt{examples/vqa/inference.py} 中的 \texttt{SenseNovaU1VQA.answer()} 主要做三件事：
+
+\begin{lstlisting}[language=Python]
+pixel_values, grid_hw = load_image_native(image)
+pixel_values = pixel_values.to(self.device, dtype=self.model.dtype)
+grid_hw = grid_hw.to(self.device)
+
+response, updated_history = self.model.chat(
+    self.tokenizer,
+    pixel_values,
+    question,
+    generation_config,
+    history=history,
+    return_history=True,
+    grid_hw=grid_hw,
+)
+\end{lstlisting}
+
+也就是说，VQA wrapper 本身没有复杂逻辑。它负责：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{图像预处理：} 调用 \texttt{load\_image\_native} 得到 \texttt{pixel\_values} 和 \texttt{grid\_hw}；
+  \item \textbf{设备与精度：} 把图像 patch 转到模型所在 device，并转成模型 dtype；
+  \item \textbf{转交模型：} 把 tokenizer、图像 patch、问题、生成参数一起交给 \texttt{model.chat()}。
+\end{itemize}
+
+\begin{intubox}
+\textbf{源码阅读抓手：} 从 \texttt{answer()} 开始读时，不要在 wrapper 里找“模型理解”的秘密。这里更像工程胶水，真正的核心在 \texttt{NEOChatModel.chat()} 和 \texttt{NEOChatModel.generate()}。
+\end{intubox}
+
+\subsection{三、第一步：图片先变成 \texttt{pixel\_values + grid\_hw}}
+
+上一节已经讲过 \texttt{load\_image\_native} 的输入格式，这里从 VQA pathway 角度再强调一次：
+
+\begin{lstlisting}[language=Python]
+# pixel_values: [sum(grid_h * grid_w), 3 * patch_size * patch_size]
+# grid_hw:      [[grid_h, grid_w], ...]
+\end{lstlisting}
+
+\texttt{pixel\_values} 保存 patch 内容，\texttt{grid\_hw} 保存 patch 原来的二维布局。理解链路里这两个对象一路传到 \texttt{generate()}：
+
+\begin{lstlisting}[language=Python]
+generation_output = self.generate(
+    pixel_values=pixel_values,
+    input_ids=input_ids,
+    grid_hw=grid_hw,
+    attention_mask=attention_mask,
+    **generation_config
+)
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{不要只看 \texttt{pixel\_values}：} 如果丢掉 \texttt{grid\_hw}，模型仍然可能知道每个 patch 的内容，但不知道这些 patch 在图片里的行列关系；后面的 \texttt{h\_indexes} 和 \texttt{w\_indexes} 也就无法正确构造。
+\end{warnbox}
+
+\subsection{四、第二步：\texttt{chat()} 负责把 VQA 问题变成模型 query}
+
+\texttt{chat()} 的第一处关键逻辑是自动补图像占位符：
+
+\begin{lstlisting}[language=Python]
+if history is None and pixel_values is not None and '<image>' not in question:
+    question = '<image>\n' + question
+\end{lstlisting}
+
+这意味着单轮 VQA 时，用户即使只问“图里有什么？”，模型内部也会把问题改成类似：
+
+\begin{lstlisting}[language=Python]
+<image>
+图里有什么？
+\end{lstlisting}
+
+然后它会设置图像 special token 的 id：
+
+\begin{lstlisting}[language=Python]
+img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+self.img_context_token_id = img_context_token_id
+self.img_start_token_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
+\end{lstlisting}
+
+接下来，\texttt{chat()} 使用 conversation template 拼 prompt：
+
+\begin{lstlisting}[language=Python]
+template = get_conv_template(self.template)
+template.system_message = self.system_message
+
+for (old_question, old_answer) in history:
+    template.append_message(template.roles[0], old_question)
+    template.append_message(template.roles[1], old_answer)
+template.append_message(template.roles[0], question)
+template.append_message(template.roles[1], None)
+query = template.get_prompt()
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{到这一步为止：} 输入还只是“文本 query + 图片 patch”。图片还没有真正进入 LLM；query 里仍然只是一个 \texttt{<image>} 占位符。
+\end{summarybox}
+
+\subsection{五、第三步：\texttt{<image>} 展开成视觉 embedding 的槽位}
+
+\texttt{chat()} 会根据 \texttt{grid\_hw} 计算需要多少个 \texttt{<IMG\_CONTEXT>}：
+
+\begin{lstlisting}[language=Python]
+for i in range(grid_hw.shape[0]):
+    num_patch_token = int(
+        grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2
+    )
+    image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
+    query = query.replace('<image>', image_tokens, 1)
+\end{lstlisting}
+
+这里有两个对齐关系：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{数量对齐：} \texttt{num\_patch\_token} 必须等于视觉 encoder 最终输出的 token 数；
+  \item \textbf{语义对齐：} \texttt{<IMG\_CONTEXT>} 是“待替换槽位”，之后会被真正的视觉 embedding 覆盖。
+\end{itemize}
+
+举一个小例子：如果 \texttt{grid\_hw = [4, 4]}，并且 \texttt{downsample\_ratio = 0.5}，那么：
+
+\begin{lstlisting}[language=Python]
+num_patch_token = 4 * 4 * 0.5**2 = 4
+query = query.replace(
+    '<image>',
+    '<img><IMG_CONTEXT><IMG_CONTEXT><IMG_CONTEXT><IMG_CONTEXT></img>',
+    1,
+)
+\end{lstlisting}
+
+随后 tokenizer 把整个 query 变成 \texttt{input\_ids} 和 \texttt{attention\_mask}。
+
+\subsection{六、第四步：\texttt{generate()} 构造三轴位置索引}
+
+进入 \texttt{NEOChatModel.generate()} 后，第一件重要的事不是抽视觉特征，而是先根据 \texttt{input\_ids} 和 \texttt{grid\_hw} 构造位置索引：
+
+\begin{lstlisting}[language=Python]
+indexes = self.get_thw_indexes(input_ids[0], grid_hw)
+\end{lstlisting}
+
+\texttt{get\_thw\_indexes()} 返回三行：
+
+\begin{lstlisting}[language=Python]
+return torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
+\end{lstlisting}
+
+它们分别表示：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{t\_indexes}：} token 在文本/整体序列里的时间或块位置；
+  \item \textbf{\texttt{h\_indexes}：} 图像 token 在图片中的高度坐标；
+  \item \textbf{\texttt{w\_indexes}：} 图像 token 在图片中的宽度坐标。
+\end{itemize}
+
+源码里最关键的一段是：
+
+\begin{lstlisting}[language=Python]
+selected = (input_ids == self.img_context_token_id)
+abs_pos_w, abs_pos_h = build_abs_positions_from_grid_hw(
+    grid_hw // int(1 / self.downsample_ratio),
+    device=t_indexes.device,
+)
+h_indexes[selected] = abs_pos_h.to(t_indexes.device, t_indexes.dtype)
+w_indexes[selected] = abs_pos_w.to(t_indexes.device, t_indexes.dtype)
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{通俗理解：} \texttt{<IMG\_CONTEXT>} 先在文本序列里占坑；\texttt{get\_thw\_indexes()} 再给每个坑贴上“这是第几行、第几列的图像块”的坐标标签。
+\end{intubox}
+
+\subsection{七、一个容易忽略的细节：图像 token 是一个 block}
+
+\texttt{t\_indexes} 不是简单的 \texttt{0,1,2,3,...}。它由下面这几行构造：
+
+\begin{lstlisting}[language=Python]
+img_start_shift = torch.cat([
+    torch.zeros(1, dtype=torch.long).to(input_ids.device),
+    (input_ids == self.img_start_token_id).long(),
+], dim=0)[:-1]
+not_img_token = (input_ids != self.img_context_token_id).long()
+t_indexes = ((img_start_shift + not_img_token).cumsum(0) - 1)
+\end{lstlisting}
+
+效果是：普通文本 token 会推进 \texttt{t}，但连续的 \texttt{<IMG\_CONTEXT>} 不会每个都单独推进一个新时间步。图像 token 更像被放进同一个“图像块”。
+
+这和 Qwen3 里的 block causal mask 呼应：
+
+\begin{lstlisting}[language=Python]
+def create_block_causal_mask(index):
+    mask = (idx_j == idx_i) | (arange.unsqueeze(0) <= arange.unsqueeze(1))
+\end{lstlisting}
+
+它的含义是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{不同时间块之间：} 仍然遵守自回归因果顺序，后面的 token 能看前面；
+  \item \textbf{同一个时间块内部：} 如果 \texttt{idx\_j == idx\_i}，可以相互注意，不强行按 patch 顺序单向看。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{为什么这很重要：} 图像 patch 本来就是二维整体，不是自然语言那样严格左到右生成的序列。把图像 token 放进同一个 block，可以让同一张图里的视觉 token 更自由地互相交互，同时又不破坏文本生成的因果性。
+\end{summarybox}
+
+\subsection{八、第五步：\texttt{extract\_feature()} 抽出视觉 token}
+
+如果传入了 \texttt{pixel\_values}，\texttt{generate()} 会抽取视觉特征：
+
+\begin{lstlisting}[language=Python]
+if visual_features is not None:
+    vit_embeds = visual_features
+else:
+    vit_embeds = self.extract_feature(pixel_values, grid_hw=grid_hw)
+\end{lstlisting}
+
+\texttt{extract\_feature()} 对 VQA 来说走的是理解侧 vision model：
+
+\begin{lstlisting}[language=Python]
+return self.vision_model(
+    pixel_values=pixel_values,
+    output_hidden_states=False,
+    return_dict=True,
+    grid_hw=grid_hw,
+).last_hidden_state
+\end{lstlisting}
+
+视觉模型内部的关键路径是：
+
+\begin{lstlisting}[language=Python]
+pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
+patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
+patch_embeds = self._apply_2d_rotary_pos_emb(patch_embeds, grid_hw)
+patches_per_img = self.dense_embedding(patches_per_img.permute(0, 3, 1, 2))
+embeddings = torch.cat(patches_list, dim=0)
+\end{lstlisting}
+
+这里可以拆成四步：
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{patch reshape：} 把 \texttt{load\_image\_native} 产生的二维 patch 向量恢复成 \(3 \times 16 \times 16\) 小图块；
+  \item \textbf{patch embedding：} 用 \texttt{Conv2d} 把每个 patch 投到视觉 hidden size；
+  \item \textbf{视觉侧 2D RoPE：} 根据 \texttt{grid\_hw} 给 patch 注入二维位置；
+  \item \textbf{\texttt{dense\_embedding}：} 同时完成空间降采样和通道投影，输出 LLM hidden size 的视觉 token。
+\end{enumerate}
+
+\subsection{九、第六步：视觉 token 替换 \texttt{<IMG\_CONTEXT>} embedding}
+
+视觉 token 抽出来以后，\texttt{generate()} 会先拿到文本 token 的 embedding：
+
+\begin{lstlisting}[language=Python]
+input_embeds = self.language_model.get_input_embeddings()(input_ids)
+B, N, C = input_embeds.shape
+input_embeds = input_embeds.reshape(B * N, C)
+\end{lstlisting}
+
+然后找到所有 \texttt{<IMG\_CONTEXT>} 的位置：
+
+\begin{lstlisting}[language=Python]
+input_ids = input_ids.reshape(B * N)
+selected = (input_ids == self.img_context_token_id)
+assert selected.sum() != 0
+input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+\end{lstlisting}
+
+最后恢复成 batch 序列形状：
+
+\begin{lstlisting}[language=Python]
+input_embeds = input_embeds.reshape(B, N, C)
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{这就是 VQA 中图文融合的关键瞬间：} 从 LLM 视角看，输入仍然是一条普通 embedding 序列；但其中若干个位置已经不再是 \texttt{<IMG\_CONTEXT>} 的文本 embedding，而是真正的视觉 embedding。
+\end{summarybox}
+
+\subsection{十、第七步：统一序列进入 \texttt{language\_model.generate()}}
+
+完成替换后，\texttt{NEOChatModel.generate()} 调用语言模型的自回归生成：
+
+\begin{lstlisting}[language=Python]
+outputs = self.language_model.generate(
+    inputs_embeds=input_embeds,
+    indexes=indexes,
+    attention_mask=attention_mask,
+    generation_config=generation_config,
+    output_hidden_states=output_hidden_states,
+    use_cache=True,
+    **generate_kwargs,
+)
+\end{lstlisting}
+
+这里有两个参数特别关键：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\texttt{inputs\_embeds}：} 已经混入视觉 token 的统一 embedding 序列；
+  \item \textbf{\texttt{indexes}：} 三轴位置索引，告诉 Qwen3 attention 每个 token 的 \texttt{t/h/w} 坐标。
+\end{itemize}
+
+在 \texttt{Qwen3Model.forward()} 里，如果传入的是 \texttt{inputs\_embeds} 而不是 \texttt{input\_ids}，它会根据 \texttt{indexes[0]} 创建 block causal mask：
+
+\begin{lstlisting}[language=Python]
+causal_mask_mapping = {
+    "full_attention": create_block_causal_mask(indexes[0]),
+}
+self.current_index = indexes[0].max()
+\end{lstlisting}
+
+后续自回归生成新文本 token 时，如果走 \texttt{input\_ids} 分支，模型会把新 token 当作普通文本位置继续推进：
+
+\begin{lstlisting}[language=Python]
+self.current_index += 1
+indexes = torch.LongTensor([[self.current_index], [0], [0]]).to(input_ids.device)
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{直觉：} 首轮 prefilling 阶段使用完整的图文混合序列；后续 decoding 阶段一次生成一个文本 token，它只需要新的 \texttt{t} 位置，\texttt{h/w} 默认为 0。
+\end{intubox}
+
+\subsection{十一、第八步：Qwen3 attention 怎样用 \texttt{t/h/w}}
+
+在 \texttt{Qwen3Attention.forward\_und()} 里，query/key 的 head dim 会被拆成三部分：
+
+\begin{lstlisting}[language=Python]
+query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
+query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
+
+key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
+key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
+\end{lstlisting}
+
+然后分别按三套索引做 RoPE：
+
+\begin{lstlisting}[language=Python]
+cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+query_states_t, key_states_t = apply_rotary_pos_emb(query_states_t, key_states_t, cos_t, sin_t)
+
+cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
+query_states_h, key_states_h = apply_rotary_pos_emb(query_states_h, key_states_h, cos_h, sin_h)
+
+cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+query_states_w, key_states_w = apply_rotary_pos_emb(query_states_w, key_states_w, cos_w, sin_w)
+\end{lstlisting}
+
+最后再拼回完整 query/key：
+
+\begin{lstlisting}[language=Python]
+query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
+key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
+\end{lstlisting}
+
+\begin{summarybox}
+\textbf{这一步的意义：} LLM attention 不只是看到“文本 token + 图像 token”的混合序列，还能在 attention 的位置编码里区分文本顺序 \texttt{t}、图像高度 \texttt{h} 和图像宽度 \texttt{w}。
+\end{summarybox}
+
+\subsection{十二、第九步：生成答案并解码}
+
+\texttt{language\_model.generate()} 输出 token id 后，\texttt{chat()} 做最后的 decode：
+
+\begin{lstlisting}[language=Python]
+response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
+response = response.split(template.sep.strip())[0].strip()
+history.append((question, response))
+\end{lstlisting}
+
+这里的 \texttt{template.sep.strip()} 来自 conversation template。\texttt{chat()} 会把它作为 \texttt{eos\_token\_id}，并在 decode 后用它截断回答：
+
+\begin{lstlisting}[language=Python]
+eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
+generation_config['eos_token_id'] = eos_token_id
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{多轮 VQA 的细节：} 单轮时 \texttt{chat()} 会自动给 question 前面补 \texttt{<image>}。多轮时，旧的 question / answer 会从 \texttt{history} 重新拼进模板；如果第一轮已经带了 \texttt{<image>}，历史里也会保留这个占位符。理解多轮行为时，要同时看 \texttt{history}、\texttt{grid\_hw} 和 prompt 里有几个 \texttt{<image>}。
+\end{warnbox}
+
+\subsection{十三、用一个极简例子串起来}
+
+假设用户输入：
+
+\begin{lstlisting}[language=Python]
+image = cat.png
+question = "这张图里有什么？"
+\end{lstlisting}
+
+如果图片经过预处理后得到 \texttt{grid\_hw = [4, 4]}，且 \texttt{downsample\_ratio = 0.5}，那么链路是：
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{wrapper：} \texttt{load\_image\_native(cat.png)} 得到 16 个原始 patch 和 \texttt{grid\_hw=[4,4]}；
+  \item \textbf{chat：} 自动把问题变成 \texttt{<image>\textbackslash n这张图里有什么？}；
+  \item \textbf{占位展开：} \texttt{<image>} 变成 4 个 \texttt{<IMG\_CONTEXT>} 槽位；
+  \item \textbf{视觉编码：} \texttt{NEOVisionModel} 把 16 个 patch 经 \texttt{dense\_embedding} 变成 4 个 LLM hidden size 的视觉 token；
+  \item \textbf{embedding 替换：} 4 个视觉 token 覆盖 4 个 \texttt{<IMG\_CONTEXT>} 的文本 embedding；
+  \item \textbf{位置索引：} 这 4 个视觉 token 获得 \(2 \times 2\) 的 \texttt{h/w} 坐标，并作为一个图像 block 参与 attention；
+  \item \textbf{自回归生成：} Qwen3 decoder 基于图文混合上下文生成回答，例如“图中有一只猫”。
+\end{enumerate}
+
+\subsection{十四、调试 VQA pathway 时最值得检查的断点}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.4cm}p{5.0cm}p{6.0cm}}
+\hline
+\textbf{断点位置} & \textbf{应该检查什么} & \textbf{常见问题} \\
+\hline
+\texttt{load\_image\_native} 后 & \texttt{pixel\_values.shape}、\texttt{grid\_hw} & 图像过大/过小导致 token 数异常，或 device/dtype 未迁移 \\
+\texttt{chat()} 展开后 & query 里是否还有足够的 \texttt{<IMG\_CONTEXT>} & prompt 中 \texttt{<image>} 数量和输入图片数量不匹配 \\
+\texttt{get\_thw\_indexes()} 后 & \texttt{indexes.shape} 是否为 \texttt{[3, seq\_len]} & \texttt{grid\_hw} 缺失导致 \texttt{h/w} 全为 0 \\
+\texttt{extract\_feature()} 后 & \texttt{vit\_embeds.shape[-1]} 是否等于 LLM hidden size & 视觉 token 维度无法替换文本 embedding \\
+替换 \texttt{input\_embeds[selected]} 时 & \texttt{selected.sum()} 是否等于视觉 token 数 & \texttt{<IMG\_CONTEXT>} 槽位数量和视觉 token 数不一致 \\
+\texttt{language\_model.generate()} 后 & 是否按 \texttt{eos\_token\_id} 停止 & eos token 配置或模板分隔符异常导致输出截断不对 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+\subsection{十五、本节小结}
+
+\begin{summarybox}
+VQA / understanding pathway 可以浓缩成五句话：\\
+1. VQA wrapper 只负责加载图像、迁移 device/dtype、组装 generation config，然后调用 \texttt{model.chat()}；\\
+2. \texttt{chat()} 把问题变成 conversation query，并把 \texttt{<image>} 展开成 \texttt{<img>}、若干 \texttt{<IMG\_CONTEXT>} 和 \texttt{</img>}；\\
+3. \texttt{extract\_feature()} 通过 \texttt{NEOVisionModel} 把图像 patch 编成和 LLM hidden size 对齐的视觉 token；\\
+4. \texttt{generate()} 把视觉 token 写入 \texttt{<IMG\_CONTEXT>} 槽位，并把 \texttt{t/h/w} 三轴索引一起传给 Qwen3；\\
+5. Qwen3 decoder 在 block causal mask 和三轴 RoPE 的帮助下，对统一图文 embedding 序列做自回归生成，最后由 tokenizer decode 成文本回答。
+\end{summarybox}
+
+% ============================================================
+\subsection{参考资料}
+% ============================================================
+
+\begingroup
+\small
+\sloppy
+\begin{itemize}[leftmargin=1.5em]
+  \item OpenSenseNova，\emph{SenseNova-U1 官方 GitHub 仓库}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1}
+  \item OpenSenseNova，\emph{SenseNova-U1 README：统一多模态理解、推理与生成架构说明}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/README.md}
+  \item OpenSenseNova，\emph{VQA inference wrapper：\texttt{SenseNovaU1VQA.answer}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/examples/vqa/inference.py}
+  \item OpenSenseNova，\emph{NEOChatModel：\texttt{chat}、\texttt{generate}、\texttt{extract\_feature} 与 \texttt{get\_thw\_indexes}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py}
+  \item OpenSenseNova，\emph{NEOVisionModel：patch embedding、2D RoPE 与 \texttt{dense\_embedding}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_neo_vit.py}
+  \item OpenSenseNova，\emph{Qwen3 attention modification：block causal mask 与 \texttt{t/h/w} 三轴 RoPE}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/modeling_qwen3.py}
+  \item OpenSenseNova，\emph{Image preprocessing utilities：\texttt{load\_image\_native} 与 \texttt{smart\_resize}}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/utils.py}
+  \item OpenSenseNova，\emph{Conversation template utilities：\texttt{get\_conv\_template} 与 prompt 拼接规则}。\\
+  \url{https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/conversation.py}
+  \item Alexey Dosovitskiy et al.，\emph{An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale}。\\
+  \url{https://arxiv.org/abs/2010.11929}
+  \item Jianlin Su et al.，\emph{RoFormer: Enhanced Transformer with Rotary Position Embedding}。\\
+  \url{https://arxiv.org/abs/2104.09864}
+  \item Qwen Team，\emph{Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution}。\\
+  \url{https://arxiv.org/abs/2409.12191}
+\end{itemize}
+\endgroup

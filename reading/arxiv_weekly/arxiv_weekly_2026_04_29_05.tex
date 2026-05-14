@@ -1,0 +1,341 @@
+% ============================================================
+% arXiv / Hugging Face Daily Papers 周报：2026年4月29日 – 5月5日
+% ============================================================
+
+\section{arXiv / Hugging Face Daily Papers 周报：2026年4月29日 – 5月5日}
+
+\begin{conceptbox}
+\textbf{方向}：后训练技术 · 世界模型 · 图像编辑 · 视频模型\\
+\textbf{数据来源}：\href{https://arxiv.org/list/cs.CV/recent}{arXiv cs.CV} · \href{https://huggingface.co/papers}{Hugging Face Daily Papers}\\
+\textbf{整理日期}：2026-05-06\\
+\textbf{筛选原则}：优先收录与视觉生成、多模态后训练、3D/世界建模、图像编辑、视频生成/理解相关的论文；Hugging Face Daily Papers 命中的论文在条目中额外标注。
+\end{conceptbox}
+
+\subsection{一、后训练技术（Post-Training / Adaptation / Distillation）}
+
+\subsubsection{1. GRPO-TTA：用 GRPO 做视觉语言模型测试时适配}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.03403}{2605.03403}
+
+这篇工作把 GRPO 从常规后训练推进到 \textbf{test-time adaptation} 场景：不是只问“训练后模型能不能更会推理”，而是问“推理时能不能利用 GRPO 信号做视觉调参”。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 核心问题是 VLM 在分布变化、视觉证据不稳定时容易依赖语言先验。
+  \item 方法上用 GRPO 驱动测试时视觉调优，把组内相对奖励信号用于在线适配。
+  \item 对你的后训练笔记来说，它属于“RL 方法从离线 post-training 走向 inference-time optimization”的代表。
+\end{itemize}
+
+\subsubsection{2. Perceptual Flow Network：约束视觉推理轨迹}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.02730}{2605.02730} | \textbf{HF Daily Papers}：2026-05-05
+
+论文关注 LVLM 的视觉 grounding 问题：标准 MLE 目标不能显式约束模型的视觉推理路径，导致语言偏置和幻觉。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 重点不是单纯提高 VQA 分数，而是让模型的中间推理轨迹更贴近视觉证据。
+  \item 可归入“视觉推理后训练 / 轨迹级约束”方向，与偏好对齐、过程监督有相邻关系。
+  \item 值得后续关注它是否能和 GRPO、DPO、过程奖励模型结合。
+\end{itemize}
+
+\subsubsection{3. Stream-R1：面向流式视频生成的奖励蒸馏}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.03849}{2605.03849}
+
+Stream-R1 针对流式视频扩散模型的蒸馏加速问题，提出 reliability-perplexity aware reward distillation。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 背景是 DMD 等分布匹配蒸馏通常无差别匹配 teacher 输出，容易把低可靠样本也蒸馏进去。
+  \item 论文引入可靠性和困惑度感知的奖励信号，决定学生模型应该更关注哪些 teacher 输出。
+  \item 它是“生成模型加速”和“奖励建模/蒸馏”交叉的后训练工作，也和视频模型部分强相关。
+\end{itemize}
+
+\subsubsection{4. TCOD：多轮自主智能体的 on-policy temporal curriculum distillation}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24005}{2604.24005} | \textbf{HF Daily Papers}：2026-04-29
+
+从标题和 HF 收录看，这篇更偏智能体训练，但它对后训练笔记仍有价值：多轮任务中，on-policy 蒸馏不仅要蒸“答案”，还要考虑时间课程和交互轨迹。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 关键词是 temporal curriculum、on-policy distillation、多轮 autonomous agents。
+  \item 可以作为“长程任务后训练如何避免早期错误滚雪球”的参考。
+  \item 与视频/GUI/机器人场景的序列决策训练存在方法共性。
+\end{itemize}
+
+\subsubsection{5. BOLT：无需预准备的在线轻量适配}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.00405}{2605.00405}
+
+BOLT 关注 heterogeneous cooperative perception 中的在线适配问题：现实环境里不同 agent 往往独立训练、异构部署，不能假设提前联合训练或专门适配。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 论文把适配从 offline preparation 转向 online lightweight adaptation。
+  \item 对系统和后训练都有启发：部署时的环境异构性可能比训练时 benchmark 更关键。
+  \item 可归入“test-time / deployment-time adaptation”类别。
+\end{itemize}
+
+\subsection{二、世界模型（World Model / 3D / Robotics / Scene）}
+
+\subsubsection{1. Map2World：分割图条件的文本到 3D 世界生成}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.00781}{2605.00781} | \textbf{HF Daily Papers}：2026-05-04
+
+Map2World 是本周最贴近“世界模型”主线的论文之一：它把 segment map 作为结构条件，引导 text-to-3D world generation。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 目标是生成可用于沉浸式内容、自动驾驶仿真等场景的 3D 世界。
+  \item 相比只靠文本，segment map 提供了更强的空间布局约束。
+  \item 对你的世界模型笔记来说，它位于“可控 3D 场景生成 / 仿真数据构建”分支。
+\end{itemize}
+
+\subsubsection{2. RADIO-ViPE：动态环境下的在线多模态开放词汇语义 SLAM}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.26067}{2604.26067} | \textbf{HF Daily Papers}：2026-04-30
+
+这篇将多模态融合、open-vocabulary semantic SLAM、动态环境在线建图结合起来，适合作为机器人世界模型方向的补充。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 重点是 online tightly coupled multi-modal fusion，而不是离线 3D 重建。
+  \item open-vocabulary 语义能力使地图不只是几何结构，还包含可语言查询的语义层。
+  \item 与机器人长期自主、交互式世界模型、动态场景理解强相关。
+\end{itemize}
+
+\subsubsection{3. StateVLM：面向机器人 affordance reasoning 的状态感知 VLM}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.03927}{2605.03927}
+
+StateVLM 关注 VLM 在机器人 affordance reasoning 中的局限：仅凭图像和语言，很难可靠判断物体当前状态和可操作性。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 核心是把 state awareness 注入 VLM，使其更适合机器人操作任务。
+  \item 这类工作说明世界模型不只是“生成未来画面”，还需要表达可行动状态。
+  \item 可与 VoxAfford 等 3D affordance detection 工作一起阅读。
+\end{itemize}
+
+\subsubsection{4. VoxAfford：开放词汇 3D affordance 检测}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.01365}{2605.01365}
+
+VoxAfford 面向点云上的开放词汇 affordance 定位，使用 multi-scale voxel-token fusion。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 问题形式是：给定自然语言 affordance 描述，在 3D 点云中定位可交互区域。
+  \item 它把 MLLM 的语言泛化能力与 3D 空间定位结合。
+  \item 对机器人世界模型而言，这是“从感知到可操作性”的关键接口。
+\end{itemize}
+
+\subsubsection{5. 2D-SuGaR：面向几何准确网格重建的 surface-aware Gaussian Splatting}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.00569}{2605.00569}
+
+3D Gaussian Splatting 强在实时渲染，但体表示并不天然保证表面几何准确。2D-SuGaR 从 surface-aware 的角度改进 mesh reconstruction。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 关注点从“看起来像”转向“几何表面是否可用”。
+  \item 对自动驾驶仿真、机器人导航、3D 编辑都很重要。
+  \item 可和 3DGS 场景编辑、object removal 工作放在同一组笔记中。
+\end{itemize}
+
+\subsubsection{6. BlenderRAG：检索增强的 3D 对象代码生成}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.00632}{2605.00632} | \textbf{HF Daily Papers}：2026-05-05
+
+BlenderRAG 用 retrieval-augmented code synthesis 生成可执行 Blender 代码，解决 LLM 直接生成 3D 对象时容易语法错误和几何不一致的问题。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它不是传统 3D diffusion，而是“代码作为 3D 世界生成中间表示”。
+  \item 检索增强可以提供可复用的几何构造和程序化先验。
+  \item 对“可编辑、可执行、可组合”的 3D 世界生成路线有启发。
+\end{itemize}
+
+\subsection{三、图像编辑（Image Editing / Diffusion Editing / Visual Generation）}
+
+\subsubsection{1. AttnRouter：MMDiT 上的训练免费图像编辑注意力路由}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.01480}{2605.01480}
+
+AttnRouter 研究 Qwen-Image-Edit-2511 这类 MMDiT 图像编辑模型中的 attention 机制，提出 per-category attention routing。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 亮点是 training-free：不重新训练模型，而是从注意力路由角度控制编辑。
+  \item 论文还提出 KVInject 等机制，用于在噪声 token 与源图 token 的混合 attention stream 中注入控制。
+  \item 适合放入“编辑模型推理时控制 / attention intervention”笔记。
+\end{itemize}
+
+\subsubsection{2. SpecEdit：基于 semantic locking 的 diffusion image editing 加速}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.02152}{2605.02152}
+
+SpecEdit 的出发点是扩散图像编辑计算昂贵，尤其是高分辨率 token 在每个 denoising step 都参与计算。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 方法关键词是 training-free acceleration 和 semantic locking。
+  \item 与动态分辨率采样不同，它强调保住语义关键区域，减少不必要空间 token 计算。
+  \item 对实际图像编辑系统部署很有价值，尤其是交互式编辑场景。
+\end{itemize}
+
+\subsubsection{3. Probing Visual Planning in Image Editing Models：图像编辑模型的视觉规划能力探测}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.22868}{2604.22868} | \textbf{HF Daily Papers}：2026-04-30
+
+这篇更像评测/分析型工作：它关注图像编辑模型是否真的具备视觉规划能力，而不只是局部纹理替换。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 对图像编辑很关键，因为复杂编辑通常需要先理解目标状态，再规划空间变化。
+  \item 可与“多步编辑”“指令遵循”“空间关系编辑”类 benchmark 放在一起。
+  \item 对后续做编辑 RL 或偏好对齐也有帮助：奖励不应只看最终美观度，还应评估规划合理性。
+\end{itemize}
+
+\subsubsection{4. Meta-CoT：增强图像编辑的粒度与泛化}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24625}{2604.24625} | \textbf{HF Daily Papers}：2026-04-29
+
+Meta-CoT 从标题看聚焦 image editing 中的 chain-of-thought / meta reasoning，用于提升编辑粒度和泛化。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 适合关注“图像编辑是否需要显式中间推理”的问题。
+  \item 与视觉规划、分步骤编辑、编辑指令分解方向强相关。
+  \item 如果后续深入读，可以重点看它的 CoT 是用于数据构造、模型训练，还是推理时控制。
+\end{itemize}
+
+\subsubsection{5. Diffusion Templates：可控扩散的统一插件框架}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24351}{2604.24351} | \textbf{HF Daily Papers}：2026-04-30
+
+Diffusion Templates 试图把可控扩散中的各种控制形式抽象为统一 plugin framework。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 适合和 ControlNet、IP-Adapter、attention injection、LoRA adapter 等控制机制对照。
+  \item 关键问题是：不同控制信号能否用统一模板接入，而不是每种任务重写一套 pipeline。
+  \item 对工程上构建图像生成/编辑系统很有参考价值。
+\end{itemize}
+
+\subsubsection{6. GOR-IS：3D Gaussian intrinsic space 中的对象移除}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.00498}{2605.00498}
+
+GOR-IS 研究 3D Gaussian scene 中的 object removal，是 3D 场景编辑的基础任务。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 难点不是 2D 图像 inpainting，而是多视角一致地移除对象并补全被遮挡区域。
+  \item intrinsic space 的处理有助于避免简单图像空间编辑造成的视角不一致。
+  \item 可归入“3D editing / scene manipulation”方向。
+\end{itemize}
+
+\subsection{四、视频模型（Video Generation / Understanding / Audio-Visual）}
+
+\subsubsection{1. UniVidX：基于扩散先验的统一多模态视频生成框架}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.00658}{2605.00658} | \textbf{HF Daily Papers}：2026-05-04
+
+UniVidX 试图把多种 multimodal graphics tasks 统一到一个视频扩散框架中，而不是为每个输入输出设定分别训练一个模型。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 关键词是 unified multimodal framework、versatile video generation、diffusion priors。
+  \item 代表视频模型从单一文生视频走向统一多任务生成。
+  \item 与 BAGEL、LLaDA2.0-Uni 这类统一理解-生成范式有方法上的相似趋势。
+\end{itemize}
+
+\subsubsection{2. Motion-Aware Caching：自回归视频生成的运动感知缓存}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.01725}{2605.01725} | \textbf{HF Daily Papers}：2026-05-05
+
+自回归视频生成理论上适合长视频，但逐步 denoising 成本很高。Motion-Aware Caching 针对这一点做加速。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 关键思路是缓存复用不能只按静态相似性，还要考虑运动变化。
+  \item 对长视频生成很实用：静态背景可以复用，运动区域需要更精细更新。
+  \item 可放入“视频生成推理加速”分支，与投机解码、蒸馏、KV/cache 优化并列。
+\end{itemize}
+
+\subsubsection{3. Co-Director：agentic generative video storytelling}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2604.24842}{2604.24842} | \textbf{HF Daily Papers}：2026-04-29
+
+Co-Director 关注视频故事生成中的 agentic workflow：不只是生成单段视频，而是让模型像导演一样组织故事。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 关键词是 agentic、generative video storytelling。
+  \item 这类工作通常涉及剧情规划、镜头分解、一致性维护和多段视频组合。
+  \item 可作为“视频生成从 clip-level 到 story-level”的代表条目。
+\end{itemize}
+
+\subsubsection{4. AniMatrix：面向动漫风格的视频生成模型}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.03652}{2605.03652}
+
+AniMatrix 的观点很有意思：通用视频模型通常内化物理真实世界先验，但动漫故意违反物理真实，如 smear、impact frames、chibi shifts 等。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 它不是简单“动漫数据微调”，而是强调动漫有自己的运动和艺术规律。
+  \item 说明视频生成模型的 motion prior 需要按领域重构。
+  \item 对风格化视频、动画制作、非真实物理世界生成很有参考价值。
+\end{itemize}
+
+\subsubsection{5. Audio-Visual Intelligence in Large Foundation Models：大基础模型中的音视觉智能综述}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.04045}{2605.04045}
+
+这是一篇 audio-visual intelligence 综述，覆盖感知、生成、交互等多模态任务。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 对视频理解/生成方向有综述价值，尤其是音频与视觉同步、跨模态对齐、交互式理解。
+  \item 可以作为后续整理 audio-video 模型路线图的入口。
+  \item 与 OmniEncoder、AVQA、音视频联合生成方向一起阅读更合适。
+\end{itemize}
+
+\subsubsection{6. OmniEncoder：统一编码视觉、听觉和连续运动}
+
+\textbf{arXiv}：\href{https://arxiv.org/abs/2605.01506}{2605.01506}
+
+OmniEncoder 试图解决现有 omni-modal LLM 常用多个 modality-specific encoder 的问题。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 目标是用一个 encoder 处理视觉、音频和连续运动。
+  \item 对视频模型尤其重要，因为视频不只是帧序列，还包含声音、运动、节奏等连续信号。
+  \item 可归入“统一多模态编码器 / audio-video-motion representation”方向。
+\end{itemize}
+
+\subsection{五、汇总速查表}
+
+\small
+\begin{longtable}{p{0.7cm}p{3.0cm}p{2.5cm}p{2.5cm}p{4.8cm}}
+\toprule
+\# & 简称 & arXiv ID & 方向 & 关键词 \\
+\midrule
+1 & GRPO-TTA & \href{https://arxiv.org/abs/2605.03403}{2605.03403} & 后训练 & GRPO, 测试时适配, VLM \\
+2 & Perceptual Flow Network & \href{https://arxiv.org/abs/2605.02730}{2605.02730} & 后训练 & 视觉轨迹, grounded reasoning, HF 05-05 \\
+3 & Stream-R1 & \href{https://arxiv.org/abs/2605.03849}{2605.03849} & 后训练 / 视频 & 奖励蒸馏, 流式视频生成 \\
+4 & TCOD & \href{https://arxiv.org/abs/2604.24005}{2604.24005} & 后训练 / Agent & on-policy distillation, temporal curriculum, HF 04-29 \\
+5 & BOLT & \href{https://arxiv.org/abs/2605.00405}{2605.00405} & 后训练 / 系统 & 在线适配, cooperative perception \\
+6 & Map2World & \href{https://arxiv.org/abs/2605.00781}{2605.00781} & 世界模型 & Text-to-3D, segment map, HF 05-04 \\
+7 & RADIO-ViPE & \href{https://arxiv.org/abs/2604.26067}{2604.26067} & 世界模型 / SLAM & 多模态融合, open-vocabulary, HF 04-30 \\
+8 & StateVLM & \href{https://arxiv.org/abs/2605.03927}{2605.03927} & 世界模型 / 机器人 & state-aware VLM, affordance \\
+9 & VoxAfford & \href{https://arxiv.org/abs/2605.01365}{2605.01365} & 世界模型 / 3D & 3D affordance, voxel-token fusion \\
+10 & 2D-SuGaR & \href{https://arxiv.org/abs/2605.00569}{2605.00569} & 3D 重建 & Gaussian Splatting, mesh reconstruction \\
+11 & BlenderRAG & \href{https://arxiv.org/abs/2605.00632}{2605.00632} & 世界模型 / 3D 生成 & RAG, Blender code, HF 05-05 \\
+12 & AttnRouter & \href{https://arxiv.org/abs/2605.01480}{2605.01480} & 图像编辑 & training-free editing, MMDiT, attention routing \\
+13 & SpecEdit & \href{https://arxiv.org/abs/2605.02152}{2605.02152} & 图像编辑 & semantic locking, diffusion acceleration \\
+14 & Visual Planning Editing & \href{https://arxiv.org/abs/2604.22868}{2604.22868} & 图像编辑 / 评测 & visual planning, HF 04-30 \\
+15 & Meta-CoT & \href{https://arxiv.org/abs/2604.24625}{2604.24625} & 图像编辑 & CoT, granularity, HF 04-29 \\
+16 & Diffusion Templates & \href{https://arxiv.org/abs/2604.24351}{2604.24351} & 图像编辑 / 控制 & controllable diffusion, plugin, HF 04-30 \\
+17 & GOR-IS & \href{https://arxiv.org/abs/2605.00498}{2605.00498} & 3D 编辑 & object removal, 3D Gaussian \\
+18 & UniVidX & \href{https://arxiv.org/abs/2605.00658}{2605.00658} & 视频模型 & 统一视频生成, diffusion prior, HF 05-04 \\
+19 & Motion-Aware Caching & \href{https://arxiv.org/abs/2605.01725}{2605.01725} & 视频模型 / 加速 & autoregressive video, cache, HF 05-05 \\
+20 & Co-Director & \href{https://arxiv.org/abs/2604.24842}{2604.24842} & 视频模型 / Agent & video storytelling, HF 04-29 \\
+21 & AniMatrix & \href{https://arxiv.org/abs/2605.03652}{2605.03652} & 视频模型 & anime video, art prior \\
+22 & Audio-Visual Intelligence & \href{https://arxiv.org/abs/2605.04045}{2605.04045} & 视频 / 音视觉 & AVI, foundation model, survey \\
+23 & OmniEncoder & \href{https://arxiv.org/abs/2605.01506}{2605.01506} & 视频 / 多模态 & unified encoder, audio-video-motion \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\subsection{六、资料来源与覆盖说明}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{arXiv}：主要检索 \href{https://arxiv.org/list/cs.CV/recent}{cs.CV recent} 与相关论文的 \texttt{/abs/} 页面，时间范围覆盖 2026-04-29 至 2026-05-05。
+  \item \textbf{Hugging Face Daily Papers}：交叉参考 \href{https://huggingface.co/papers?date=2026-04-29}{2026-04-29}、\href{https://huggingface.co/papers?date=2026-04-30}{2026-04-30}、\href{https://huggingface.co/papers?date=2026-05-01}{2026-05-01}、\href{https://huggingface.co/papers?date=2026-05-02}{2026-05-02}、\href{https://huggingface.co/papers?date=2026-05-03}{2026-05-03}、\href{https://huggingface.co/papers?date=2026-05-04}{2026-05-04}、\href{https://huggingface.co/papers?date=2026-05-05}{2026-05-05}。
+  \item \textbf{分类方式}：同一篇论文可能跨多个方向；正文按最主要贡献归类，速查表保留跨领域标签。
+  \item \textbf{阅读优先级}：若只读 5 篇，建议优先看 \textbf{GRPO-TTA}、\textbf{Map2World}、\textbf{AttnRouter}、\textbf{UniVidX}、\textbf{Stream-R1}。
+\end{itemize}
+
+*本周共整理重点论文 \textbf{23 篇}，其中多篇被 Hugging Face Daily Papers 收录，覆盖后训练、世界模型、图像编辑和视频模型四个方向。*
