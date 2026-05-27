@@ -1,0 +1,13 @@
+% PyTorch framework notes zone.
+
+\part*{PyTorch 框架机制}
+\phantomsection
+\addcontentsline{toc}{part}{PyTorch 框架机制}
+
+\begin{conceptbox}
+\textbf{用途：} 收集 PyTorch 这个工程框架本身的核心机制——不是 API 字典，而是 \key{为什么这样设计、内部怎么实现、什么时候触发、什么时候要小心}。\\
+\textbf{当前主线：} \key{Hook 机制} → autograd 引擎 → \texttt{nn.Module} 生命周期 → 显存/通信工具链。\\
+\textbf{说明：} 笔记尽量贴近源码事实（\code{torch/nn/modules/module.py}, \code{torch/utils/hooks.py}），并补充实际工程中最常用的代码模式与陷阱。
+\end{conceptbox}
+
+\input{Notes/07_pytorch/hooks}

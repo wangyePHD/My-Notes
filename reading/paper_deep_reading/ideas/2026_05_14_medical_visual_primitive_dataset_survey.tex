@@ -1,0 +1,254 @@
+\subsection*{Idea 调研：医学视觉原语推理的数据集选型 (10 篇论文对比)}
+\phantomsection
+\addcontentsline{toc}{subsection}{Idea 调研：医学视觉原语推理的数据集选型 (10 篇论文对比)}
+
+\begin{conceptbox}
+\textbf{调研日期：} 2026-05-14。\\
+\textbf{背景：} 受 \href{https://arxiv.org/abs/2511.10591}{Thinking with Visual Primitives (DeepSeek)} 启发，希望把 \key{多粒度视觉原语推理} 迁移到医学图像领域，构建 ``病灶定位 $\to$ 形态描述 $\to$ 关系建模 $\to$ 诊断推理'' 的链式视觉 CoT。本笔记调研了 10 篇医学多模态论文的数据集，给出 \key{视觉原语适配度} 的逐项判断。\\
+\textbf{核心结论：} 这 10 篇里，\key{真正含有空间级标注（bbox / mask / ROI）且能直接用于视觉原语监督}的只有 3 个数据集：\textbf{MedTrinity-25M}、\textbf{GMAI-VL-5.5M}、以及 \textbf{VILA-M3 通过外部 expert model 生成的 grounding}。其中 \textbf{MedTrinity-25M 是首选}，因为它是唯一一个明确以 \key{image-ROI-description triplet} 为基本单元、且自带多粒度文字描述的大规模医学数据集。
+\end{conceptbox}
+
+\subsubsection*{1. 任务定位}
+
+\textbf{我想做的事：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 沿用 Thinking with Visual Primitives 的 \key{多粒度视觉原语} 思想，让 MLLM 在医学图像上能 ``指着 ROI 说话''：先选区域、再描述、再聚合关系、最后给诊断。
+  \item 训练数据需要同时具备：
+  \begin{enumerate}[leftmargin=1.5em]
+    \item \key{空间锚定} (bbox / mask / ROI 坐标)；
+    \item \key{多粒度文字} (modality / organ / 病灶属性 / 区域关系 / 诊断结论)；
+    \item \key{推理链 / CoT}（最好是 medically-grounded，不是 GPT 凭空编的）。
+  \end{enumerate}
+\end{itemize}
+
+\textbf{数据集筛选标准：}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{硬性 (Must-have)}：含 bbox/mask 等空间标注。
+  \item \textbf{软性 (Nice-to-have)}：含 region-level caption；含多专科 / 多模态覆盖；含 CoT 标注；规模足以撑视觉编码器 CPT。
+\end{itemize}
+
+\subsubsection*{2. 10 篇论文 / 数据集核心信息汇总}
+
+\paragraph{(1) MedTrinity-25M (NeurIPS 2024 / ICLR 2025 spotlight)}
+
+\href{https://arxiv.org/abs/2408.02900}{arXiv 2408.02900}，作者 Yunfei Xie 等 (HUST + UCSC + Harvard + Stanford)。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{数据单位}：\textbf{image-ROI-description triplet}（这正是我想要的视觉原语单元！）。
+  \item \key{规模}：25M+ 图像，10 模态，65+ 疾病，30+ 数据源。
+  \item \key{标注内容}：每个图都有
+  \begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Global}：modality、organ detection、disease type；
+    \item \textbf{Local}：bbox + segmentation mask + region-wise textual description；
+    \item \textbf{Region-wise correlation}：ROI 与周边区域的关系描述。
+  \end{itemize}
+  \item \key{构建方式}：自动 pipeline = ``coarse caption $\to$ ROI locating (expert models) $\to$ medical KB retrieval $\to$ MLLM 多粒度生成''，对原始数据集 \textbf{无需配对文本}。
+  \item \key{开源}：\url{https://github.com/UCSC-VLAA/MedTrinity-25M}，HuggingFace 上有 25M 全量。
+\end{itemize}
+
+\paragraph{(2) GMAI-VL-5.5M (CVPR 2025)}
+
+\href{https://arxiv.org/abs/2411.14522}{arXiv 2411.14522}，作者 Tianbin Li 等 (Shanghai AI Lab + 多校)。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{规模}：5.5M 高质量 image-text pairs，源自 \textbf{219 个专科医学数据集}。
+  \item \key{覆盖}：13 模态 (CT / MRI / X-ray / fundus / pathology / dermoscopy 等) $\times$ 18 专科。
+  \item \key{标注格式}：统一 schema $\langle$image, modality, label, department, bbox [optional]$\rangle$。
+  \item \key{关键点}：\textbf{把 SA-Med2D-20M 的 segmentation mask 转成了 detection bbox 格式}，这是视觉原语监督的金矿。
+  \item \key{训练对话样例}：``As a medical expert, you are given a $\langle$X-ray$\rangle$ image \dots where the $\langle$bbox [179,164,500,434]$\rangle$ is labeled as $\langle$Pneumothorax$\rangle$''。
+  \item \key{开源}：\url{https://huggingface.co/datasets/OpenGVLab/GMAI-VL-5.5M}。
+\end{itemize}
+
+\paragraph{(3) VILA-M3 (CVPR 2025)}
+
+\href{https://arxiv.org/abs/2411.12915}{arXiv 2411.12915}，作者 NVIDIA + MONAI 团队。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{思想}：VLM 不直接学 grounding，而是 \textbf{推理时调用外部 expert model}（BraTS、VISTA3D、CheXpert、TorchXRayVision）拿 segmentation 反馈。
+  \item \key{数据}：MIMIC-CXR + VQA-RAD + SLAKE + Path-VQA + CheXpert (Exp.) + 自建 expert-trigger 训练样本（含特殊 token 如 $\langle$VISTA3D(hepatic tumor)$\rangle$）。
+  \item \key{模式}：``hybrid 2D/3D info fusion'' —— 把 3D CT / MRI 的 segmentation 体积还原成 2D context 给 VLM。
+  \item \key{开源}：训练脚本和 model card 在 \url{https://github.com/Project-MONAI/VLM}。
+\end{itemize}
+
+\paragraph{(4) Patho-R1 (2025.05)}
+
+\href{https://arxiv.org/abs/2505.11404}{arXiv 2505.11404}，病理领域专精的 RL-based reasoner。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{三阶段 pipeline}：CPT 3.5M 图文 $\to$ SFT 500K $\to$ RL 10K (GRPO + DAPO)。
+  \item \key{CPT 数据}：PathGen-1.6M (\textbf{强调 tissue-cell morphology 与 spatial organization}) + Quilt-1M + PathCap + 自建 textbook。
+  \item \key{SFT 数据 schema}：5 病理子领域 (histopathology / gross / IHC / cytology / FISH) $\times$ 3 难度 CoT $\times$ 4 任务类型 (descriptive / complex reasoning / multi-turn / MCQ)。
+  \item \key{RL 数据}：10K 诊断 MCQs。
+  \item \key{弱点}：\textbf{无 bbox/mask 监督}，只是隐式学高分辨形态学。
+\end{itemize}
+
+\paragraph{(5) Lingshu (2025.06，灵枢)}
+
+\href{https://arxiv.org/abs/2506.07044}{arXiv 2506.07044}，阿里通义医疗多模态基座。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{数据组成}：caption (ROCOv2 + LLaVA-Med + Quilt-LLaVA + PubMedVision + MIMIC-CXR + FairVLMed + MedICaT + MedPix-2.0) + instruction (PathVQA + PMC-VQA + SLAKE + VQA-RAD + Quilt-LLaVA + VQA-Med-2019 + LLaVA-Med-zh) + reasoning distillation + RLVR ($\sim$100K)。
+  \item \key{训练范式}：4 stage = vision-text alignment $\to$ medical 知识注入 $\to$ medical reasoning SFT $\to$ Lingshu-RL (RLVR/GRPO)。
+  \item \key{弱点}：\textbf{无空间标注}，纯 VQA + CoT。
+\end{itemize}
+
+\paragraph{(6) MedReason (2025.04)}
+
+\href{https://arxiv.org/abs/2504.00993}{arXiv 2504.00993}，KG-grounded 医学 CoT 数据集。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{核心方法}：用 PrimeKG / UMLS 做 entity mapping，找 question $\to$ answer 之间的 \textbf{shortest path}，再用 LLM 剪枝得到 ``thinking path''。
+  \item \key{规模}：32K CoT 样本，覆盖 MedQA + MedMCQA + PubMedQA + MMLU-Pro。
+  \item \key{弱点}：\textbf{纯文本，没有图像}。
+  \item \key{对我有用的部分}：``KG 路径剪枝'' 思想可以迁移到 \key{视觉原语之间的关系约束}（确保原语链在 SNOMED-CT / UMLS 上合法）。
+\end{itemize}
+
+\paragraph{(7) MedVLThinker (2025.08)}
+
+\href{https://arxiv.org/abs/2508.02669}{arXiv 2508.02669}，多模态医学 reasoning 的简洁 baseline。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{数据}：m23k (text-only) + PMC-VQA (image-text，176,948 QA / 149K 图)。
+  \item \key{训练 recipe}：filter (Qwen2.5-VL pass-rate) $\to$ SFT (蒸馏 CoT) $\to$ RLVR (binary reward)。
+  \item \key{反直觉发现}：\textbf{只用 text-only 数据做 RLVR，反而比 image-text 数据更好}。
+  \item \key{弱点}：无空间标注。
+\end{itemize}
+
+\paragraph{(8) GMAI-VL-R1 (2025.04)}
+
+\href{https://arxiv.org/abs/2504.01886}{arXiv 2504.01886}，GMAI-VL 的 RL 版本。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{数据}：GMAI-Reasoning10K = 10K VQA + GPT-4o 蒸馏 CoT，源自 \textbf{95 个公开数据集}，12 模态。
+  \item \key{算法}：GRPO，reward = $r_\text{acc} + r_\text{fmt} + r_\text{rep}$。
+  \item \key{弱点}：无空间标注（虽然 GMAI-VL-5.5M 有，但 R1 阶段没用到）。
+\end{itemize}
+
+\paragraph{(9) Medical Thinking with Multiple Images (ICLR 2026 在审)}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item arXiv / OpenReview 上暂时\textbf{找不到正式 PDF}，疑似还在 ICLR 2026 审稿期；
+  \item 从标题推测：研究多图联合推理（前后随访、不同切片、不同模态对比），是 \textbf{医学版的 Multi-Image CoT}；
+  \item 待论文公开后再补充判断。
+\end{itemize}
+
+\paragraph{(10) Derm1M (ICCV 2025)}
+
+\href{https://openaccess.thecvf.com/content/ICCV2025/papers/Yan_Derm1M_A_Million-scale_Vision-Language_Dataset_Aligned_with_Clinical_Ontology_Knowledge_ICCV_2025_paper.pdf}{Yan et al., ICCV 2025}。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \key{规模}：1M 皮肤病图像-文字对，对齐 \textbf{临床本体知识 (ontology)}。
+  \item \key{标注层级}：concept tree (super-class $\to$ disease $\to$ sub-type) + 文本 caption。
+  \item \key{适合场景}：皮肤镜 / 临床照片，可作为 \textbf{皮肤病专科的视觉原语预训练数据}（disease taxonomy 即天然的多粒度先验）。
+  \item \key{弱点}：以 image-level / concept-level 标注为主，\textbf{不直接含 bbox}；但皮损本身大多数在画面中央，可与 SAM 结合自动生成 ROI。
+\end{itemize}
+
+\subsubsection*{3. 视觉原语适配度总评分表}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\setlength{\tabcolsep}{4pt}
+\footnotesize
+\begin{tabular}{|c|p{0.20\linewidth}|p{0.18\linewidth}|p{0.16\linewidth}|p{0.13\linewidth}|c|c|}
+\hline
+\# & 论文 / 数据集 & 规模 & bbox/mask & CoT & 开源 & 适配度 \\
+\hline
+1 & \textbf{MedTrinity-25M} & 25M triplets, 10 模态, 65 病 & 是 (bbox+mask+desc) & 多粒度文本 & 是 & $\bigstar\bigstar\bigstar\bigstar\bigstar$ \\
+\hline
+2 & \textbf{GMAI-VL-5.5M} & 5.5M, 219 子集, 13 模态 & 是 (SA-Med2D 转 bbox) & 指令式 & 是 & $\bigstar\bigstar\bigstar\bigstar\bigstar$ \\
+\hline
+3 & VILA-M3 & 多源混合 & expert model 提供 & expert trigger & 是 & $\bigstar\bigstar\bigstar\bigstar$ \\
+\hline
+4 & Patho-R1 (PathGen-1.6M 等) & CPT 3.5M / SFT 500K / RL 10K & 否 (隐式形态学) & 是 (3 级 CoT) & 是 & $\bigstar\bigstar\bigstar$ \\
+\hline
+5 & Derm1M & 1M (皮肤) & 否 (image-level) & ontology 标签 & 是 & $\bigstar\bigstar\bigstar$ \\
+\hline
+6 & Lingshu data mix & 多 M 级 & 否 & 是 (RLVR) & 是 & $\bigstar\bigstar$ \\
+\hline
+7 & GMAI-Reasoning10K & 10K & 否 & 是 (GPT-4o CoT) & 是 & $\bigstar\bigstar$ \\
+\hline
+8 & MedVLThinker (m23k + PMC-VQA) & $\sim$200K & 否 & 是 (RLVR) & 是 & $\bigstar\bigstar$ \\
+\hline
+9 & MedReason (32K CoT) & 32K \textbf{文本} & 否 (纯文本) & 是 (KG) & 是 & $\bigstar$ \\
+\hline
+10 & Medical Thinking w/ Multi Images & 未公开 & ? & ? & ? & ? \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{符号说明：} ``是'' / ``否'' 表示该数据集是否提供该类标注。
+
+\subsubsection*{4. 推荐的训练数据组合 (5-stage pipeline)}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.5cm and 1.0cm,
+    every node/.style={font=\small},
+    stage/.style={draw, rounded corners, text width=0.92\linewidth, align=left, inner sep=6pt}
+]
+  \node[stage, fill=blue!10] (s1)
+    {\textbf{Stage 1 (CPT)}：Derm1M + Patho-R1 CPT (PathGen-1.6M / Quilt-1M)\\
+     \hspace*{1.5em}+ ROCOv2 / PubMedVision\\
+     $\Rightarrow$ 学医学视觉特征};
+
+  \node[stage, fill=green!10, below=of s1] (s2)
+    {\textbf{Stage 2 (视觉原语 SFT)}：MedTrinity-25M + GMAI-VL-5.5M\\
+     $\Rightarrow$ 学 ``ROI 定位 $\to$ 描述 $\to$ 关系''};
+
+  \node[stage, fill=yellow!20, below=of s2] (s3)
+    {\textbf{Stage 3 (推理 SFT)}：GMAI-Reasoning10K + Patho-R1 SFT 500K\\
+     $\Rightarrow$ 学链式 CoT};
+
+  \node[stage, fill=orange!20, below=of s3] (s4)
+    {\textbf{Stage 4 (RLVR)}：MedVLThinker / Lingshu-RL recipe\\
+     \hspace*{1.5em}+ 自建 verifiable QA\\
+     $\Rightarrow$ GRPO/DAPO 对齐};
+
+  \node[stage, fill=red!10, below=of s4] (s5)
+    {\textbf{Stage 5 (KG 约束)}：MedReason 思想\\
+     $\Rightarrow$ 视觉原语关系图谱化、防幻觉};
+
+  \draw[->, thick] (s1) -- (s2);
+  \draw[->, thick] (s2) -- (s3);
+  \draw[->, thick] (s3) -- (s4);
+  \draw[->, thick] (s4) -- (s5);
+\end{tikzpicture}
+\end{center}
+
+\subsubsection*{5. 关键判断}
+
+\begin{summarybox}
+\textbf{核心结论：}\\
+1. \textbf{首选 MedTrinity-25M}：唯一一个 ``image-ROI-description triplet'' 形式的大规模医学数据集，且明确包含 bbox + mask + 多粒度文字（global + local + region-wise correlation），\key{天然契合视觉原语推理的三要素}。\\
+2. \textbf{次选 GMAI-VL-5.5M}：标注 schema 干净统一，prompt 模板可直接复用；特别是把 SA-Med2D 的 segmentation 转成 detection bbox 这一步，省去自己做的 conversion。\\
+3. \textbf{Patho-R1 + Derm1M}：作为专科扩展（病理 / 皮肤），可补足 MedTrinity 在细胞级和皮肤镜上的覆盖。\\
+4. \textbf{其余 5 篇 (Lingshu / GMAI-VL-R1 / MedVLThinker / MedReason / Medical-Multi-Image)} 主要贡献在 \key{训练 recipe / RL 框架 / 知识图谱约束 / CoT 蒸馏}，不直接提供视觉原语监督信号，但可作为后续 stage (SFT 推理 / RLVR / KG-guard) 的范本。
+\end{summarybox}
+
+\subsubsection*{6. 落地优先级建议}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \key{第一周}：下载 MedTrinity-25M 子集 (CT / X-ray / fundus 各采 50K)，搭通 ``ROI bbox $+$ region caption'' 的 SFT pipeline，验证 LLaVA-style 模型能否学会 ``视觉原语指认 $+$ 局部描述''。
+  \item \key{第二周}：把 GMAI-VL-5.5M 的 bbox prompt 模板合并进来，扩展模态覆盖。
+  \item \key{第三周}：参考 Patho-R1 的 3 级 CoT 模板，把 ``原语链推理'' 加进 SFT。
+  \item \key{第四周}：参考 GMAI-VL-R1 / MedVLThinker 的 GRPO recipe，做 RL 微调。
+  \item \key{第五周}：参考 MedReason 的 KG 思想，加一个 ``原语关系合法性'' 的 verifier 当 reward signal。
+\end{enumerate}
+
+\subsubsection*{7. 资料来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item MedTrinity-25M：\href{https://arxiv.org/abs/2408.02900}{arXiv 2408.02900}，\href{https://yunfeixie233.github.io/MedTrinity-25M/}{项目主页}，\href{https://github.com/UCSC-VLAA/MedTrinity-25M}{GitHub}。
+  \item GMAI-VL \& GMAI-VL-5.5M：\href{https://arxiv.org/abs/2411.14522}{arXiv 2411.14522}，\href{https://huggingface.co/datasets/OpenGVLab/GMAI-VL-5.5M}{HF 数据集}。
+  \item VILA-M3：\href{https://arxiv.org/abs/2411.12915}{arXiv 2411.12915}，\href{https://github.com/Project-MONAI/VLM}{GitHub}。
+  \item Patho-R1：\href{https://arxiv.org/abs/2505.11404}{arXiv 2505.11404}。
+  \item Lingshu：\href{https://arxiv.org/abs/2506.07044}{arXiv 2506.07044}。
+  \item MedReason：\href{https://arxiv.org/abs/2504.00993}{arXiv 2504.00993}。
+  \item MedVLThinker：\href{https://arxiv.org/abs/2508.02669}{arXiv 2508.02669}。
+  \item GMAI-VL-R1：\href{https://arxiv.org/abs/2504.01886}{arXiv 2504.01886}。
+  \item Derm1M：\href{https://openaccess.thecvf.com/content/ICCV2025/papers/Yan_Derm1M_A_Million-scale_Vision-Language_Dataset_Aligned_with_Clinical_Ontology_Knowledge_ICCV_2025_paper.pdf}{ICCV 2025 paper}。
+  \item Medical Thinking with Multiple Images：ICLR 2026 在审，正式 PDF 暂未公开。
+  \item Thinking with Visual Primitives (DeepSeek)：\href{https://arxiv.org/abs/2511.10591}{arXiv 2511.10591}。
+\end{itemize}

@@ -1,0 +1,563 @@
+% ============================================================
+% Paper deep reading: Flow-OPD
+% Source: https://arxiv.org/abs/2605.08063
+% ============================================================
+
+\section{论文精读：Flow-OPD}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2605.08063}{Flow-OPD: On-Policy Distillation for Flow Matching Models}\\
+\textbf{作者/机构：} Zhen Fang, Wenxuan Huang, Yu Zeng, Yiming Zhao, Shuang Chen, Kaituo Feng, Yunlong Lin, Lin Chen, Zehui Chen, Shaosheng Cao, Feng Zhao；USTC / UCLA / CUHK / Xiaohongshu。\\
+\textbf{版本：} arXiv 2605.08063v2，2026-05-11 更新；Project Page: \href{https://costaliya.github.io/Flow-OPD/}{Flow-OPD}；Code: \href{https://github.com/CostaliyA/Flow-OPD}{CostaliyA/Flow-OPD}；Model: \href{https://huggingface.co/CostaliyA/Flow-OPD}{HuggingFace Flow-OPD}。\\
+\textbf{方向标签：} Text-to-Image Flow Matching；RL-based Post-training；On-policy Distillation；Multi-teacher Distillation；Flow-GRPO；Dense Trajectory Supervision；Manifold Anchor Regularization。\\
+\textbf{阅读日期：} 2026-05-14。\\
+\textbf{阅读口径：} 这篇论文可以看作把 LLM 里的 OPD/OPSD 思路迁移到 Flow Matching 图像生成模型：不再把多任务对齐压成一个稀疏 scalar reward，而是先训练多个单任务 teacher，再在 student 自己采样出来的 flow trajectory 上，用 teacher 的 velocity field 提供 dense supervision。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+Flow-OPD 的核心判断是：\textbf{多任务 T2I 对齐里，真正的问题不是 GRPO 完全无效，而是 sparse scalar reward 无法同时表达文字、构图、审美和偏好这些彼此冲突的能力。} 它的解法是把 ``多 reward 混合优化'' 改成 ``多 teacher on-policy dense distillation''：每个 teacher 先在单一 reward 上吃到上限，然后 student 在自己的 on-policy trajectory 上按任务路由去问对应 teacher，获得 step-wise velocity-field supervision。
+
+\[
+\begin{aligned}
+\text{Flow-OPD}
+&= \text{single-reward Flow-GRPO teachers}\\
+&\quad + \text{Flow-based cold start}\\
+&\quad + \text{on-policy SDE rollout}\\
+&\quad + \text{task-routed dense vector-field supervision}\\
+&\quad + \text{Manifold Anchor Regularization}.
+\end{aligned}
+\]
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇的价值不在于又提出一个 T2I reward，而是提出一种 \key{多任务图像生成对齐的组织方式}：先让多个专家各自专精，再用 OPD 把这些专家的轨迹级判断合并进一个通用 student。它和 OPSD 的精神一致，都是 ``on-policy + dense teacher signal''；但 OPSD 的 teacher 来自同模型 privileged context，而 Flow-OPD 的 teacher 是多个单任务 Flow-GRPO 专家。
+\end{summarybox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\linewidth]{flow_opd/mix.pdf}
+\caption{Flow-OPD 与 vanilla GRPO 的多任务训练曲线对比。论文强调 Flow-OPD 在 GenEval 与 OCR 平均 reward 上持续提升并接近 93，而 GRPO 约在 78 附近早停；同时 DeQA 和 PickScore 归一化后也保持较好。图源：arXiv 2605.08063 Figure 1。}
+\label{fig:flow-opd-mix}
+\end{figure}
+
+\subsection{1. 为什么它应该放在图像模型专区}
+
+这篇论文当然属于 RL/OPD 后训练，但它的问题对象不是语言模型，而是 \key{Flow Matching text-to-image model}，底座是 Stable Diffusion 3.5 Medium。它要解决的是图像生成模型在多任务对齐时的典型冲突：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{compositional reasoning / GenEval：} 物体数量、属性、位置关系和组合是否正确；
+  \item \textbf{text rendering / OCR：} 图片中文字是否可读、是否拼写正确；
+  \item \textbf{human preference / PickScore：} 是否更符合人类偏好；
+  \item \textbf{image quality / DeQA：} 画面质量、结构合理性和审美完整性。
+\end{itemize}
+
+因此我把它读成一篇 \key{图像生成模型对齐范式} 论文，而不是普通 RL 算法论文。它和 \texttt{image\_models} 专区里 Wan-Image / Qwen-Image-2.0 的关系也很直接：这些技术报告都在强调专业图像生成系统需要多维度对齐；Flow-OPD 则专门研究当这些维度彼此冲突时，后训练目标应该怎么组织。
+
+\begin{intubox}
+\textbf{一句话定位：} Flow-OPD 是 ``T2I Flow Matching 的 multi-teacher on-policy distillation alignment stage''。它可以接在一个已经能生成图的 FM base model 之后，用来把 composition、OCR、image quality、preference 四类能力合并进一个 generalist T2I 模型。
+\end{intubox}
+
+\subsection{2. 问题背景：为什么多 reward GRPO 会失败}
+
+\subsubsection{2.1 单任务 GRPO 是有效的}
+
+论文首先承认 GRPO / Flow-GRPO 在单 reward 场景下是有效的。Flow Matching 原始训练本质是 offline reconstruction：给定数据路径，学习 velocity field。它不能直接优化不可微的人类偏好、OCR 准确率或复杂组合指标。GRPO 的价值在于让模型在线采样自己的结果，再用 reward 给 group relative advantage：
+
+\[
+A(\mathbf{x}_1^{(i)})=
+\frac{r(\mathbf{x}_1^{(i)})-\mu}{\sigma}.
+\]
+
+这样模型可以探索自己当前分布里的高 reward trajectory，突破纯 SFT / offline FM loss 的上限。
+
+\subsubsection{2.2 失败发生在多任务联合优化}
+
+问题在于，多任务图像对齐并不是 ``把几个 reward 加起来'' 就能解决。论文做了一个很直观的实验：在 SD-3.5-M 上依次加入 GenEval、OCR、PickScore、DeQA 目标，结果出现明显 seesaw effect。
+
+\begin{center}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{设置} & \textbf{GenEval} & \textbf{OCR} \\
+\midrule
+SD-3.5-M & 0.63 & 0.59 \\
++ GenEval & 0.94 & 0.65 \\
++ OCR & 0.89 & 0.91 \\
++ PickScore & 0.82 & 0.86 \\
++ DeQA & 0.73 & 0.83 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个表的读法是：第一个 reward 可能有效，但后续 reward 会不断蚕食之前学到的能力。例如加入 OCR 后 OCR 提升，但 GenEval 从 0.94 掉到 0.89；继续加偏好/质量目标后，GenEval 又降到 0.73。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\linewidth]{flow_opd/intro.pdf}
+\caption{单 reward GRPO 的跨任务退化现象。每个 specialized teacher 在自己的目标上可以变强，但非目标能力会退化；这说明单一 sparse reward 会让优化器沿着目标维度 reward hacking，并破坏共享参数空间里其它能力。图源：arXiv 2605.08063 Figure 2。}
+\label{fig:flow-opd-intro}
+\end{figure}
+
+\subsubsection{2.3 梯度干扰的形式化直觉}
+
+对一个目标任务 $\mathcal{T}_1$ 的参数更新 $\Delta\theta$，它对另一个能力 $\mathcal{T}_k$ 的一阶影响可以近似为：
+
+\[
+\Delta \mathcal{J}_k
+\approx
+\left\langle
+\nabla_\theta \mathcal{J}_k,
+\Delta\theta
+\right\rangle.
+\]
+
+如果任务梯度方向冲突，
+
+\[
+\left\langle
+\nabla_\theta \mathcal{J}_k,
+\nabla_\theta \mathcal{J}_1
+\right\rangle < 0,
+\]
+
+那么优化 $\mathcal{T}_1$ 就会压低 $\mathcal{T}_k$。T2I 里这很常见：为了 OCR 更清楚，模型可能牺牲自然质感；为了审美更强，可能牺牲精确几何和文字；为了复杂组合正确，可能降低整体图片美感。
+
+\begin{warnbox}
+\textbf{关键问题：} scalar reward 太窄。它只告诉模型 ``这张图最终得分多少''，但没有告诉每个 denoising step、每个 velocity field 的局部方向应该怎样兼顾多个能力。于是多 reward 混合会把高维冲突压缩成一个低维标量，天然容易 seesaw。
+\end{warnbox}
+
+\subsection{3. 方法总览：两阶段 alignment}
+
+Flow-OPD 把多任务对齐拆成两阶段：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Expert acquisition：} 用单 reward Flow-GRPO 训练多个 domain-specialized teachers。每个 teacher 只服务一个目标，例如 GenEval、OCR、PickScore、DeQA。
+  \item \textbf{Expert unification：} 初始化一个 student，然后让 student on-policy 采样自己的 flow trajectory；根据 prompt/task 路由到对应 teacher，teacher 在 student 访问到的 state 上提供 dense vector-field supervision；最后用 MAR 防止功能对齐导致审美塌陷。
+\end{enumerate}
+
+这相当于把 ``多个 reward 同时压进一个 policy gradient'' 改成了 ``多个 teacher 分别给局部 dense direction''。
+
+\[
+\text{multi-reward scalar optimization}
+\quad\Longrightarrow\quad
+\text{multi-teacher dense trajectory distillation}.
+\]
+
+\begin{summarybox}
+\textbf{最重要的转换：} reward 不再只是最终图像的一个数，而是 teacher 在每个 explored latent state 上给出的 velocity field。对 Flow Matching 来说，这比 token-level logit distribution 更自然，因为模型本来学的就是连续时间 velocity。
+\end{summarybox}
+
+\subsection{4. 方法拆解}
+
+\subsubsection{4.1 Flow-based Cold Start}
+
+OPD 依赖 student 自己采样轨迹。如果初始 student 太差，trajectory 会偏离 teacher 的可监督区域，早期训练就会不稳定。因此论文先做 cold start，给 student 一个较强的初始策略 $\theta_0$。
+
+论文试了两种方式：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{SFT-based initialization：} 用 specialized teachers 采样的 trajectories 做监督微调，让 student 先继承专家分布。
+  \item \textbf{Model merging：} 直接把多个 teacher 的参数先合并成一个初始 student，等于把多个单任务先验叠到同一个参数点上。
+\end{itemize}
+
+从主结果看，\key{Merge init} 版本最好：GenEval 0.92、OCR 0.94、DeQA 4.35、PickScore 23.08，平均 0.9044。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.78\linewidth]{flow_opd/bar.pdf}
+\caption{Cold-start ablation。冷启动能显著提升后续 Flow-OPD 的稳定性；其中 model merging 不需要额外训练成本，并且在同构 teacher 场景下给出更强的功能对齐初始点。图源：arXiv 2605.08063 Figure 4。}
+\label{fig:flow-opd-coldstart}
+\end{figure}
+
+\subsubsection{4.2 把 OPD 搬到 Flow Matching：从 token distribution 到 velocity field}
+
+LLM 里的 OPD 通常在 student 自己生成的 token sequence 上，对齐 teacher 的 next-token distribution。Flow Matching 没有离散 token policy，它学习的是连续时间 ODE/SDE 的 velocity field。
+
+Flow Matching 的基础形式是：
+
+\[
+\mathrm{d}\mathbf{x}_t = v_t(\mathbf{x}_t,t)\,\mathrm{d}t.
+\]
+
+在 OT path 下，
+
+\[
+\mathbf{x}_t=(1-t)\mathbf{x}_0+t\mathbf{x}_1,
+\]
+
+模型用 FM loss 学习速度：
+
+\[
+\mathcal{L}_{\mathrm{FM}}(\theta)
+=
+\mathbb{E}_{t,\mathbf{x}_0,\mathbf{x}_1}
+\left[
+\left\|v_\theta(\mathbf{x}_t,t)-(\mathbf{x}_1-\mathbf{x}_0)\right\|^2
+\right].
+\]
+
+为了做 on-policy exploration，论文跟随 Flow-GRPO，把 deterministic probability flow ODE 转成带噪 SDE：
+
+\[
+\mathrm{d}x_t
+=
+\left[
+ v_\theta(x_t,t)+\frac{\sigma_t^2}{2t}\left(x_t+(1-t)v_\theta(x_t,t)\right)
+\right]\mathrm{d}t
++\sigma_t\mathrm{d}w.
+\]
+
+离散后，每一步 transition 可以看成一个局部 Gaussian policy：
+
+\[
+\pi_\theta(x_{t-\Delta t}\mid x_t,c)
+=
+\mathcal{N}\left(\mu_\theta(x_t,t),\sigma_t^2\Delta t I\right).
+\]
+
+\subsubsection{4.3 Task routing：每个样本只问对应 teacher}
+
+对 student 访问到的 state $x_t$，Flow-OPD 不让所有 teacher 同时说话，而是用 hard routing：
+
+\[
+k=\mathcal{R}(c),
+\qquad
+v_{\mathrm{target}}(x_t,t,c)=v_{\phi_k}(x_t,t,c).
+\]
+
+这里 $c$ 是文本条件，$\mathcal{R}(\cdot)$ 把 prompt/task 映射到对应 expert。这样做的核心是 \key{避免 teacher 之间的监督信号互相干扰}：OCR prompt 主要问 OCR teacher，组合 prompt 主要问 GenEval teacher，审美/质量任务问对应质量 teacher。
+
+\begin{intubox}
+\textbf{直觉版：} 多 reward GRPO 像一个老师同时要求你 ``字要清楚、画要美、数量要准、风格要好''，但只给一个总分；Flow-OPD 像把老师拆成几个专科老师，学生写到某一步时，由最相关的老师直接指出当前 velocity direction 应该往哪边修。
+\end{intubox}
+
+\subsubsection{4.4 Dense KL reward：vector field 距离就是 OPD 奖励}
+
+因为 student policy 和 target policy 都是同方差 Gaussian，它们的 KL 可以解析成均值距离：
+
+\[
+D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{\mathrm{target}})
+=
+\frac{\|\mu_\theta(x_t,t)-\mu_{\mathrm{target}}(x_t,t)\|^2}{2\sigma_t^2\Delta t}.
+\]
+
+代入 SDE transition mean 之后，KL 等价于一个时间加权的 velocity-field 距离：
+
+\[
+D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{\mathrm{target}})
+=
+\frac{\Delta t}{2}
+\left(
+\frac{\sigma_t(1-t)}{2t}+\frac{1}{\sigma_t}
+\right)^2
+\left\|v_\theta(x_t,t,c)-v_{\mathrm{target}}(x_t,t,c)\right\|^2.
+\]
+
+论文把这个距离取负，作为 immediate dense reward：
+
+\[
+r_t^{(i)}
+=
+-w(t)
+\left\|
+\bar{v}_\theta(x_t^{(i)},t,c)-v_{\mathrm{target}}(x_t^{(i)},t,c)
+\right\|^2.
+\]
+
+注意这里 $\bar{v}_\theta$ 是 detached student vector field：reward 本身不反传梯度，梯度只通过 policy ratio 走。
+
+\subsubsection{4.5 Clipped policy gradient：保持 on-policy RL 形态}
+
+Flow-OPD 不是简单做 teacher-student regression，而是把 dense OPD reward 放进 PPO/GRPO 风格的 clipped policy update：
+
+\[
+\mathcal{J}(\theta)
+\approx
+\frac{1}{BG}
+\sum_{j=1}^{B}\sum_{i=1}^{G}\sum_{t=0}^{T}
+\min\left(
+\rho_{t,i,j}(\theta)r_{t,i,j}^{\mathrm{OPD}},
+\mathrm{clip}\left(\rho_{t,i,j}(\theta),1-\epsilon,1+\epsilon\right)
+r_{t,i,j}^{\mathrm{OPD}}
+\right).
+\]
+
+这保留了 RL 的 on-policy exploration，也用 clipping 控制 policy trust region。
+
+\begin{summarybox}
+\textbf{和普通 distillation 的差别：} 如果直接回归 teacher velocity field，那更像 off-policy imitation；Flow-OPD 的重点是 student 先暴露自己会走到哪些 latent states，然后 teacher 在这些 states 上给监督。这对应 OPSD 里 ``student rollout prefix 给 teacher'' 的思想，只是这里的 prefix 变成了 flow trajectory state。
+\end{summarybox}
+
+\subsubsection{4.6 Manifold Anchor Regularization：别为了 OCR/结构把画面弄丑}
+
+Flow-OPD 还引入 MAR。它观察到功能性 reward 很容易 reward hacking：比如文字变清楚了，但背景单调、质感塑料化、多个实体语义重复，或者整体审美下降。
+
+MAR 的做法是额外维护一个 frozen aesthetic teacher，给所有数据提供高质量 visual manifold anchor：
+
+\[
+\mathcal{L}_{\mathrm{Total}}(\theta)
+=
+\mathcal{L}_{\mathrm{Policy}}(\theta)
++\lambda
+\mathbb{E}_{c,t,x_t\sim\rho_t^\theta}
+\left[
+ w(t)
+ \left\|v_\theta(x_t,t,c)-v_{\mathrm{aesthetic}}(x_t,t,c)\right\|^2
+\right].
+\]
+
+这相当于在吸收功能性 teacher 时，把 student 拉回一个高质量图像流形，避免 ``为了某个指标变强而牺牲通用画质''。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.88\linewidth]{flow_opd/p2.pdf}
+\caption{MAR 的定性消融。无 MAR 时，模型容易出现背景模式塌陷、结构重复或审美退化；引入 aesthetic teacher 作为 manifold anchor 后，图像质量和语义丰富度更稳。图源：arXiv 2605.08063 Figure 5。}
+\label{fig:flow-opd-mar}
+\end{figure}
+
+\subsection{5. 算法流程：用一条 T2I prompt 走一遍}
+
+假设 prompt 是：\textit{``A poster with the word FLOW-OPD, three red cubes above two blue spheres, clean studio lighting.''}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{先有多个 teacher：}
+    \begin{itemize}[leftmargin=1.5em]
+      \item GenEval teacher 擅长数量、颜色、空间关系；
+      \item OCR teacher 擅长文字渲染；
+      \item PickScore teacher 擅长人类偏好；
+      \item DeQA/aesthetic teacher 擅长整体质量。
+    \end{itemize}
+  \item \textbf{Cold start：} student 先通过 SFT 或 model merging 获得一个不太差的初始参数，避免一开始采样轨迹太烂。
+  \item \textbf{On-policy rollout：} student 用 SDE 采样 $G$ 条 latent denoising trajectories。每条 trajectory 都是当前 student 真会走的路径。
+  \item \textbf{Task routing：} 这个 prompt 同时涉及 OCR 与 composition，但论文实现是 hard routing 到一个对应 domain teacher；如果路由到 OCR teacher，它就在每个 $x_t$ 上给 OCR 优化方向；如果路由到 GenEval teacher，则给组合关系优化方向。
+  \item \textbf{Dense labeling：} teacher 不只给最终图像打一个分，而是在每个 $x_t$ 上输出 target velocity field。
+  \item \textbf{Dense reward：} 用 student velocity 和 teacher velocity 的加权 $L_2$ 差距构造 $r_t$，每个 denoising step 都有信号。
+  \item \textbf{Policy update：} 用 clipped policy gradient 更新 student。reward detached，梯度通过 policy ratio 走。
+  \item \textbf{MAR anchor：} aesthetic teacher 同时约束 student 不要偏离高质量视觉流形。
+\end{enumerate}
+
+\begin{intubox}
+\textbf{形象理解：} GRPO 像最后看成品海报打分；Flow-OPD 像老师在每一步草图演化时告诉你 ``当前这一步的方向场应该这样走''。所以它不是更密的最终 reward，而是把监督下沉到了 flow trajectory 的每个状态。
+\end{intubox}
+
+\subsection{6. 实验设置}
+
+论文的实验底座是 \textbf{Stable Diffusion 3.5 Medium}。评测包括四类主指标：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{GenEval：} compositional image generation；
+  \item \textbf{OCR Accuracy：} visual text rendering；
+  \item \textbf{DeQA：} image quality / detailed quality assessment；
+  \item \textbf{PickScore：} human preference proxy。
+\end{itemize}
+
+训练和评测细节来自论文 appendix / GitHub README：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 训练规模：4 nodes，每个节点 $8\times$ H800，约 50 小时；
+  \item sampling timestep $T=10$，evaluation timestep $T=40$；
+  \item group size $G=24$；
+  \item noise level $a=0.7$，分辨率 512；
+  \item MAR KL ratio $\beta=0.02$；
+  \item LoRA 设置：$\alpha=64$，$r=32$；
+  \item GRPO-Mix 的 GenEval:OCR:PickScore 数据/epoch 比例约为 3:1:1。
+\end{itemize}
+
+\subsection{7. 主结果怎么读}
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{GenEval} & \textbf{OCR} & \textbf{DeQA} & \textbf{PickScore} & \textbf{Avg} \\
+\midrule
+SD-3.5-M & 0.63 & 0.59 & 4.07 & 21.64 & 0.7166 \\
+GRPO-GenEval & 0.94 & 0.65 & 4.01 & 21.53 & 0.8050 \\
+GRPO-OCR & 0.64 & 0.92 & 4.06 & 21.69 & 0.8016 \\
+GRPO-DeQA & 0.64 & 0.66 & 4.23 & 23.02 & 0.7578 \\
+GRPO-PickScore & 0.51 & 0.69 & 4.22 & 23.19 & 0.7340 \\
+GRPO-Mix & 0.73 & 0.83 & 4.33 & 21.84 & 0.8165 \\
+Ours (SFT) & 0.91 & 0.92 & 4.29 & 21.83 & 0.8819 \\
+\textbf{Ours (Merge)} & \textbf{0.92} & \textbf{0.94} & \textbf{4.35} & \textbf{23.08} & \textbf{0.9044} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\linewidth]{flow_opd/p1.pdf}
+\caption{Flow-OPD 与多个 baseline 的定性对比。论文声称 Flow-OPD 在指令遵循、文字生成、结构一致性和人类偏好之间取得更好的折中，并出现 teacher-surpassing：student 在一些边界样例上超过任一单独 teacher。图源：arXiv 2605.08063 Figure 3。}
+\label{fig:flow-opd-main-qualitative}
+\end{figure}
+
+这张主结果表有三个重点：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{单 teacher 是偏科生：} GRPO-GenEval 的 GenEval 达到 0.94，但 OCR 只有 0.65；GRPO-OCR 的 OCR 达到 0.92，但 GenEval 只有 0.64；GRPO-PickScore 的 PickScore 高，但 GenEval 掉到 0.51。
+  \item \textbf{GRPO-Mix 缓解但不解决：} Avg 到 0.8165，但 GenEval 只有 0.73，OCR 0.83，仍明显低于各单项 teacher ceiling。
+  \item \textbf{Flow-OPD Merge 最均衡：} GenEval 0.92 接近 GenEval teacher 的 0.94；OCR 0.94 超过 OCR teacher 的 0.92；DeQA 4.35 超过 DeQA teacher 的 4.23；PickScore 23.08 接近 PickScore teacher 的 23.19。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{Teacher-surpassing 怎么理解：} 它不一定说明 student 获得了神秘新能力，更可能是多 teacher 在同一个 student manifold 中做了 cross-pollination：composition teacher、OCR teacher、quality teacher 的局部方向共同塑造了更平滑的通用 flow manifold，使 student 在某些样例上超过单个偏科 teacher。
+\end{summarybox}
+
+\subsection{8. OOD / T2I-CompBench++ 结果}
+
+论文还在 T2I-CompBench++ 上测试 out-of-domain compositional generalization：
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Model} & \textbf{Color} & \textbf{Shape} & \textbf{Texture} & \textbf{Complex} & \textbf{3D} & \textbf{Numeracy} & \textbf{Non-Spatial} \\
+\midrule
+SD3.5-M & 0.7994 & 0.5669 & 0.7338 & 0.3800 & 0.3739 & 0.5927 & 0.3146 \\
+GRPO-Mix & 0.7966 & 0.5803 & 0.7392 & 0.3677 & 0.3681 & 0.6388 & 0.3130 \\
+Cold Start & 0.8173 & 0.6126 & 0.7342 & 0.3870 & 0.4249 & 0.6458 & 0.3145 \\
+Cold Start + GRPO & 0.8031 & 0.5985 & 0.7409 & 0.3842 & 0.4017 & 0.6269 & 0.3136 \\
+\textbf{Ours (Merge)} & \textbf{0.8298} & \textbf{0.6292} & \textbf{0.7446} & \textbf{0.3943} & \textbf{0.4565} & \textbf{0.6837} & \textbf{0.3163} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这说明 Flow-OPD 不只是把训练 reward benchmark 做高，也提升了一些 compositional OOD 指标，尤其是 shape、3D-spatial、numeracy。
+
+\subsection{9. MAR 对通用画质的影响}
+
+MAR 的作用可以从通用质量/偏好指标看到：
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{ImageReward} & \textbf{Aesthetic} & \textbf{UnifiedReward} & \textbf{HPS-v2.1} & \textbf{QwenVL} \\
+\midrule
+SD-3.5-M & 1.02 & 5.87 & 3.339 & 0.2982 & 3.45 \\
+GRPO-DeQA & 1.33 & 5.97 & 3.456 & 0.2846 & 3.68 \\
+GRPO-Mix & 1.23 & 5.93 & 3.501 & 0.3101 & 3.88 \\
+w.o. MAR & 1.26 & 5.89 & 3.518 & 0.2998 & 3.82 \\
+\textbf{Ours (Merge)} & \textbf{1.36} & \textbf{6.23} & \textbf{3.659} & \textbf{0.3302} & \textbf{4.05} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+无 MAR 时 QwenVL 3.82、Aesthetic 5.89；加 MAR 后 QwenVL 4.05、Aesthetic 6.23。这个结果支持论文的主张：只做功能对齐容易画质退化，必须有一个高质量 manifold anchor。
+
+\subsection{10. 和 OPSD / Flow-GRPO / DenseGRPO 的关系}
+
+\subsubsection{10.1 和 OPSD}
+
+OPSD 和 Flow-OPD 的共同点：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 都是 \textbf{on-policy}：监督发生在 student 自己访问到的分布上；
+  \item 都用 \textbf{dense teacher signal} 替代稀疏 outcome reward；
+  \item 都强调 exposure bias / distribution shift：不要只在离线标准轨迹上训练。
+\end{itemize}
+
+差别也很关键：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+\textbf{维度} & \textbf{OPSD} & \textbf{Flow-OPD} \\
+\midrule
+对象 & LLM reasoning & Flow Matching T2I \\
+teacher 来源 & 同模型 + privileged solution context & 多个单 reward Flow-GRPO expert teacher \\
+监督对象 & next-token distribution & continuous velocity field \\
+轨迹 & student token rollout / prefix & student SDE latent trajectory \\
+主要目标 & reasoning dense self-distillation & multi-task image alignment \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{对应关系：} OPSD 里 ``student prefix 给 teacher''，到 Flow-OPD 里变成 ``student latent state 给 teacher''；OPSD 里 teacher 输出 token distribution，Flow-OPD 里 teacher 输出 velocity field。
+\end{intubox}
+
+\subsubsection{10.2 和 Flow-GRPO}
+
+Flow-GRPO 解决的是 ``FM 模型如何做 RL''；Flow-OPD 解决的是 ``多个 Flow-GRPO experts 如何合成一个 generalist''。
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Flow-GRPO 的 reward 是 scalar，通常是 terminal / sparse 或按 trajectory 粗粒度广播；
+  \item Flow-OPD 的 reward 来自 teacher-student velocity KL，每个 denoising step 都有 dense signal；
+  \item Flow-GRPO-Mix 把多个 reward 混在一起，容易梯度干扰；
+  \item Flow-OPD 用 task routing 把不同 teacher 的监督解耦。
+\end{itemize}
+
+\subsubsection{10.3 和 DenseGRPO}
+
+DenseGRPO 试图把最终 reward 拆成 step-wise credit，回答 ``哪一步对最终 reward 贡献更大''。Flow-OPD 则更进一步：它不只是把终局 reward densify，而是直接用 teacher velocity field 构造 dense supervision。
+
+\[
+\text{DenseGRPO: terminal reward}\rightarrow\text{step-wise reward credit}
+\]
+
+\[
+\text{Flow-OPD: teacher vector field}\rightarrow\text{dense trajectory supervision}
+\]
+
+所以二者都在解决稀疏 reward，但监督来源不同：DenseGRPO 仍围绕 reward model，Flow-OPD 围绕 expert policy / expert velocity field。
+
+\subsection{11. 我认为它的真正贡献}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{贡献 1：把 OPD 从离散 token 推广到连续 flow trajectory。} 它给出了一个很自然的映射：token policy distribution 对应 SDE transition Gaussian，KL 对应 velocity-field weighted $L_2$。
+  \item \textbf{贡献 2：把多任务对齐拆成 expert acquisition 与 expert unification。} 这比直接 multi-reward RL 更可控，也更符合工业系统中 ``单能力先做到上限，再合并'' 的经验。
+  \item \textbf{贡献 3：task-routed dense labeling。} 这是一种避免 teacher/reward 互相打架的组织方式。
+  \item \textbf{贡献 4：MAR 作为功能对齐的安全带。} 它提醒我们图像模型后训练不能只追功能性指标，必须显式保护 visual manifold。
+\end{itemize}
+
+\subsection{12. 局限与风险}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{依赖 teacher 上限：} appendix 明确说，如果 specialized teacher 自己生成错误，错误会通过 dense supervision 传给 student。
+  \item \textbf{需要 teacher/student 架构同构：} velocity-field step-wise supervision 要求 teacher 和 student 在可对齐的 flow trajectory / latent space 中工作。异构模型蒸馏还未解决。
+  \item \textbf{hard routing 可能过粗：} 一个 prompt 往往同时需要 OCR、composition、aesthetics。单 teacher hard routing 简化了干扰，但可能错过多 teacher 协同。
+  \item \textbf{代码仍未完全开源：} README 说 full training code 仍在逐步开源；multi-teacher 系统交互还在 review，当前公开实现偏 single-teacher example。
+  \item \textbf{评测仍可能 reward-driven：} GenEval/OCR/PickScore/DeQA 覆盖面有限，真实复杂编辑、多图一致性、版权/安全等能力还没充分评估。
+  \item \textbf{成本不低：} 先训练多个 experts，再做 OPD，需要多 teacher 推理、on-policy rollout 和 reward/eval 服务；虽然 LoRA 降低成本，但工程复杂度较高。
+\end{itemize}
+
+\subsection{13. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{多能力后训练不要急着混 reward：} 可以先训练 experts，再做 dense teacher unification。
+  \item \textbf{把 reward model 升级成 generative teacher：} 对图像模型来说，teacher 不只是打分器，还可以返回 velocity field / denoising direction。
+  \item \textbf{on-policy distillation 的通用模板：} student 先走自己的轨迹，再在这些 states 上问 teacher，而不是在 teacher 轨迹上做离线模仿。
+  \item \textbf{MAR 思路可迁移：} 任何功能性对齐任务，比如 OCR、layout、identity，都应该有一个 aesthetics / fidelity anchor，避免 reward hacking。
+  \item \textbf{teacher-surpassing 可以作为研究假设：} 多 teacher dense supervision 是否会形成比单 teacher 更平滑的通用 manifold，值得做 controlled ablation。
+\end{itemize}
+
+\subsection{14. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item hard routing 的具体分类器/规则是什么？多标签 prompt 是否会被错误路由？
+  \item multi-teacher 系统公开代码之后，teacher querying 的通信成本和显存成本如何？
+  \item MAR 的 aesthetic teacher 为什么选 DeQA-style teacher，而不是 base model 或 human preference teacher？
+  \item ``teacher-surpassing'' 是否有更严格的统计验证，还是主要来自定性 case？
+  \item 对 FLUX、Qwen-Image、Wan-Image 这类不同架构的 FM/DiT 模型是否同样有效？
+  \item 若 teacher 之间架构不同，能否做 cross-architecture velocity distillation 或 score distillation？
+\end{itemize}
+
+\subsection{15. 读完后的记忆钩子}
+
+\begin{intubox}
+\textbf{Flow-OPD = 不要把多个老师的意见压成一个分数，而是让学生在自己走过的每一步，去问最相关的老师：这一刻的 velocity field 应该往哪里走。}
+\end{intubox}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文主页：} \href{https://arxiv.org/abs/2605.08063}{Flow-OPD: On-Policy Distillation for Flow Matching Models}；\href{https://arxiv.org/html/2605.08063v2}{HTML}；\href{https://arxiv.org/pdf/2605.08063}{PDF}。
+  \item \textbf{项目页：} \href{https://costaliya.github.io/Flow-OPD/}{Flow-OPD Project Page}，用于核对方法概览、关键结果和 qualitative gallery。
+  \item \textbf{代码仓库：} \href{https://github.com/CostaliyA/Flow-OPD}{CostaliyA/Flow-OPD}，用于核对复现脚本、reward server 设置、T2I-CompBench 评测和 README 中的公开进度。
+  \item \textbf{模型权重：} \href{https://huggingface.co/CostaliyA/Flow-OPD}{HuggingFace Flow-OPD}。
+  \item \textbf{对照阅读：} \href{https://arxiv.org/abs/2505.05470}{Flow-GRPO}；\href{https://arxiv.org/abs/2505.07818}{DanceGRPO}；\href{https://thinkingmachines.ai/blog/on-policy-distillation}{On-Policy Distillation}；OPSD 笔记用于对照 LLM reasoning 中的 on-policy self-distillation。
+\end{itemize}

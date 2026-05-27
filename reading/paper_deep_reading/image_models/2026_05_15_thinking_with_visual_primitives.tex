@@ -1,0 +1,447 @@
+% ============================================================
+% Paper deep reading: Thinking with Visual Primitives
+% Main source: /Users/killerwang/Documents/My-Notes/Thinking_with_Visual_Primitives.pdf
+% ============================================================
+
+\section{论文精读：Thinking with Visual Primitives}
+
+\begin{conceptbox}
+\textbf{论文：} Thinking with Visual Primitives\\
+\textbf{作者/机构：} Ruijie Lu, Yiyang Ma, Xiaokang Chen, Lingxiao Luo, Zhiyu Wu, Zizheng Pan, Xingchao Liu, Yutong Lin, Hao Li, Wen Liu, Zhewen Hao, Xi Gao, Shaoheng Nie, Yixuan Wei, Zhenda Xie, Ting Chen, Gang Zeng；DeepSeek-AI / Peking University / Tsinghua University。\\
+\textbf{主源：} 本地 PDF：\texttt{Thinking\_with\_Visual\_Primitives.pdf}。\\
+\textbf{方向标签：} Multimodal Reasoning；Grounded Chain-of-Thought；Visual Primitives；Bounding Box Reasoning；Point-based Reasoning；Spatial Reasoning；Topological Reasoning。\\
+\textbf{阅读日期：} 2026-05-15。\textbf{阅读口径：} 这篇论文不是简单地在 CoT 里插入坐标，而是提出一整套让 MLLM 在推理链中使用 \key{bbox / point 作为视觉指代原语} 的训练体系：先通过 pretraining 学会坐标语言，再用 cold-start 任务塑造使用场景，最后通过 SFT、RL、RFT 和 OPD 把 box expert 与 point expert 合并成一个统一模型。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+\key{Thinking with Visual Primitives 的核心判断是：多模态 CoT 的瓶颈不只是看不清，而是指不准。} 高分辨率裁剪和动态 patch 主要缓解 Perception Gap；但 dense counting、multi-hop spatial reasoning、maze navigation 这类任务真正困难的是 Reference Gap：语言里的 ``左边那个''、``上面的球''、``下一段路径'' 不能稳定绑定到图像中的具体位置。
+
+它的解法是把视觉空间里的最小指代单位提升为思考单位：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Bounding box：} 用来锚定对象实例，适合 counting、object grounding、spatial VQA。
+  \item \textbf{Point / point sequence：} 用来锚定位置、路径和拓扑状态，适合 maze navigation、path tracing、trajectory reasoning。
+\end{itemize}
+
+\begin{summarybox}
+\textbf{我的理解：} 这篇论文真正有启发性的地方，是把 ``视觉引用'' 从后验验证变成了思考过程本身。模型不是最后再说自己看到了什么，而是在每一步 reasoning 中都用 bbox 或 point 把当前语言命题钉回图像坐标系。
+\end{summarybox}
+
+\subsection{1. 问题定位：Perception Gap 之后还有 Reference Gap}
+
+现有多模态模型常见增强路径是增加视觉 token、动态裁剪、high-resolution crop 或视觉工具调用。这些方法让模型 ``看得更细''，主要解决 \key{Perception Gap}。但作者认为，即使模型已经看清楚了，复杂推理仍然会失败，因为自然语言本身不是精确的二维指针。
+
+\begin{intubox}
+\textbf{直觉版：} 人数很多时，人类会用手指一个个点着数；走迷宫时，人类会沿着路线看、遇到死路回退。这个过程不是纯语言推理，而是语言和视觉指针交替进行。论文试图把这种 ``指着想'' 的机制放进 MLLM 的 CoT。
+\end{intubox}
+
+这就解释了为什么单纯的文本 CoT 容易崩：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{对象漂移：} 前面说的 ``gray metallic object'' 到后面可能不再对应同一个实例。
+  \item \textbf{计数重复或遗漏：} 模型没有稳定的一实例一锚点机制。
+  \item \textbf{空间关系断裂：} 多跳推理中，每一步关系都需要绑定到具体对象。
+  \item \textbf{拓扑路径不可表达：} 迷宫和曲线追踪需要一串位置状态，纯文本很难忠实表达。
+\end{itemize}
+
+\subsection{2. 方法总览：从坐标语言到可验证推理}
+
+论文的训练路径可以概括成三层：
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=8mm and 8mm,
+  box/.style={draw=primary, rounded corners, align=center, inner sep=5pt, font=\small, text width=0.23\linewidth},
+  arrow/.style={-{Stealth[length=2mm]}, thick, draw=textgray}
+]
+\node[box] (pre) {\textbf{2.3 Pretraining}\\学习 bbox / point 输出格式\\建立视觉原语语言};
+\node[box, right=of pre] (cold) {\textbf{2.4 Cold-start Tasks}\\Counting / Spatial VQA\\Maze / Path Tracing};
+\node[box, right=of cold] (post) {\textbf{2.5 Post-training}\\Specialized SFT/RL\\Unified RFT + OPD};
+\draw[arrow] (pre) -- (cold);
+\draw[arrow] (cold) -- (post);
+\end{tikzpicture}
+\caption{Thinking with Visual Primitives 的训练主线：先学会视觉原语语言，再用任务设计规定它如何参与推理，最后通过专家训练与合并得到统一模型。}
+\end{figure}
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.38\linewidth}}
+\toprule
+\textbf{阶段} & \textbf{它解决什么} & \textbf{关键设计} \\
+\midrule
+Pretraining & 模型不会稳定输出 bbox / point & 大规模 box grounding 数据；统一坐标格式；point 格式不绑定对象名 \\
+Cold-start data & 模型不知道什么时候该用哪种 primitive & 设计 counting、spatial reasoning、maze、path tracing 四类可验证任务 \\
+Post-training & 单一模型难以同时学好 box 与 point reasoning & 先训 box / point 专家，再用 RFT 和 OPD 合并 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{3. 2.3 Pretraining：让模型先学会视觉原语这门语言}
+
+\subsubsection{3.1 Visual primitives 的定义}
+
+论文把两种传统视觉标注形式提升为推理原语：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Box primitive：} 表示一个对象的空间范围。它不只是一个位置，还包含尺度、宽高和图像占比，因此天然适合实例级 grounding。
+  \item \textbf{Point primitive：} 表示一个位置或路径中的中间状态。它不一定指对象，也可以指轨迹、迷宫节点、线条采样点。
+\end{itemize}
+
+bbox 与 point 的差别可以写成：
+
+\[
+\text{bbox} \approx \text{object-level reference},
+\qquad
+\text{point sequence} \approx \text{process-level reference}.
+\]
+
+因此，bbox 更像 ``我说的是这个东西''；point sequence 更像 ``我是沿着这些位置这样走过来的''。
+
+\subsubsection{3.2 为什么优先扩充 bbox 数据}
+
+虽然论文同时使用 box 和 point，但在大规模数据构造上优先扩充 bbox。原因有三点：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{标注更确定：} box 要紧密包住对象，标准相对明确；point 则可能点在头、身体、边缘，甚至遮挡物上。
+  \item \textbf{可泛化到 point：} box 本身由左上角和右下角两个点定义，模型学 box 后更容易迁移到点式表达。
+  \item \textbf{信息更丰富：} point 只有位置，box 额外提供对象大小、形状范围和相对尺度，对 counting 与空间比较更有用。
+\end{itemize}
+
+\subsubsection{3.3 大规模 Web box 数据构造}
+
+作者从互联网数据源中大规模爬取 object detection / grounding 相关数据。以 HuggingFace 为例，他们通过 ``Object Detection'' 和 ``Grounding'' 标签筛选数据集，并用 LLM agent 解析数据集说明文件，把不同格式转换到统一存储格式。
+
+初始数据源规模为 \key{97,984 个 box-grounding 相关数据源}。随后做两阶段过滤。
+
+\paragraph{Step I: Semantic-based Review.}
+
+第一步过滤语义标签质量，重点去掉三类数据：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{无意义机器标签：} 例如纯数字类别、内部开发代码，缺乏自然语言语义。
+  \item \textbf{不可泛化的私人实体：} 例如某个私有人物或内部 ID，模型无法从少量样本学到可泛化概念。
+  \item \textbf{含糊缩写或主观标签：} 例如工业检测中的 ``OK'' / ``NG''，没有稳定视觉语义。
+\end{itemize}
+
+这一轮后，数据源从 \key{97,984} 保留到 \key{43,141}。
+
+\paragraph{Step II: Visual-Geometric Quality Review.}
+
+第二步过滤 box 的几何质量，主要针对：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{严重漏标：} 图中有大量目标实例但只标了一小部分，导致 recall 过低。
+  \item \textbf{严重截断或偏移：} box 没有合理包住对象，切掉关键部位。
+  \item \textbf{Mega box：} box 覆盖超过 90\% 图像，通常意味着分类数据被硬转成检测数据。
+\end{itemize}
+
+这一轮后，数据源从 \key{43,141} 保留到 \key{31,701}。最后作者做类别均衡采样，每个数据集的每个类别最多采样 $N=1000$ 张图，并进行全局去重，最终得到 \key{4000 万级高质量样本}。
+
+\subsubsection{3.4 统一预训练格式}
+
+box grounding 使用如下格式：
+
+\begin{lstlisting}[language={}]
+<|ref|>TARGET<|/ref|><|box|>[[x1,y1,x2,y2],[x3,y3,x4,y4]...]<|/box|>
+\end{lstlisting}
+
+其中坐标被归一化为 $0$ 到 $999$ 的离散整数；多个 box 按从左到右排序。
+
+point 任务使用如下格式：
+
+\begin{lstlisting}[language={}]
+<|point|>[[x1,y1],[x2,y2]...]<|/point|>
+\end{lstlisting}
+
+这里有一个重要差异：\key{point 格式不要求输出对象名}。这是为了让 point 可以表示更抽象的概念，例如路径、运动轨迹或拓扑搜索中的中间节点，而不局限于某个可命名对象。
+
+\subsection{4. 2.4 Task Design \& Cold-Start Data：设计任务逼模型用 primitive 思考}
+
+Pretraining 只让模型学会 ``坐标语言''，但还不能保证模型会在复杂任务中正确使用它。因此 2.4 构造了小规模但高精度的 cold-start 数据，特点是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{明确监督目标：} 来自人工标注、scene graph、程序生成或算法生成。
+  \item \textbf{尽可能可验证：} 能用规则检查 box、point、路径、答案是否一致。
+  \item \textbf{覆盖不同 primitive 使用场景：} bbox 用于对象级推理，point 用于路径和拓扑推理。
+\end{itemize}
+
+四类任务如下：
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.22\linewidth}p{0.22\linewidth}p{0.45\linewidth}}
+\toprule
+\textbf{任务} & \textbf{主要 primitive} & \textbf{训练目标} \\
+\midrule
+Counting & bbox & 建立目标实例和计数之间的一一对应，减少漏数和重复数 \\
+Spatial Reasoning / VQA & bbox & 把多跳关系推理绑定到具体对象，降低指代漂移 \\
+Maze Navigation & point sequence & 用点表达搜索、前进、遇墙、回溯和连通性判断 \\
+Path Tracing & point sequence & 沿曲线采样轨迹，在交叉处依靠几何连续性判断路径 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{4.1 Counting：bbox 解决计数里的对象对应问题}
+
+作者认为 MLLM 计数失败的根源常常不是不会加法，而是没有稳定建立：
+
+\[
+\text{目标类别/属性} \longleftrightarrow \text{图像中的具体实例集合}
+\]
+
+所以 counting 被拆成两类。
+
+\paragraph{Coarse-grained Counting.}
+
+粗粒度计数关注一般类别，例如 ``men''、``dogs''。数据来自多个 dense detection 数据集，并过滤掉过密、box 太小、标注 recall 低的样本。生成 thinking content 时使用三步结构：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Intent Analysis：} 先确认要数什么。
+  \item \textbf{Batch Grounding：} 一次性定位所有候选对象，而不是逐个反复枚举。
+  \item \textbf{Statistical Summation：} 根据 box 集合做统计。
+\end{enumerate}
+
+batch grounding 是关键，因为它迫使模型先显式构造 ``候选对象集合''，再数集合大小。
+
+\paragraph{Fine-grained Counting.}
+
+细粒度计数要求属性或空间约束，例如 ``bears on the ground''、``white dogs on the left''。作者使用 GQA 的 scene graph 生成问题，并记录：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 满足条件的 ground-truth object IDs；
+  \item 被排除的 hard negative object IDs；
+  \item 构造该问答对的 rationale。
+\end{itemize}
+
+这样模型不只是找对象，还要对候选对象做属性/位置筛选。它学到的流程是：
+
+\[
+\text{找所有候选} \rightarrow \text{检查条件} \rightarrow \text{排除负例} \rightarrow \text{计数}.
+\]
+
+\subsubsection{4.2 Spatial Reasoning \& General VQA：bbox 降低多跳推理的指代歧义}
+
+空间推理任务的核心问题是：每一步关系都需要绑定到具体对象。比如问题：
+
+\begin{quote}
+Is there a purple rubber object that has the same size as the gray metallic object?
+\end{quote}
+
+模型应该先定位 gray metallic object，判断它的 size，再搜索同 size 的 purple rubber object。每个关键对象都要带 bbox，避免 ``gray object'' 在多步推理里漂移。
+
+自然图像部分使用 GQA，通过 scene graph 生成空间关系和对象交互问题。合成图像部分使用 CLEVR，因为 CLEVR 可以给出可控场景、程序化问题、execution trace 和 object IDs。作者还把 3D 对象坐标投影到 2D bbox，从而让每一步程序化推理都能对应图像中的具体区域。
+
+此外，作者加入 negative sample augmentation：当被问对象或关系不存在时，模型必须基于视觉证据诚实拒绝，而不是强行幻觉一个 box。
+
+\subsubsection{4.3 Maze Navigation：point sequence 表达拓扑搜索}
+
+迷宫任务要求模型判断从起点到终点是否可达，如果可达则给出路径；如果不可达则说明探索后无路可走。这个任务很难靠语言 CoT 表达，因为它本质上是图结构连通性问题。
+
+作者用 DFS、Prim、Kruskal 生成可解且非平凡的迷宫，并设计三类拓扑：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 矩形网格迷宫；
+  \item 圆形同心环迷宫；
+  \item 六边形蜂窝迷宫。
+\end{itemize}
+
+不可解迷宫的构造也很巧妙：先生成可解迷宫和路径，再在路径中部加墙，使其看起来像可解，但必须完整搜索才能确认不可达。
+
+thinking content 使用 DFS 风格：定位起点和终点、尝试前进、遇墙、回溯、换分支、最终判断。这让 point 成为搜索状态的记录，而不是简单视觉标注。
+
+\subsubsection{4.4 Path Tracing：point sequence 表达沿线追踪}
+
+Path Tracing 任务要求模型从指定起点沿一条曲线走到终点。难点在于多条曲线交叉时，模型必须根据局部几何连续性判断哪条线才是目标线的延续。
+
+作者用程序生成多条 Bézier curves，并引入 uniform-style mode：所有线颜色和线宽相同，迫使模型不能靠颜色捷径，而要靠曲率连续性和局部几何判断。
+
+模型的 thinking content 是一串沿目标曲线采样的点。采样密度随几何复杂度变化：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 直线段点更少；
+  \item 弯曲处点更多；
+  \item 交叉密集区域点更密。
+\end{itemize}
+
+这很像人类沿线追踪时 ``简单处快看，复杂处慢看'' 的行为。论文为 Path Tracing 生成了 \key{125,000 个 cold-start samples}。
+
+\subsection{5. 2.5 Post-Training Pipeline：先训专家，再合并统一模型}
+
+2.5 的核心策略是：
+
+\[
+\text{train specialists} \rightarrow \text{then merge}.
+\]
+
+原因是 bbox reasoning 和 point reasoning 的模式不同，混在少量 specialized data 里容易产生 mode conflict。因此作者先训练两个专家，再合并成统一模型。
+
+\subsubsection{5.1 Specialized SFT}
+
+SFT 阶段的数据比例为：
+
+\[
+70\%\ \text{general multimodal / pure-text data}
+\quad + \quad
+30\%\ \text{specialized visual primitive data}.
+\]
+
+保留大量通用数据是为了避免模型只会输出坐标格式、通用语言和 VQA 能力退化。作者分别训练：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $F_{\mathrm{TwG}}$：Thinking with Grounding，box 专家。
+  \item $F_{\mathrm{TwP}}$：Thinking with Pointing，point 专家。
+\end{itemize}
+
+\subsubsection{5.2 Specialized RL}
+
+SFT 后，作者对两个专家分别做 RL，使用 GRPO。这里最重要的设计是：\key{RL 阶段不再显式监督中间 visual primitives}。因为 cold-start 数据里的 primitives 已经被严格验证过，RL 数据只需要 image、question 和 final answer，这大幅扩大了可用数据范围。
+
+RL 的 reward 由三类 RM 共同构成：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Format RM：} 检查 box / point 格式是否正确，是否重复输出 box，是否陷入无限循环。
+  \item \textbf{Quality RM：} LLM-based GRM，检查 thinking 与 final response 是否一致、是否自相矛盾、是否 reward hacking。
+  \item \textbf{Accuracy RM：} 针对不同任务单独设计，给最终答案和过程合理性打分。
+\end{itemize}
+
+\paragraph{Counting Accuracy RM.}
+
+计数 reward 不是二值 exact match，而是相对误差上的指数衰减：
+
+\[
+R(\hat{y},y)=\alpha\cdot\exp\left(-\beta\cdot\frac{|\hat{y}-y|}{|y|+1}\right),
+\]
+
+其中 $\alpha=0.7$、$\beta=3$。这样差一点不会直接归零，RL 信号更平滑。
+
+\paragraph{Maze Accuracy RM.}
+
+迷宫任务的 reward 很细，包含：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item causal exploration progress：一旦穿墙，后续探索因果上无效并截断；
+  \item exploration completeness：不可解迷宫要尽量完整探索可达区域；
+  \item wall violation penalty：统计所有穿墙行为并惩罚；
+  \item final path validity：可解时必须给出合法连续路径；
+  \item answer correctness：可解/不可解判断是否正确。
+\end{itemize}
+
+\paragraph{Path Tracing Accuracy RM.}
+
+Path Tracing 的 reward 包含：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item trajectory accuracy：双向比较预测轨迹和真实曲线，既惩罚偏离，也惩罚覆盖不完整；
+  \item endpoint accuracy：检查起点和终点位置；
+  \item trajectory continuity penalty：防止模型追一半后直接跳到猜测终点；
+  \item answer correctness：最终 endpoint label 是否正确。
+\end{itemize}
+
+\subsubsection{5.3 RL 数据选择：为什么选 Normal-Level}
+
+作者先让 SFT 模型对每个样本生成 $N$ 个 rollouts，再按正确数量分为：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Easy-Level：} 所有 rollouts 都正确；
+  \item \textbf{Normal-Level：} 有些正确、有些错误；
+  \item \textbf{Hard-Level：} 所有 rollouts 都错误。
+\end{itemize}
+
+RL 主要选择 Normal-Level。直觉是：easy 学不到东西，hard reward 太稀疏，normal 最适合策略改进。
+
+Specialized RL 后得到两个专家：
+
+\[
+E_{\mathrm{TwG}},\quad E_{\mathrm{TwP}}.
+\]
+
+\subsubsection{5.4 Unified RFT}
+
+有了两个专家后，作者让专家在数据池上 rollout，生成 RFT 数据。筛选策略是：保留所有 Normal-Level 样本，并随机采样 5\% Easy-Level 样本以防止简单能力遗忘。然后从 base pretrained model 初始化，训练统一模型 $F$。
+
+这里的重点是：\key{统一模型不是直接参数平均，而是用专家生成的数据重新训练得到。}
+
+\subsubsection{5.5 On-Policy Distillation}
+
+Unified RFT 后的模型虽然已经整合了两类能力，但和两个 expert 仍有差距。因此作者进一步使用 OPD，把 expert 的输出分布蒸馏到统一模型中。
+
+目标函数形式为：
+
+\[
+\mathcal{L}_{\mathrm{OPD}}(\theta)
+=
+\sum_{i=1}^{N}w_i\cdot D_{\mathrm{KL}}\left(\pi_\theta\Vert\pi_{E_i}\right),
+\]
+
+其中 $E_i$ 是 expert，实际使用两个 teacher：$E_{\mathrm{TwG}}$ 和 $E_{\mathrm{TwP}}$。论文采用 full-vocabulary logit distillation。
+
+\begin{summarybox}
+\textbf{关键理解：} 2.5 不是简单的 ``SFT 后 RL''，而是一个分而治之的专家系统：box 和 point 先分开学到足够强，再通过 RFT 和 OPD 统一。这个设计暗示 bbox reasoning 与 point reasoning 在训练动态上确实存在冲突。
+\end{summarybox}
+
+\subsection{6. 和 PatchCue / GRIT / CogCoM 的关系}
+
+你之前提到 PatchCue，我觉得它和这篇论文确实属于同一大方向：\key{把视觉空间中的局部引用单位显式放入推理过程}。但粒度和训练目标不同。
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.18\linewidth}p{0.25\linewidth}p{0.47\linewidth}}
+\toprule
+\textbf{工作} & \textbf{视觉引用粒度} & \textbf{和 TWVP 的差别} \\
+\midrule
+PatchCue & patch-level cues & 更贴近 ViT patch token，让模型用 patch cue 辅助推理；TWVP 更强调可读、可验证的 bbox / point 作为显式思考单位。 \\
+GRIT & image / region in CoT & 也是让 MLLM ``think with images''，但 TWVP 更强调 Reference Gap 和坐标级 primitive。 \\
+CogCoM & visual manipulations & 通过视觉操作链增强推理；TWVP 不一定操作图像，而是在文本推理中嵌入空间指针。 \\
+VLM-R3 / VGR & region recognition / grounded reasoning & 更偏区域识别、推理和证据追踪；TWVP 将 point 引入拓扑和路径类 reasoning。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{我的判断：} PatchCue 更像 ``模型内部 patch 粒度的提示''，TWVP 更像 ``外显可读的视觉指针语言''。前者贴近视觉编码器，后者贴近推理链和可验证过程。真正值得继续探索的是：能否把 patch cue、bbox、point、mask、trajectory 统一成多粒度 visual reference language。
+\end{intubox}
+
+\subsection{7. 我认为这篇论文最可复用的想法}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{把视觉中间态显式化：} 不要只让模型在 hidden state 里隐式对齐视觉对象，而是让它在可读 CoT 里写出坐标级证据。
+  \item \textbf{任务决定 primitive：} bbox 适合对象集合，point 适合路径过程。不同 primitive 应该绑定不同任务结构。
+  \item \textbf{训练数据要可验证：} maze 和 path tracing 的价值在于 verifier 强，可以给过程级 reward，而不是只看最终答案。
+  \item \textbf{专家先分开训：} box expert 与 point expert 先专精，再合并，能避免早期 mode conflict。
+  \item \textbf{Normal-Level 数据最适合 RL：} 通过 rollout 难度筛选，把 RL 预算放在模型半会不会的样本上。
+\end{itemize}
+
+\subsection{8. 局限与待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{坐标不等于视觉理解：} 模型可能学会输出格式，但坐标是否真实对应视觉证据仍需要强 verifier。
+  \item \textbf{公开性与复现细节不足：} 本地 PDF 未给出清晰公开 arXiv 编号；训练数据和 reward implementation 仍高度依赖内部系统。
+  \item \textbf{bbox / point 不是唯一 primitive：} mask、segment、depth、pose、scene graph edge 也可能是更合适的视觉思考单位。
+  \item \textbf{point 的语义仍然模糊：} 一个 point sequence 可以表示轨迹，但复杂场景中点的采样密度、顺序和解释都需要规范化。
+  \item \textbf{与隐式 attention 的关系未被充分解释：} visual primitive 是作为外显监督增强了 attention，还是形成了新的推理协议？这个还值得做机制分析。
+  \item \textbf{负样本与 faithful refusal 很关键：} 如果训练中过少，模型可能倾向于总是输出一个坐标，导致 grounded hallucination。
+\end{itemize}
+
+\subsection{9. 读完后的记忆钩子}
+
+\begin{summarybox}
+\textbf{TWVP = 让模型一边想，一边指。} bbox 负责 ``我说的是哪个对象''，point sequence 负责 ``我是沿着哪条路径想过来的''。它的真正贡献不是坐标格式本身，而是把视觉指针、任务构造、过程验证和专家合并组织成了一套训练 pipeline。
+\end{summarybox}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{主源论文：} Thinking with Visual Primitives，本地 PDF 文件。按标题检索 arXiv API 未返回精确条目，因此本笔记不虚构 arXiv 编号。
+  \item \textbf{PatchCue：} \href{https://arxiv.org/abs/2603.05869}{PatchCue: Enhancing Vision-Language Model Reasoning with Patch-Based Visual Cues}，用于对照 patch-level visual cues 与 bbox / point primitives 的粒度差异。
+  \item \textbf{GRIT：} \href{https://arxiv.org/abs/2505.15879}{GRIT: Teaching MLLMs to Think with Images}，论文参考文献中作为视觉 CoT / grounding 相关工作。
+  \item \textbf{CogCoM：} \href{https://arxiv.org/abs/2402.04236}{CogCoM: A Visual Language Model with Chain-of-Manipulations Reasoning}，用于对照 visual manipulation chain 与 visual primitive chain。
+  \item \textbf{Kosmos-2：} \href{https://arxiv.org/abs/2306.14824}{Kosmos-2: Grounding Multimodal Large Language Models to the World}，作为 grounding multimodal LLM 的代表性前置工作。
+  \item \textbf{CLEVR：} Johnson et al., \textit{CLEVR: A Diagnostic Dataset for Compositional Language and Elementary Visual Reasoning}, CVPR 2017；本论文用其生成 synthetic multi-hop spatial reasoning 数据。
+  \item \textbf{GQA：} Hudson and Manning, \textit{GQA: A New Dataset for Real-World Visual Reasoning and Compositional Question Answering}, CVPR 2019；本论文用其 scene graph 构造 natural-scene counting 与 spatial reasoning 数据。
+  \item \textbf{论文内相邻工作：} VLM-R3、VGR、Traceable Evidence Enhanced Visual Grounded Reasoning、Visual CoT 等，均用于理解 ``视觉证据进入推理链'' 这一研究线索。
+\end{itemize}

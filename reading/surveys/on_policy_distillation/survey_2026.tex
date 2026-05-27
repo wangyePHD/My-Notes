@@ -1,0 +1,562 @@
+% ============================================================
+% Survey: Generation-side OPD / OPSD
+% Date: 2026-05-20
+% Main sources: arXiv HTML/PDF + project pages + existing deep reading notes
+% Figures downloaded from arXiv HTML into assets/figures/on_policy_distillation/
+% ============================================================
+
+\section{生成侧 OPD/OPSD Survey：从离线监督到 on-policy 轨迹监督}
+
+\begin{conceptbox}
+\textbf{主题：} 生成模型里的 On-Policy Distillation (OPD) 与 On-Policy Self-Distillation (OPSD)。\\
+\textbf{核心论文边界：} 严格生成侧主线至少应包含四篇：\key{Flow-OPD}（T2I Flow Matching 多任务对齐）、\key{DiffusionOPD}（连续扩散 Markov chain 的 closed-form OPD）、\key{D-OPSD}（少步扩散模型持续微调）与 \key{AnyFlow}（any-step video diffusion 的 on-policy flow-map distillation）。语言侧 \key{OPSD} 与 \key{UniSD} 只作为机制来源和对照，不应和生成侧论文混成同一类主线。\\
+\textbf{资料来源：} 已重新访问 arXiv abstract / HTML / PDF / source、项目页和代码仓库，并下载论文图到 \code{assets/figures/on_policy_distillation/}；同时参考已有精读笔记。\\
+\textbf{一句话总论：} 这波 OPD/OPSD 的真正变化，不是“又一种蒸馏 loss”，而是把监督信号从 \key{teacher / target 定义的离线轨迹} 挪到 \key{student 自己推理时会访问的 on-policy 轨迹} 上。
+\end{conceptbox}
+
+\subsection{0. 我先纠正上一版的错误理解}
+
+上一版笔记的问题是把几篇带 “self-distillation / OPD” 字样的论文平铺在一起，导致两个关键点被冲淡：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{生成侧主线不是语言/生成混排，也不是两篇或三篇，而至少是四篇。} OPSD 是 LLM reasoning 的概念源头，UniSD 是 LLM self-distillation 的组件化框架；真正直接讨论生成模型 trajectory 的主线应包含 \textbf{Flow-OPD}、\textbf{DiffusionOPD}、\textbf{D-OPSD} 与 \textbf{AnyFlow}。
+  \item \textbf{四篇解决的问题不一样。} Flow-OPD 解决“多个 reward-specialized 图像生成专家怎么合成一个通用模型”；DiffusionOPD 解决“如何把 OPD 从离散 token 提升到连续扩散 Markov chain，并用 closed-form per-step KL 替代高方差 PPO”；D-OPSD 解决“已经 step-distilled 的少步图像模型怎么继续监督微调而不破坏少步动力学”；AnyFlow 解决“consistency-distilled video model 为什么不能 any-step scaling，以及如何用 flow-map OPD 保留 ODE 轨迹”。
+  \item \textbf{共同点不是 teacher 形式，而是训练状态。} 不管 teacher 是 reward-trained 单任务专家、同模型多模态上下文、强视频 diffusion teacher，还是语言侧 privileged context，关键都是：student 先走自己的轨迹，然后 teacher 在这些 states / transitions / prefixes 上给 dense supervision。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{新的 survey 读法：} 把 OPD/OPSD 看成一个“训练状态重定位”问题：从 \bad{在数据/teacher 轨迹上训练 student}，转向 \good{在 student 自己会访问的轨迹上训练 student}。生成侧的贡献，是把这个想法从离散 token rollout 翻译成连续 diffusion / flow velocity trajectory。
+\end{summarybox}
+
+\subsection{1. 概念源头：语言侧 OPSD 只提供模板，不是生成侧主线}
+
+\subsubsection{1.1 LLM OPSD 的模板}
+
+LLM OPSD 的最小模板是：
+
+\begin{center}
+\resizebox{0.92\linewidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.75cm and 1.2cm,
+  box/.style={draw, rounded corners, align=center, inner sep=6pt, font=\small},
+  arrow/.style={-{Latex[length=2mm]}, thick}
+]
+  \node[box] (data) {数据：问题 $x$ + 标准解 $y^\star$};
+  \node[box, below left=of data] (student) {Student\\只看 $x$};
+  \node[box, below right=of data] (teacher) {Teacher\\看 $x,y^\star$};
+  \node[box, below=of student] (rollout) {student on-policy rollout\\生成 $\hat y$};
+  \node[box, below=of rollout] (prefix) {把 $\hat y_{<t}$ 给 teacher};
+  \node[box, below=of prefix] (dist) {对齐 next-token distribution\\forward KL + clipping};
+  \draw[arrow] (data) -- (student);
+  \draw[arrow] (data) -- (teacher);
+  \draw[arrow] (student) -- (rollout);
+  \draw[arrow] (rollout) -- (prefix);
+  \draw[arrow] (teacher) |- (prefix);
+  \draw[arrow] (prefix) -- (dist);
+\end{tikzpicture}%
+}
+\end{center}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\linewidth]{on_policy_distillation/opsd_x1.png}
+\caption{语言侧 OPSD 的方法图。它不是让 student 模仿 reference trajectory，而是先让 student 生成自己的 on-policy response，再让额外看到 reference solution 的同源 teacher 在 student prefix 上给 next-token distribution。图源：\href{https://arxiv.org/html/2601.18734v3}{arXiv HTML: OPSD Figure 1}。}
+\end{figure}
+
+这个模板迁移到生成侧时，发生了两个替换：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.28\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+\textbf{抽象元素} & \textbf{LLM OPSD} & \textbf{生成侧 OPD/OPSD}\\
+\midrule
+student 访问的状态 & token prefix $\hat y_{<t}$ & diffusion / flow latent state $x_t^s$\\
+teacher 的输出 & next-token distribution & velocity field / SDE transition direction\\
+监督距离 & full-vocabulary KL / JSD & weighted velocity MSE 或 transition KL\\
+privileged 信息 & 标准解 / reference CoT & 目标图像、多任务 expert、reward-trained teacher\\
+核心风险 & style token 主导 KL & 破坏少步动力学、reward hacking、teacher 冲突\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{1.2 为什么生成侧更难}
+
+语言侧的 prefix 是离散且自回归的；生成侧的 trajectory 是连续 latent dynamics。尤其是少步 diffusion / flow model，一步 velocity 的错误会直接改变后续状态分布。因此生成侧 OPD/OPSD 的难点不是“怎么写一个 KL”，而是：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{state 必须是 student 自己 rollout 出来的。} 不能随便拿 target image noising states 当训练状态，否则 train-test mismatch 会破坏 few-step dynamics。
+  \item \textbf{teacher 信号必须是局部方向。} 最终 reward 一个数不够，最好能在每个 $x_t$ 上给 velocity field。
+  \item \textbf{要防止功能性目标破坏图像流形。} OCR、composition、aesthetics、identity 等目标往往互相拉扯，单一 scalar reward 很容易 reward hacking。
+\end{itemize}
+
+\subsection{2. 论文图谱：四条生成侧路线}
+
+\begin{center}
+\resizebox{0.98\linewidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.75cm and 0.75cm,
+  box/.style={draw, rounded corners, align=center, inner sep=5pt, font=\small, text width=3.25cm},
+  arrow/.style={-{Latex[length=2mm]}, thick}
+]
+  \node[box, fill=blue!8] (opsd) {LLM OPSD\\student prefix + privileged teacher distribution};
+  \node[box, fill=green!8, below left=of opsd, xshift=-2.3cm] (flow) {Flow-OPD\\多任务 T2I 对齐\\multi-expert velocity OPD};
+  \node[box, fill=cyan!8, below left=of opsd, xshift=0.2cm] (diffopd) {DiffusionOPD\\连续扩散 OPD\\closed-form transition KL};
+  \node[box, fill=orange!10, below right=of opsd, xshift=-0.2cm] (dopsd) {D-OPSD\\少步扩散持续微调\\target image as teacher context};
+  \node[box, fill=purple!8, below right=of opsd, xshift=2.3cm] (anyflow) {AnyFlow\\any-step video diffusion\\flow-map OPD};
+  \node[box, fill=gray!8, below=of flow] (flowproblem) {问题：多个 reward-specialized experts 怎么统一，不发生 seesaw?};
+  \node[box, fill=gray!8, below=of diffopd] (diffproblem) {问题：OPD 如何从离散 token 扩展到连续 denoising transition?};
+  \node[box, fill=gray!8, below=of dopsd] (dproblem) {问题：few-step model 怎么学新概念/风格，而不破坏已蒸馏轨迹?};
+  \node[box, fill=gray!8, below=of anyflow] (aproblem) {问题：video distilled model 怎么既少步快，又能随 step 数增加继续变好?};
+  \draw[arrow] (opsd) -- (flow);
+  \draw[arrow] (opsd) -- (diffopd);
+  \draw[arrow] (opsd) -- (dopsd);
+  \draw[arrow] (opsd) -- (anyflow);
+  \draw[arrow] (flow) -- (flowproblem);
+  \draw[arrow] (diffopd) -- (diffproblem);
+  \draw[arrow] (dopsd) -- (dproblem);
+  \draw[arrow] (anyflow) -- (aproblem);
+\end{tikzpicture}%
+}
+\end{center}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{p{0.12\linewidth}p{0.18\linewidth}p{0.18\linewidth}p{0.18\linewidth}p{0.20\linewidth}p{0.09\linewidth}}
+\toprule
+\textbf{维度} & \textbf{Flow-OPD} & \textbf{DiffusionOPD} & \textbf{D-OPSD} & \textbf{AnyFlow} & \textbf{共同抽象}\\
+\midrule
+目标任务 & 多任务 T2I 对齐 & 多任务 diffusion OPD 理论与训练 & 少步扩散持续微调 & any-step video diffusion distillation & 生成模型后训练\\
+teacher 来源 & 多个 Flow-GRPO 单任务 experts & 多个单任务 RL teachers & 同模型 + target image multimodal context & 强 video diffusion teacher + DMD supervision & teacher 更强/更多信息\\
+student 状态 & SDE rollout trajectory & SDE/ODE denoising Markov rollout & few-step solver rollout trajectory & flow-map backward simulation rollout & on-policy states / transitions\\
+监督对象 & expert velocity field & same-covariance Gaussian transition mean / per-step KL & multimodal teacher velocity field & arbitrary interval transition / reverse divergence & dense local supervision\\
+需要 reward & expert acquisition 阶段需要 & teacher acquisition 阶段需要；OPD 阶段用 teacher transition & 不需要 & 不靠 hand-designed reward；用 DMD/KL teacher guidance & OPD 阶段非 final scalar reward\\
+主要防线 & task routing + MAR & closed-form KL + round-robin gradient accumulation & same-state matching + EMA teacher & flow-map transition + shortcut simulation & 防分布错位 / 防动力学破坏\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{3. Flow-OPD：把多 reward 对齐改造成多 expert 轨迹蒸馏}
+
+\subsubsection{3.1 它真正解决的问题：不是单任务 RL，而是多任务 seesaw}
+
+Flow-OPD 的第一张图已经把问题说清楚：GRPO 单独优化某个 reward 可以变强，但 reward 一多就会互相伤害。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.94\linewidth]{on_policy_distillation/flow_opd_x1.png}
+\caption{Flow-OPD 的动机图：vanilla GRPO 在多任务混合时停在较低水平；cold-start + GRPO 有提升但仍受限；Flow-OPD 通过 expert unification 继续提升。右侧显示 GenEval / OCR / DeQA / PickScore 多指标上，Flow-OPD 更均衡。图源：\href{https://arxiv.org/html/2605.08063v4}{arXiv HTML: Flow-OPD Figure 1}。}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.94\linewidth]{on_policy_distillation/flow_opd_x2.png}
+\caption{单任务 teacher 的偏科现象：GRPO-GenEval、GRPO-OCR、GRPO-PickScore、GRPO-DeQA 各自在目标维度增强，但非目标能力退化。这是 Flow-OPD 放弃“混 scalar reward”，转向“先专家、再蒸馏”的直接证据。图源：\href{https://arxiv.org/html/2605.08063v4}{arXiv HTML: Flow-OPD Figure 2}。}
+\end{figure}
+
+\begin{warnbox}
+\textbf{我的理解：} Flow-OPD 的核心不是“OPD 比 GRPO 高级”，而是说 \key{多任务生成对齐不能把多个目标粗暴压成一个 scalar reward}。OCR、构图、审美和偏好对应的梯度方向本来就可能冲突；先训练 specialists，再让 generalist 在自己的 trajectory 上问 specialists，才是更自然的组织方式。
+\end{warnbox}
+
+\subsubsection{3.2 方法：expert acquisition 到 expert unification}
+
+Flow-OPD 可以拆成两段：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Expert acquisition：} 用 Flow-GRPO 分别训练 GenEval、OCR、PickScore、DeQA 等单任务 experts。每个 expert 只服务一个 reward，尽量吃到该能力上限。
+  \item \textbf{Expert unification：} 初始化一个 student；student 用 SDE 采样自己的 on-policy trajectory；根据 task routing 找对应 expert；expert 在 student 访问到的 $x_t^s$ 上输出 velocity field；student 通过 clipped policy update 学这个 dense velocity reward。
+\end{enumerate}
+
+对 Flow Matching 来说，student 和 expert 在同一 state 上的 transition KL 可以写成加权 velocity 距离：
+
+\[
+D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{\mathrm{target}})
+\propto
+w(t)\left\|v_\theta(x_t,t,c)-v_{\mathrm{target}}(x_t,t,c)\right\|^2.
+\]
+
+因此 Flow-OPD 把 “teacher 给一个完整样本” 变成 “teacher 在每个 latent state 给一个局部 vector-field direction”。
+
+\begin{summarybox}
+\textbf{关键 insight：} Flow-OPD 的 teacher 不是 reward model，而是 \key{generative policy / velocity expert}。这比 reward model 多了一个维度：它不只判断“最终图像好不好”，还告诉 student “当前 denoising state 应该往哪个方向走”。
+\end{summarybox}
+
+\subsubsection{3.3 三个设计点：cold start、task routing、MAR}
+
+\paragraph{Cold start：为什么不能直接 OPD？}
+
+OPD 依赖 student 自己 rollout。如果 student 初始太弱，它会走到 expert 不擅长纠偏的区域；teacher signal 也可能变成噪声。因此 Flow-OPD 先做 cold start：要么用 experts samples 做 SFT，要么直接 model merging。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.86\linewidth]{on_policy_distillation/flow_opd_x4.png}
+\caption{Flow-OPD cold-start 消融。Merge init 版本在 GenEval、OCR、DeQA、PickScore 上整体最好，说明 OPD 不是凭空启动的，它需要一个已经接近专家混合流形的 student 初始点。图源：\href{https://arxiv.org/html/2605.08063v4}{arXiv HTML: Flow-OPD Figure 4}。}
+\end{figure}
+
+\paragraph{Task routing：为什么不用所有 experts 一起教？}
+
+如果一个 prompt 主要考 OCR，就让 OCR expert 提供 velocity；主要考 composition，就让 GenEval expert 提供 velocity。这个 hard routing 看起来粗糙，但它避免了多 teacher 在同一 state 上给互相冲突的方向。
+
+\paragraph{MAR：为什么需要审美锚？}
+
+功能性 reward 很容易让图像走偏：文字更清楚但背景塌，构图更准但质感变差。Flow-OPD 用 frozen aesthetic teacher 做 Manifold Anchor Regularization (MAR)，相当于在吸收功能 expert 的同时，不让 student 离开高质量图像流形。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\linewidth]{on_policy_distillation/flow_opd_x5.png}
+\caption{MAR 消融定性图。没有 KL/MAR 锚点时，模型更容易出现背景单调、结构重复或审美退化；加入 manifold anchor 后，功能性提升不会严重牺牲视觉质量。图源：\href{https://arxiv.org/html/2605.08063v4}{arXiv HTML: Flow-OPD Figure 5}。}
+\end{figure}
+
+\subsubsection{3.4 主结果怎么读：Flow-OPD 是“通才学生”而非“单项冠军”}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{on_policy_distillation/flow_opd_x3.png}
+\caption{Flow-OPD 主定性对比。单任务 experts 往往偏科，GRPO-Mix 仍会丢某些能力；Flow-OPD 在文字、数量、组合、审美等维度更均衡。图源：\href{https://arxiv.org/html/2605.08063v4}{arXiv HTML: Flow-OPD Figure 3}。}
+\end{figure}
+
+主表中最该看的不是单个最高分，而是“能不能接近各个 teacher ceiling”：
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{GenEval} & \textbf{OCR} & \textbf{DeQA} & \textbf{PickScore} & \textbf{Avg}\\
+\midrule
+SD-3.5-M & 0.63 & 0.59 & 4.07 & 21.64 & 0.7166\\
+GRPO-Mix & 0.73 & 0.83 & 4.33 & 21.84 & 0.8165\\
+Ours (SFT init) & 0.91 & 0.92 & 4.29 & 21.83 & 0.8819\\
+\textbf{Ours (Merge init)} & \textbf{0.92} & \textbf{0.94} & \textbf{4.35} & \textbf{23.08} & \textbf{0.9044}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{summarybox}
+\textbf{Flow-OPD 的真正贡献：} 它给多任务图像生成对齐提出了一个可复用范式：\key{先把每个能力训练成 expert，再在 student 的 on-policy latent trajectory 上做 task-routed dense distillation，最后用 visual manifold anchor 防 reward hacking}。
+\end{summarybox}
+
+\subsection{4. D-OPSD：少步扩散模型的持续微调必须发生在自己的 few-step trajectory 上}
+
+\subsubsection{4.1 它真正解决的问题：step-distilled model 的 SFT 会破坏 dynamics}
+
+D-OPSD 面对的不是多 reward 冲突，而是少步模型的训练状态错位。普通 SFT 会在 target image 加噪状态上训练：
+
+\[
+\text{offline SFT state}=\mathrm{noise}(x_0,t),
+\]
+
+但少步模型推理时真正访问的是自己从噪声 rollout 出来的 states：
+
+\[
+\text{few-step inference state}=x^s_{t_k}.
+\]
+
+这两者不是同一分布。对 4--8 步模型来说，每一步都很“硬”，没有足够多 denoising steps 去纠错；所以离线 SFT 很容易学到新概念，但把原本的少步轨迹训坏。
+
+\subsubsection{4.2 关键动机：目标图像可以当 context，而不是 target state}
+
+D-OPSD 最有价值的观察是：Z-Image-Turbo / FLUX.2-klein 这类现代 T2I 模型使用 LLM/VLM encoder，可能继承了 encoder 的 multimodal in-context 能力。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{on_policy_distillation/d_opsd_x1.png}
+\caption{D-OPSD 的动机实验：把 target image 放进 multimodal context 后，模型即使不额外训练，也能生成保留目标概念/风格的变体。这说明 target image 不一定要作为 denoising target，也可以作为 teacher 的 privileged context。图源：\href{https://arxiv.org/html/2605.05204v2}{arXiv HTML: D-OPSD Figure 1}。}
+\end{figure}
+
+\begin{intubox}
+\textbf{这里的 insight 很关键：} D-OPSD 不是“拿图像监督 diffusion”这么简单，而是把目标图像从 \bad{定义训练轨迹的 target state} 改成 \good{增强 teacher 判断的 context}。这样 student 仍然走 text-only few-step trajectory，teacher 只在同一 trajectory 上给 velocity direction。
+\end{intubox}
+
+\subsubsection{4.3 方法：same-state velocity self-distillation}
+
+D-OPSD 对每个图文对 $(x_0,y)$ 构造两个条件：
+
+\[
+c_s=f_{\mathrm{text}}(y),\qquad c_t=f_{\mathrm{mm}}(y,x_0).
+\]
+
+然后：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item student 只看文本 $c_s$，从噪声出发按原来的 few-step solver 生成自己的 trajectory $x^s_{t_k}$；
+  \item teacher 看文本 + 目标图像 $c_t$，但不重新采样轨迹，只在 student states 上预测 velocity；
+  \item student 用 text-only velocity 去匹配 teacher 的 multimodal velocity：
+\end{enumerate}
+
+\[
+\mathcal{L}_{\mathrm{D\mbox{-}OPSD}}
+=
+\mathbb{E}_{(x_0,y)}
+\left[
+\frac{1}{K}\sum_{k=1}^{K}
+\left\|v_\theta(x^s_{t_k},t_k,c_s)-\mathrm{sg}\bigl(v_{\bar\theta}(x^s_{t_k},t_k,c_t)\bigr)\right\|_2^2
+\right].
+\]
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{on_policy_distillation/d_opsd_x2.png}
+\caption{D-OPSD 方法框架。student 使用 text-only condition 做 on-policy sampling；teacher 使用 multimodal condition，在同一批 student states 上提供 velocity；训练后只保留 student，推理仍然是原始 text-only pipeline。图源：\href{https://arxiv.org/html/2605.05204v2}{arXiv HTML: D-OPSD Figure 2}。}
+\end{figure}
+
+\subsubsection{4.4 结果怎么读：不是最近邻复刻，而是泛化与质量的折中}
+
+\paragraph{小数据 LoRA 定制。}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\linewidth]{on_policy_distillation/d_opsd_x4.png}
+\caption{小数据 LoRA 定性对比。SFT 往往牺牲图像质量；PSO 更像记住训练样本；D-OPSD 更强调在新 prompt 中保留概念/风格，同时维持少步生成质量。图源：\href{https://arxiv.org/html/2605.05204v2}{arXiv HTML: D-OPSD Figure 3}。}
+\end{figure}
+
+定量结果里 PSO 的 DINO/LPIPS 可能最好，但 CLIP-S、Quality-S、Aesthetic-S 不如 D-OPSD。这说明 D-OPSD 不追求“离训练图最近”，而追求“把目标概念变成 text-only 推理时可调用的能力”。
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Z-Image-Turbo} & \textbf{DINO-D}$\downarrow$ & \textbf{LPIPS-D}$\downarrow$ & \textbf{VLM-J}$\uparrow$ & \textbf{CLIP-S}$\uparrow$ & \textbf{Quality-S}$\uparrow$ & \textbf{Aesthetic-S}$\uparrow$\\
+\midrule
+Vanilla SFT & 0.2212 & 0.6501 & 1.3293 & 0.3095 & 2.4236 & 2.3582\\
+PSO & \textbf{0.0570} & \textbf{0.4974} & \textbf{3.3333} & 0.2893 & 3.3422 & 3.0820\\
+\textbf{D-OPSD} & 0.0823 & 0.5803 & \textbf{3.3333} & \textbf{0.3664} & \textbf{3.7965} & \textbf{3.1710}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{大规模领域适配。}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{on_policy_distillation/d_opsd_x5.png}
+\caption{全量微调定性对比。SFT / PSO 在目标领域上有一定适配，但容易损失原始质量与知识；D-OPSD 更好地把模型偏到目标领域，同时保留 prior knowledge。图源：\href{https://arxiv.org/html/2605.05204v2}{arXiv HTML: D-OPSD Figure 4}。}
+\end{figure}
+
+大规模 anime 数据上，D-OPSD 的 FID、DINO-D、LPIPS-D、Quality-S、Aesthetic-S 都最好，同时 GenEval/DPG 只小幅下降；SFT 和 PSO 则明显破坏旧能力。
+
+\subsubsection{4.5 消融和失败案例：on-policy 与 in-context 能力缺一不可}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\linewidth]{on_policy_distillation/d_opsd_x6.png}
+\caption{D-OPSD 消融。仅靠 target image SFT 或 teacher samples 不能解决 train-test mismatch；真正关键的是在 student 自己 rollout 的 states 上做 self-distillation。图源：\href{https://arxiv.org/html/2605.05204v2}{arXiv HTML: D-OPSD Figure 5}。}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\linewidth]{on_policy_distillation/d_opsd_x7.png}
+\caption{D-OPSD 失败案例。如果 base model 在 multimodal context 下也无法理解目标概念，那么 teacher branch 本身就没有高质量 supervision，D-OPSD 也会失败。图源：\href{https://arxiv.org/html/2605.05204v2}{arXiv HTML: D-OPSD Figure 6}。}
+\end{figure}
+
+\begin{summarybox}
+\textbf{D-OPSD 的真正贡献：} 它重新定义了少步模型持续微调的“训练状态”——不是 target image noising state，而是 student few-step rollout state；target image 只作为 teacher context 提供 privileged velocity supervision。
+\end{summarybox}
+
+\subsection{5. AnyFlow：video diffusion 的 on-policy flow-map distillation}
+
+\subsubsection{5.1 它真正解决的问题：consistency distillation 没有 any-step scaling}
+
+你说的 “DiffusionOPD” 更准确地对应到这篇 \textbf{AnyFlow: Any-Step Video Diffusion Model with On-Policy Flow Map Distillation}。它不是 T2I 多 reward 对齐，也不是个性化/领域持续微调，而是视频扩散蒸馏里的第三条主线：\key{把 consistency-style endpoint distillation 改成 flow-map transition distillation，并用 on-policy backward simulation 修正 rollout drift}。
+
+Consistency distillation 的问题是：它擅长把模型压到很少步，但目标常常是固定点映射 $z_t\rightarrow z_0$。多步采样时要反复 endpoint projection + re-noising，中间状态会逐渐偏离原始 probability-flow ODE path。结果就是一个反直觉现象：给更多采样步数，质量不一定提升，甚至下降。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{on_policy_distillation/anyflow_test_scale.pdf}
+\caption{AnyFlow 的 test-time scaling 图。consistency-based 方法如 Self-Forcing / rCM 在 step 数增加时可能退化；AnyFlow 在 causal、bidirectional 以及 teacher 对比中都保留了“步数越多越好”的 scaling 行为。图源：\href{https://arxiv.org/abs/2605.13724}{arXiv:2605.13724} source / \href{https://nvlabs.github.io/AnyFlow/}{AnyFlow 项目页}。}
+\end{figure}
+
+\begin{warnbox}
+\textbf{我的修正：} 这篇必须算进生成侧 OPD 主线。它把 OPD 从“图像生成后训练”推进到 \key{video diffusion distillation / any-step sampling}：关心的不是 reward、concept tuning，而是采样轨迹本身能不能随计算预算平滑扩展。
+\end{warnbox}
+
+\subsubsection{5.2 方法：从 endpoint consistency 到 two-time flow map}
+
+AnyFlow 的关键替换是：
+
+\[
+\text{consistency endpoint: } f_\theta(z_t,t)\approx z_0
+\qquad\Longrightarrow\qquad
+\text{flow map: } f_\theta(z_t,t,r)\approx z_r.
+\]
+
+也就是说，模型不只学习“从任意 $t$ 直接跳到 0”，而是学习任意时间对之间的转移 $z_t\rightarrow z_r$。这带来一个重要性质：同一个模型既可以做大步 shortcut，也可以做小步 local refinement，因此天然适合 any-step inference。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{on_policy_distillation/anyflow_paradigm_comparison.pdf}
+\caption{AnyFlow 对 consistency distillation 与 flow-map distillation 的对比。上半部分的 consistency backward simulation 需要 re-noise 中间状态，容易导致 trajectory drift；下半部分的 flow map backward simulation 把 Euler 轨迹分解成 shortcut transitions，直接训练不同 step size 的中间转移。图源：\href{https://arxiv.org/abs/2605.13724}{arXiv:2605.13724} source / \href{https://nvlabs.github.io/AnyFlow/}{项目页}。}
+\end{figure}
+
+\subsubsection{5.3 Pipeline：先 forward flow-map，再 on-policy flow-map distillation}
+
+AnyFlow 分两阶段：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Forward flow-map training：} 从预训练 video diffusion model 出发，在 teacher synthetic data 上学习稳定的 two-time transition operator $f_\theta(z_t,t,r)$，作为 any-step generation 的初始化。
+  \item \textbf{On-policy flow-map distillation：} 从 Stage-1 checkpoint 出发，让 student 做 backward simulation rollout，再用 strong teacher 的 DMD/KL signal 做 reverse-divergence supervision，修正 few-step discretization error 与 causal generation 的 exposure bias。
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{on_policy_distillation/anyflow_pipeline.pdf}
+\caption{AnyFlow pipeline。第一阶段学习 forward flow-map transition；第二阶段用 flow-map backward simulation 生成 student rollouts，并在 teacher guidance 下做 on-policy distillation。图源：\href{https://arxiv.org/abs/2605.13724}{arXiv:2605.13724} source。}
+\end{figure}
+
+\begin{summarybox}
+\textbf{关键 insight：} AnyFlow 里的 OPD 不是“在 student 生成图像后打 reward”，而是 \key{在 student 自己的 flow-map rollout 上训练 arbitrary-interval transitions}。它把 on-policy 的对象从单个 latent state 推进到 \key{transition operator}：你不只问“这个 state 的 velocity 怎么走”，而是问“从 $t$ 到 $r$ 这段 shortcut transition 应该是什么”。
+\end{summarybox}
+
+\subsubsection{5.4 主结果怎么读：AnyFlow 是 any-step 轨迹修复，不是固定步数蒸馏}
+
+AnyFlow 的表格最该看两个点：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{4 NFE 不差：} 在少步 regime 下，它要 match / beat consistency-based methods；否则 any-step 没意义。
+  \item \textbf{32 NFE 继续变好：} 这是核心。consistency methods 可能随着更多 steps 退化，而 AnyFlow 在 4 到 32 NFE 之间继续提升，说明它保留了接近 PF-ODE 的 trajectory scaling。
+\end{itemize}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Setting} & \textbf{Model} & \textbf{NFEs} & \textbf{VBench Total} & \textbf{读法}\\
+\midrule
+Bidirectional 1.3B & AnyFlow-Wan2.1-T2V & 4 & 83.48 & few-step 已经强\\
+Bidirectional 1.3B & AnyFlow-Wan2.1-T2V & 32 & 83.96 & 多步继续涨\\
+Causal 1.3B & AnyFlow-FAR-Wan2.1 & 4 & 83.54 & 对齐 Self-Forcing\\
+Causal 1.3B & AnyFlow-FAR-Wan2.1 & 32 & 83.96 & 保留 scaling\\
+Causal 14B & AnyFlow-FAR-Wan2.1 & 4 & 84.05 & 强少步视频生成\\
+Causal 14B & AnyFlow-FAR-Wan2.1 & 32 & 84.41 & 高预算继续提升\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\linewidth]{on_policy_distillation/anyflow_downstream_results.pdf}
+\caption{AnyFlow 的 downstream continued training 结果。论文强调 flow-map formulation 保留 instantaneous flow field，因此蒸馏后模型还能继续适配机器人、驾驶等下游视频数据；这和很多 fixed-step consistency distilled model 不同。图源：\href{https://arxiv.org/abs/2605.13724}{arXiv:2605.13724} source。}
+\end{figure}
+
+\begin{summarybox}
+\textbf{AnyFlow 的真正贡献：} 它把 OPD/trajectory distillation 用在 video diffusion 的 \key{any-step distillation} 上：通过 two-time flow map 表达和 flow-map backward simulation，既保留少步速度，又让模型在更多采样步数下继续沿合理 ODE trajectory refinement。
+\end{summarybox}
+
+\subsection{6. 三篇生成侧论文的统一抽象}
+
+\subsubsection{6.1 一个通用训练模板}
+
+Flow-OPD、D-OPSD 和 AnyFlow 可以抽象成同一个模板：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Student rollout：} 用当前 student 按真实推理方式采样 trajectory / states / transitions，例如 $\tau^s=\{x^s_{t_k}\}$ 或 $z_t\rightarrow z_r$。
+  \item \textbf{Teacher query：} 在 student 访问到的 states 或 transitions 上查询更强/更多信息的 teacher，得到局部方向、transition target 或 reverse-divergence signal。
+  \item \textbf{Dense local alignment：} 用 velocity MSE、transition KL、DMD/KL gradient 或 clipped policy objective 对齐 student 的局部生成动力学。
+  \item \textbf{Stability anchor：} 用 EMA、MAR、clipping、cold start、flow-map shortcut 或 timestep reweighting 防止 teacher 噪声、流形漂移和轨迹崩坏。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{统一公式（文字版）：} 生成侧 OPD/OPSD = \key{student on-policy states / transitions} + \key{privileged / expert / stronger teacher} + \key{dense local alignment} + \key{trajectory stability anchor}。
+\end{summarybox}
+
+\subsubsection{6.2 关键差异：teacher 是谁？}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{0.17\linewidth}p{0.25\linewidth}p{0.25\linewidth}p{0.25\linewidth}}
+\toprule
+\textbf{问题} & \textbf{Flow-OPD} & \textbf{D-OPSD} & \textbf{AnyFlow}\\
+\midrule
+teacher 从哪里来？ & reward 训练的多个单任务 experts & 同一个模型的 text+image multimodal branch & 强 video diffusion teacher / DMD teacher guidance\\
+为什么 teacher 更强？ & 每个 expert 在单能力上专精 & teacher 多看目标图像，拥有 privileged information & teacher 保留更完整 PF-ODE / 高质量 video diffusion trajectory\\
+teacher 有什么风险？ & 专家偏科、路由错误、teacher 错误会传播 & base in-context 能力不足、encoder feature mismatch & backward simulation 成本高，flow-map transition 学不稳会破坏 scaling\\
+怎么稳住？ & cold start + task routing + MAR & same-state matching + EMA/frozen teacher + encoder reweight & forward flow-map init + shortcut backward simulation + adaptive reweighting\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{6.3 关键差异：它们分别适合什么工程场景？}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{用 Flow-OPD 的场景：} 你有多个可验证/可打分目标，比如 OCR、composition、aesthetic、preference；能为每个目标训练一个 expert；最终想要一个通用模型吸收所有能力。
+  \item \textbf{用 D-OPSD 的场景：} 你有图文对，但没有 reward；底座是 step-distilled few-step model；目标是 subject/style/domain adaptation，同时保持少步质量。
+  \item \textbf{用 AnyFlow 的场景：} 你做 video diffusion distillation，希望一个模型既能 4-step 快速预览，又能在 16/32 steps 下继续提升质量，而不是被 fixed-step consistency sampler 绑死。
+\end{itemize}
+
+\subsection{7. 我认为最有研究价值的 insight}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{OPD/OPSD 的本质是“状态/转移分布对齐”，不是“teacher 更强”。} Teacher 强不强当然重要，但更根本的是 supervision 发生在 student 会访问的 states 或 transitions 上。
+  \item \textbf{生成侧正在从 scalar reward 转向 vector-field / transition-map teacher。} Reward model 只会打分；expert generative model 可以给 velocity direction；AnyFlow 进一步说明 teacher 可以监督任意时间对之间的 flow-map transition。
+  \item \textbf{reference image / solution 的角色在变化。} D-OPSD 和 LLM OPSD 都把 reference 从 hard label 变成 privileged context；这避免直接模仿 reference 的风格或轨迹。
+  \item \textbf{少步模型的持续学习必须尊重 sampler dynamics。} 对 step-distilled model，普通 SFT 的危害比多步模型更大，因为少步轨迹本身就是能力载体。
+  \item \textbf{多能力对齐不该从混 reward 开始。} Flow-OPD 暗示一个更工业化的 pipeline：单能力 expert $\rightarrow$ on-policy dense unification $\rightarrow$ manifold anchor。
+  \item \textbf{any-step video generation 不能只追求少步好看。} AnyFlow 的启发是：好的蒸馏不仅要 4-step 强，还要保留 ODE trajectory 的 test-time scaling，让更多计算真的换来更好视频。
+\end{enumerate}
+
+\subsection{8. 局限与下一步可做的题}
+
+\subsubsection{8.1 当前局限}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Flow-OPD 成本高：} 先训练多个 experts，再做 student OPD，需要多 teacher 推理和复杂路由。
+  \item \textbf{D-OPSD 依赖 base in-context 能力：} 如果模型看图也不会理解目标概念，teacher signal 就不可靠。
+  \item \textbf{AnyFlow 训练链路重：} 需要 forward flow-map training、on-policy simulation、teacher guidance 和视频模型大规模训练资源；它不是轻量后处理技巧。
+  \item \textbf{routing / teacher selection 仍然粗：} Flow-OPD 的 hard routing、D-OPSD 的 teacher branch、AnyFlow 的 teacher guidance 都没有彻底解决 teacher 错误传播。
+  \item \textbf{teacher 错误会被密集放大：} dense supervision 是优势也是风险，错误 teacher 会在每个 step 或 transition 上持续教错。
+  \item \textbf{评估仍不完整：} 当前证据覆盖 T2I、少步 T2I tuning 与 video diffusion，但 3D generation、editing、多图一致性、long video coherence 和跨架构 OPD 还没有系统验证。
+\end{itemize}
+
+\subsubsection{8.2 值得做的 follow-up}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Soft multi-teacher routing：} 不用 hard routing，而是让多个 experts 按 uncertainty / task classifier / verifier score 加权给 velocity。
+  \item \textbf{Verifier-gated OPD：} 在 dense velocity 或 transition supervision 前，用 verifier 过滤 teacher 错误状态，避免 dense error propagation。
+  \item \textbf{D-OPSD for video：} target video clip 作为 multimodal teacher context，student 在自己的 few-step video trajectory 上匹配 teacher velocity。
+  \item \textbf{AnyFlow + reward alignment：} 在 flow-map OPD 保留 any-step scaling 后，再叠加 aesthetic / safety / preference verifier，研究 video RLHF 与 trajectory scaling 是否兼容。
+  \item \textbf{OPD + RL 两阶段：} 先用 D-OPSD/Flow-OPD/AnyFlow 做 dense warm-up，再用 GRPO/Flow-GRPO/DMD 类 objective 做 outcome 或 distribution optimization。
+  \item \textbf{Cross-architecture OPD：} 研究不同 latent space / DiT / video backbone 之间如何对齐 velocity field 或 transition map，突破 teacher/student 同构限制。
+  \item \textbf{Process-level generation verifier：} 不只评价最终图像/视频，而是评价中间 denoising states 或 flow-map transitions 是否朝正确语义、布局和运动演化。
+\end{itemize}
+
+\subsection{9. 最后总结}
+
+\begin{intubox}
+\textbf{记忆钩子：}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Flow-OPD：} 不要把多个老师的意见压成一个分数；让学生在自己走过的每一步，去问对应专科老师 velocity 应该往哪里走。
+  \item \textbf{D-OPSD：} 不要用目标图像的加噪状态去教少步模型；让少步模型先按自己的轨迹走，再让“看过目标图像”的自己在同一状态上告诉它 velocity 怎么修。
+  \item \textbf{AnyFlow：} 不要把视频蒸馏成固定步数 endpoint shortcut；让模型学习任意时间对的 flow-map transition，并在自己的 backward simulation 轨迹上修正 rollout error。
+  \item \textbf{共同核心：} 生成侧 OPD/OPSD 是把监督从离线样本轨迹搬到 student on-policy trajectory / transition 上。
+\end{itemize}
+\end{intubox}
+
+\begin{summarybox}
+\textbf{一句话判断：} 这三篇论文说明，生成模型后训练下一步的重点可能不是设计更复杂的 scalar reward，而是构造更好的 \key{trajectory-local / transition-local teacher}：它能在 student 自己访问的中间状态或时间转移上提供方向性监督，同时用 anchor / clipping / EMA / flow-map shortcut 防止密集监督把模型带偏。
+\end{summarybox}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Flow-OPD：} \href{https://arxiv.org/abs/2605.08063}{arXiv abs}；\href{https://arxiv.org/html/2605.08063v4}{arXiv HTML v4}；\href{https://arxiv.org/pdf/2605.08063}{PDF}；\href{https://costaliya.github.io/Flow-OPD/}{项目页}；\href{https://github.com/CostaliyA/Flow-OPD}{代码仓库}。
+  \item \textbf{D-OPSD：} \href{https://arxiv.org/abs/2605.05204}{arXiv abs}；\href{https://arxiv.org/html/2605.05204v2}{arXiv HTML v2}；\href{https://arxiv.org/pdf/2605.05204}{PDF}；\href{https://vvvvvjdy.github.io/d-opsd}{项目页}；\href{https://github.com/vvvvvjdy/D-OPSD}{代码仓库}。
+  \item \textbf{AnyFlow / Diffusion OPD：} \href{https://arxiv.org/abs/2605.13724}{arXiv abs}；\href{https://arxiv.org/pdf/2605.13724}{PDF}；\href{https://nvlabs.github.io/AnyFlow/}{项目页}；\href{https://github.com/NVlabs/AnyFlow}{代码仓库}；\href{https://huggingface.co/collections/nvidia/anyflow}{HuggingFace 模型集合}。
+  \item \textbf{语言侧机制来源：} \href{https://arxiv.org/abs/2601.18734}{Self-Distilled Reasoner: OPSD}；\href{https://arxiv.org/html/2601.18734v3}{OPSD arXiv HTML}；\href{https://arxiv.org/abs/2605.06597}{UniSD}；\href{https://arxiv.org/html/2605.06597v1}{UniSD arXiv HTML}。
+  \item \textbf{相关背景：} \href{https://thinkingmachines.ai/blog/on-policy-distillation}{Thinking Machines: On-Policy Distillation}；\href{https://arxiv.org/abs/2505.05470}{Flow-GRPO}；\href{https://arxiv.org/abs/2208.12242}{DreamBooth}。
+  \item \textbf{本地精读：} \href{run:reading/paper_deep_reading/image_models/2026_05_14_flow_opd.tex}{Flow-OPD 精读}；\href{run:reading/paper_deep_reading/image_models/2026_05_14_d_opsd.tex}{D-OPSD 精读}；\href{run:reading/paper_deep_reading/post_training/2026_05_14_opsd.tex}{OPSD 精读}；\href{run:reading/paper_deep_reading/post_training/2026_05_09_unisd.tex}{UniSD 精读}。
+\end{itemize}
+
+% ============================================================
+% 依赖包说明（确保主文档已加载以下包）
+% \usepackage{algorithm}
+% \usepackage{algpseudocode}
+% \usepackage{amssymb,amsmath}
+% \usepackage{booktabs}
+% \usepackage{hyperref}
+% \usepackage{enumitem}
+% ============================================================

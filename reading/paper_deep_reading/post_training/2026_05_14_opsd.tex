@@ -11,7 +11,7 @@
 \textbf{简称：} OPSD / On-Policy Self-Distillation。\\
 \textbf{版本：} arXiv 2601.18734v3；ICML 2026。\\
 \textbf{代码：} \href{https://github.com/siyan-zhao/OPSD}{siyan-zhao/OPSD}。\\
-\textbf{方向标签：} LLM Reasoning Post-training、On-policy Distillation、Self-distillation、Privileged Context、Dense Token-level Supervision、RLVR Alternative。\\
+\textbf{方向标签：} reasoning post-training；on-policy distillation；self-distillation；privileged context；dense token-level supervision；RLVR alternative。\\
 \textbf{阅读日期：} 2026-05-14。\\
 \textbf{阅读口径：} 这篇不是在改 GRPO 的 advantage、sampling 或 reward，而是在 LLM reasoning 后训练里提出一条 \key{介于 SFT 和 RLVR 之间} 的路线：利用带标准解的数据集，把同一个模型拆成 ``能看标准解的 teacher'' 和 ``只能看题目的 student''，在 student 自己生成的 on-policy 轨迹上做 token-level soft distillation。
 \end{conceptbox}
@@ -41,15 +41,18 @@ OPSD 的核心想法可以概括成：\textbf{让模型带着标准答案做一�
 如果把一个 reasoning LLM 的训练流程粗略拆成：
 
 \[
-\text{Pretraining}
+\begin{aligned}
+&\text{Pretraining}
 \rightarrow
 \text{Instruction / SFT}
 \rightarrow
 \text{Reasoning specialization}
-\rightarrow
+\\
+&\rightarrow
 \text{RLVR / preference alignment}
 \rightarrow
 \text{test-time scaling},
+\end{aligned}
 \]
 
 OPSD 位于 \key{Reasoning specialization / post-SFT reasoning post-training} 阶段。它通常接在已经 instruction-tuned 的模型之后，例如论文使用 Qwen3 Instruct 系列作为 base，然后用 OpenThoughts 的数学 reasoning problem-solution pairs 做 LoRA 后训练。
@@ -85,6 +88,12 @@ GRPO / RLVR & 是 & 否 & 否 & 是\\
 \end{center}
 
 从这个表看，OPSD 的位置很清楚：它试图拿到 GRPO 的 on-policy 分布优势，同时保留 distillation 的 dense feedback，但不引入额外大 teacher。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\linewidth]{opsd/opsd_tab1.png}
+\caption{作者博客给出的训练范式对比图。它把 SFT、GRPO、普通蒸馏和 OPSD 放在同一张表里，最适合用来定位 OPSD：on-policy、dense token feedback、无外部 teacher、无需 outcome reward。}
+\end{figure}
 
 \subsubsection{1.3 它在当前 post-training 版图里的角色}
 
@@ -163,6 +172,12 @@ OPSD 从同一个 LLM $p_\theta$ 构造两个 policy：
 
 论文的 prompt 设计很关键：teacher prompt 不是简单把标准解塞进去要求复述，而是先给出 reference solution，然后要求模型 ``理解 reference solution 后用自己的方式再解一遍''。不过 teacher 实际训练时不需要生成完整答案；它只是在 student rollout 的每个 prefix 上做一次 forward pass，输出 next-token distribution。
 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth]{opsd/prompt_exampel_opsd.png}
+\caption{作者博客中的 OPSD prompt 示例。关键点是 teacher 额外拿到 reference solution，但目标不是复述标准解，而是在理解标准解后对同一个 student prefix 给出 next-token distribution。}
+\end{figure}
+
 \subsubsection{4.2 On-policy student rollout}
 
 对每个题目 $x$，先从 student policy 采样一条回答：
@@ -182,6 +197,12 @@ OPSD 从同一个 LLM $p_\theta$ 构造两个 policy：
 \]
 
 因此 teacher 并不是监督 ``标准答案的下一个 token''，而是监督 ``在 student 已经写到这里的情况下，如果我知道标准解，我会怎样分布式地修正下一步''。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.96\linewidth]{opsd/opsd_main.png}
+\caption{OPSD 方法主图。左侧是 student 在只看题目时生成 on-policy rollout；右侧是同源 teacher 在额外看到标准解后，对 student rollout 的每个 prefix 产生软目标；最终用逐 token divergence 更新 student。}
+\end{figure}
 
 \subsubsection{4.3 Full-vocabulary token-level divergence objective}
 
@@ -223,9 +244,11 @@ D_{\mathrm{KL}}(p_T\Vert p_S)
 这个实现细节很重要，因为它把 ``同一模型自蒸馏'' 变成：
 
 \[
-\text{initial model + privileged solution context}
-\quad\longrightarrow\quad
+\begin{aligned}
+&\text{initial model + privileged solution context}\\
+&\quad\longrightarrow\quad
 \text{updated student without privileged context}.
+\end{aligned}
 \]
 
 \begin{warnbox}
@@ -264,7 +287,7 @@ D_{\mathrm{clip}}^{(f)}(p_T\Vert p_S)
 
 \subsubsection{4.6 为什么 full-vocabulary logit distillation 优于 sampled-token policy gradient}
 
-论文也讨论了一个替代目标：只在 student 实际采样出来的 token $\hat{y}_n$ 上计算 teacher/student log-prob 差，并把它当成 token-level advantage：
+论文也讨论了一个替代目标：只在 student 实际采样出来的 token $\hat{y}_n$ 上计算 teacher 与 student 的 log-probability 差，并把它当成 token-level advantage：
 
 \[
 A_n(x,\hat{y})
@@ -396,7 +419,79 @@ teacher 会让后续分布更靠近 22，而不是 27。于是 OPSD 的监督不
 }
 \end{center}
 
-\subsubsection{5.2 抽象成训练 iteration}
+\subsubsection{5.2 关键澄清：prefix 给 teacher 到底是什么意思}
+
+这里最容易误解的一点是：\key{teacher 不是拿 student 的整篇回答去批改，也不是去模仿 student 的回答；student rollout 的作用，是暴露 student 自己真实会走到的一串中间状态。}
+
+设 student 已经生成了一条回答：
+
+\[
+\hat y=(\hat y_1,\hat y_2,\ldots,\hat y_T).
+\]
+
+OPSD 会把它拆成很多个自回归前缀：
+
+\[
+\emptyset,
+\quad
+\hat y_{<2}=(\hat y_1),
+\quad
+\hat y_{<3}=(\hat y_1,\hat y_2),
+\quad
+\ldots,
+\quad
+\hat y_{<T}=(\hat y_1,\ldots,\hat y_{T-1}).
+\]
+
+对每一个位置 $n$，student 和 teacher 看的是\textbf{同一个 student prefix}，区别只在于 teacher 额外看到了标准解 $y^\star$：
+
+\[
+\underbrace{p_S(\cdot\mid x,\hat y_{<n})}_{\text{只看题目和 student prefix}}
+\qquad\text{vs.}\qquad
+\underbrace{p_T(\cdot\mid x,y^\star,\hat y_{<n})}_{\text{多看标准解，再看同一个 student prefix}}.
+\]
+
+所以 ``prefix 给 teacher'' 的真实含义是：
+
+\begin{quote}
+把 student 已经写到一半的状态 $\hat y_{<n}$ 也放进 teacher 的上下文里，让 teacher 在这个状态上输出下一 token 的概率分布。
+\end{quote}
+
+这不是让 teacher 从头生成标准答案，而是问 teacher 一个局部问题：
+
+\begin{quote}
+如果现在已经写到了这个 prefix，而且我知道标准解，那么下一步 token 的分布应该是什么样？
+\end{quote}
+
+继续用上面的买文具例子，如果 student 的完整回答是：
+
+\begin{quote}
+4 本笔记本是 $4\times 3=12$ 元。5 支笔是 $5\times 3=15$ 元。所以总共是 27 元。
+\end{quote}
+
+那么某些训练状态可以写成：
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+\textbf{位置} & \textbf{student prefix $\hat y_{<n}$} & \textbf{teacher 要做的事}\\
+\midrule
+早期 & ``5 支笔是 $5\times$'' & 看过标准解后，提高 token ``2'' 的概率，降低 ``3'' 的概率\\
+中期 & ``5 支笔是 $5\times 3=15$ 元'' & 在错误已经发生的状态下，倾向输出 ``不过''、``这里应为'' 等纠错方向\\
+后期 & ``所以总共是'' & 让分布更靠近正确答案 ``22''，而不是 ``27''\\
+\bottomrule
+\end{tabular}%
+}
+\end{center}
+
+这个机制的关键价值是：\textbf{训练不只发生在标准答案轨迹上，而是发生在 student 自己会访问的轨迹上。} 这就是 OPSD 的 on-policy 部分。如果只在标准解 prefix 上训练，模型只学到 ``从正确前缀继续写''；而 OPSD 还让模型学到 ``当我自己写偏了，从这个偏掉的状态下一步该怎么拉回来''。
+
+\begin{summarybox}
+\textbf{我会这样记这个流程：} student 生成回答，不是为了让 teacher 模仿这份回答，而是为了产生一串真实的中间状态；teacher 拿着标准解进入这些状态，逐个给出 next-token distribution；最后训练 student 让它在这些状态下的分布靠近 teacher。
+\end{summarybox}
+
+\subsubsection{5.3 抽象成训练 iteration}
 
 一次 OPSD 训练 iteration 可以写成：
 
@@ -461,6 +556,12 @@ Qwen3-1.7B & \textbf{OPSD} & \textbf{57.2} & \textbf{43.9} & \textbf{29.2} & \te
 \textbf{我会这样读结果：} OPSD 对较小模型特别有价值，因为小模型从 sparse binary reward 中很难稳定学到东西，但它在看到标准解后仍能产生有用的 privileged distribution。模型越大，GRPO 也能通过更多 rollout 找到有效 reward signal，两者差距缩小。
 \end{summarybox}
 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.9\linewidth]{opsd/main_result.png}
+\caption{作者博客中的主结果图。它直观展示了 OPSD 在 Qwen3-1.7B、4B、8B 上相对 SFT 和 GRPO 的收益，尤其是小模型上 dense token-level supervision 的优势更明显。}
+\end{figure}
+
 \subsubsection{6.2 Token efficiency：OPSD 的核心优势}
 
 论文强调 OPSD 只需要每题 1 条、最多 1024 token 的 rollout；GRPO 则需要每题 8 条、每条最多 16k token。即便 GRPO 生成更多 token，它得到的仍是最终 binary reward；OPSD 在每个 token 位置都有 teacher distribution。
@@ -470,6 +571,12 @@ Qwen3-1.7B & \textbf{OPSD} & \textbf{57.2} & \textbf{43.9} & \textbf{29.2} & \te
 \begin{warnbox}
 \textbf{这里的比较要谨慎：} OPSD 使用了 reference solution 作为 privileged information；GRPO 使用的是 outcome verifier。两者不是完全同一种 supervision budget。OPSD 的 token efficiency 部分来自更强、更密的数据条件，而不只是算法更省。
 \end{warnbox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\linewidth]{opsd/opsd_tokenefficiency.png}
+\caption{作者博客中的 token efficiency 对比图。OPSD 用更少 rollout token 获得 dense token-level soft targets，而 GRPO 需要多条长 rollout 才能通过最终 outcome reward 形成稀疏学习信号。}
+\end{figure}
 
 \subsubsection{6.3 SFT 为什么反而下降}
 
@@ -510,6 +617,12 @@ Style tokens 的 KL contribution 可能显著高于 math tokens，导致训练�
 \begin{intubox}
 \textbf{我认为这是 OPSD 最可复用的 trick：} 任何 full-vocabulary distillation 都可能被少数高 KL token 支配。把 divergence contribution 从 ``整个 token position 裁剪'' 改成 ``每个 vocabulary entry 裁剪''，更细粒度，也更适合 LLM 大词表。
 \end{intubox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.72\linewidth]{opsd/cliping.png}
+\caption{作者博客中的 pointwise KL clipping 图。图中强调 style token 的 KL contribution 可能异常大；逐词表项裁剪可以避免训练被少数风格词主导，从而保护真正的数学 reasoning 信号。}
+\end{figure}
 
 \subsubsection{7.4 生成长度：更长不一定更好}
 
@@ -643,6 +756,6 @@ UniSD 后续把 self-distillation 拆成 teacher reliability、EMA teacher、con
   \item \textbf{论文 PDF：} \href{https://siyan-zhao.github.io/assets/img/opsd/opsd_v3.pdf}{Self-Distilled Reasoner: On-Policy Self-Distillation for Large Language Models}。
   \item \textbf{arXiv：} \href{https://arxiv.org/abs/2601.18734}{arXiv:2601.18734v3}，包含摘要、版本信息与 DOI。
   \item \textbf{作者博客：} \href{https://siyan-zhao.github.io/blog/2026/opsd/}{Self-Distilled Reasoner: On-Policy Self-Distillation}，用于核对方法动机、训练范式对比和讨论。
-  \item \textbf{代码仓库：} \href{https://github.com/siyan-zhao/OPSD}{siyan-zhao/OPSD}，用于核对训练脚本、OPSDTrainer、评测设置和 README 中的复现实验说明。
+  \item \textbf{代码仓库：} \href{https://github.com/siyan-zhao/OPSD}{GitHub OPSD repository}，用于核对训练脚本、OPSDTrainer、评测设置和 README 中的复现实验说明。
   \item \textbf{相关背景：} \href{https://arxiv.org/abs/1503.02531}{Knowledge Distillation}；\href{https://arxiv.org/abs/2402.03300}{DeepSeekMath / GRPO}；\href{https://arxiv.org/abs/2506.04178}{OpenThoughts}；\href{https://thinkingmachines.ai/blog/on-policy-distillation}{On-Policy Distillation}；\href{https://arxiv.org/abs/2605.06597}{UniSD}。
 \end{itemize}

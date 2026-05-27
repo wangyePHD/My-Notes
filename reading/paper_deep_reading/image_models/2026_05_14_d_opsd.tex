@@ -1,0 +1,456 @@
+% ============================================================
+% Paper deep reading: D-OPSD
+% Source: https://arxiv.org/abs/2605.05204v1
+% ============================================================
+
+\section{论文精读：D-OPSD}
+
+\begin{conceptbox}
+\textbf{论文：} \href{https://arxiv.org/abs/2605.05204}{D-OPSD: On-Policy Self-Distillation for Continuously Tuning Step-Distilled Diffusion Models}\\
+\textbf{作者/机构：} Dengyang Jiang, Xin Jin, Dongyang Liu, Zanyi Wang, Mingzhe Zheng, Ruoyi Du, Xiangpeng Yang, Qilong Wu, Zhen Li, Peng Gao, Harry Yang, Steven C.H. Hoi；HKUST / Z-Image Team, Alibaba Group / UCSD / CUHK。\\
+\textbf{版本：} arXiv 2605.05204v1，2026-05-08；Project Page: \href{https://vvvvvjdy.github.io/d-opsd}{D-OPSD}；Code: \href{https://github.com/vvvvvjdy/D-OPSD}{vvvvvjdy/D-OPSD}。\\
+\textbf{方向标签：} Step-Distilled Diffusion Models；Few-Step T2I；Continual Tuning；On-Policy Self-Distillation；Multimodal In-Context Conditioning；Z-Image-Turbo；FLUX.2-klein。\\
+\textbf{阅读日期：} 2026-05-14。\\
+\textbf{阅读口径：} 这篇论文研究的不是如何从零训练扩散模型，也不是如何再蒸馏一个少步模型，而是一个更贴近工程的问题：已经被 step-distillation 压到 4--8 步的高性能图像生成模型，如何继续用图文对监督微调，而不把原本的少步推理能力训坏。
+\end{conceptbox}
+
+\subsection{0. 一句话结论}
+
+\textbf{D-OPSD 的核心判断是：少步蒸馏模型的持续微调不能再沿用普通扩散模型的离线 SFT，因为离线 SFT 把模型拉向 ground-truth noised states，而这些 states 并不是少步 sampler 自己会访问的轨迹。} 它的解法是让同一个模型扮演两个角色：student 只看文本 prompt，在自己的少步采样轨迹上 rollout；teacher 看文本 prompt 和目标图像的多模态上下文，在同一批 student states 上给 velocity supervision。这样既使用了图文监督，又保持了 on-policy train-inference consistency。
+
+\[
+\begin{aligned}
+\text{D-OPSD}
+&= \text{student text-only rollout}\\
+&\quad + \text{teacher text+image multimodal context}\\
+&\quad + \text{same-state velocity matching}\\
+&\quad + \text{no external reward, no extra teacher model}. 
+\end{aligned}
+\]
+
+\begin{summarybox}
+\textbf{我的判断：} 这篇论文真正重要的地方，是把 LLM 里的 on-policy self-distillation 精神翻译成了少步扩散模型可执行的训练范式。它不是“再提出一个 LoRA 微调技巧”，而是在回答一个更底层的问题：当模型的推理轨迹已经被蒸馏成少数几步后，监督学习应该发生在谁的 trajectory 上？D-OPSD 的答案是：必须发生在 student 自己的 few-step trajectory 上，否则微调得到的新知识会以破坏少步动力学为代价。
+\end{summarybox}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{d_opsd/zeroshot_incontext_z.pdf}
+\caption{论文的关键动机实验：Z-Image-Turbo 在 8 步推理下，如果条件从 text-only feature 换成 text+target-image 的 multimodal feature，模型即使未经额外训练，也能生成保留目标概念或风格的变体。这说明现代以 LLM/VLM 为 encoder 的扩散模型，可能继承了 encoder 的 in-context 能力。图源：arXiv 2605.05204 Figure 1。}
+\label{fig:d-opsd-motivation-z}
+\end{figure}
+
+\subsection{1. 为什么这篇应该放在图像模型专区}
+
+表面上看，D-OPSD 属于后训练 / distillation / on-policy learning；但它的问题对象非常明确：\key{step-distilled text-to-image diffusion models}。论文实验底座是 \textbf{Z-Image-Turbo 6B} 和 \textbf{FLUX.2-klein 4B}，目标是让这类生产级少步图像模型继续学习新概念、新风格、新领域偏好，同时保持原有 4--8 步生成质量。
+
+它和普通 DreamBooth / LoRA / SFT 的区别在于：普通方法默认模型仍有足够多 denoising steps 来纠错；但 step-distilled 模型只有很少几步，每一步都是被蒸馏过的关键更新。\textbf{一旦微调改变了这些 few-step dynamics，模型可能学到目标概念，却丢掉原来的清晰度、审美和 prompt-following。}
+
+\begin{intubox}
+\textbf{一句话定位：} D-OPSD 是“面向少步图像生成模型的持续监督微调算法”。它保留监督微调对图文对的易用性，同时引入 on-policy self-distillation 来避免破坏少步推理轨迹。
+\end{intubox}
+
+\subsection{2. 问题背景：为什么少步模型不能直接 SFT}
+
+\subsubsection{2.1 少步模型的能力藏在 trajectory 里}
+
+标准 flow matching / rectified flow 训练通常把目标图像 $x_0$ 加噪到某个 $x_t$，然后监督模型预测 ground-truth velocity。这个训练目标适合从头训练或多步模型微调，因为模型推理时有较长的 denoising chain，局部误差还有修正空间。
+
+但 step-distilled 模型的情况不同。它的推理过程可能只有 4 或 8 步：
+
+\[
+1=t_K > t_{K-1} > \cdots > t_0=0,
+\]
+
+从高斯噪声出发，模型用少数几个大步更新完成生成。也就是说，少步模型的质量不仅来自单步 velocity 预测准确，还来自一整套已经被蒸馏好的 coarse trajectory。
+
+\subsubsection{2.2 Vanilla SFT 的错位在哪里}
+
+普通 SFT 使用的是 target image induced states：
+
+\[
+\text{training state} = \text{noise}(x_0, t),
+\]
+
+而少步推理时模型访问的是自己从噪声 rollout 出来的 states：
+
+\[
+\text{inference state} = x_{t_k}^{s}, \qquad x_{t_{k-1}}^{s}=\Phi(x_{t_k}^{s}, t_k, t_{k-1}, v_\theta).
+\]
+
+这两类状态分布不一样。Vanilla SFT 实际上在告诉模型：“你应该在目标图像附近的加噪状态上这样预测 velocity。”但少步模型真正需要的是：“你在自己当前少步轨迹上走到这些中间状态时，下一步应该怎么走。”
+
+\begin{warnbox}
+\textbf{关键矛盾：} 对 step-distilled 模型来说，SFT 的 train-test mismatch 不只是一般意义上的 distribution shift，而是直接打乱了蒸馏过的 few-step dynamics。结果是模型可能确实记住了新概念，但原本高质量少步生成能力被牺牲。
+\end{warnbox}
+
+\subsubsection{2.3 为什么不用 RL 直接解决}
+
+在线 RL 方法，例如 ReFL、Flow-GRPO 等，天然在模型自己的 samples / trajectories 上优化，因此更符合少步模型的推理分布。但 RL 的工程门槛在于 reward：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 如果要学一个新角色、新商品、新风格，很难手工设计合适 reward；
+  \item 如果用 reward model，二次开发者未必有可靠偏好模型；
+  \item 对少量图文对定制任务，reward 往往比监督数据更难获得。
+\end{itemize}
+
+D-OPSD 的立场是：\textbf{我们想要 RL 的 on-policy 性质，但又不想引入 reward design。}
+
+\subsection{3. 论文的关键观察：扩散模型也能继承 encoder 的 in-context 能力}
+
+这篇论文最有启发的观察是：现代 T2I diffusion model 越来越多地使用 LLM/VLM 作为条件 encoder，例如 Z-Image、FLUX.2、Qwen-Image 等。既然 encoder 本身有 in-context learning 能力，那么后面的 diffusion transformer 是否也能利用这种能力？
+
+论文用一个简单实验回答：对同一个 prompt，分别输入：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{text-only condition：} 只编码文本 prompt；
+  \item \textbf{text+image multimodal condition：} 同时编码文本 prompt 和目标图像。
+\end{enumerate}
+
+结果是，text+image condition 下的模型会生成目标概念或风格的变体，即使模型本身没有针对这个目标图像再训练。这说明目标图像可以作为一种 \key{stronger context} 进入 teacher branch，而不是作为被加噪的 ground-truth state 强行喂进 denoising trajectory。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.94\linewidth]{d_opsd/zeroshot_incontext_flux.pdf}
+\caption{附录中对 FLUX.2-klein 的类似验证：4 步推理下，使用 multimodal feature 作为条件也能更好保留目标图像的概念或风格身份。这个结果支持论文的核心假设：D-OPSD 不只是 Z-Image-Turbo 上的偶然现象，而可能适用于使用 LLM/VLM encoder 的少步图像模型。图源：arXiv 2605.05204 Appendix Figure。}
+\label{fig:d-opsd-motivation-flux}
+\end{figure}
+
+\begin{summarybox}
+\textbf{从这个观察到方法的跳跃：} 如果目标图像可以通过 VLM encoder 变成“上下文”，而不是变成“训练轨迹本身”，那么 teacher 就能看见目标图像，但 student 的 rollout 仍然保持 text-to-image 推理路径。D-OPSD 正是利用这个空隙把 OPSD 搬到了扩散模型里。
+\end{summarybox}
+
+\subsection{4. 方法总览：同一个模型，两种上下文}
+
+D-OPSD 对每个训练样本 $(x_0,y)$ 构造两个条件：
+
+\[
+c_s=f_{\mathrm{text}}(y), \qquad c_t=f_{\mathrm{mm}}(y,x_0).
+\]
+
+其中：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item $c_s$ 是 student condition，只包含文本 prompt；
+  \item $c_t$ 是 teacher condition，包含文本 prompt 和目标图像；
+  \item student 与 teacher 是同一个扩散模型的两种角色，teacher 参数用 stop-gradient 或 EMA / frozen 形式提供稳定目标；
+  \item 训练结束后 teacher branch 被丢弃，推理仍然是原始 text-only few-step T2I pipeline。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{d_opsd/method.pdf}
+\caption{D-OPSD 方法框架：先用 prompt-only encoder 得到 student condition $c_s$，用 prompt+target-image encoder 得到 teacher condition $c_t$；student 在 $c_s$ 下 rollout 自己的 few-step trajectory；teacher 和 student 在同一批 student states 上预测 velocity；最后用 velocity matching 更新 student。训练后 teacher branch 不参与推理。图源：arXiv 2605.05204 Figure 2。}
+\label{fig:d-opsd-method}
+\end{figure}
+
+\subsection{5. 方法拆解}
+
+\subsubsection{5.1 Student rollout：必须走自己的少步轨迹}
+
+给定 step schedule $1=t_K>\cdots>t_0=0$，student 从噪声开始，用原本 few-step solver 生成轨迹：
+
+\[
+x_{t_{k-1}}^{s}
+=
+\Phi\left(
+ x_{t_k}^{s}, t_k, t_{k-1},
+ v_\theta(\cdot,\cdot,c_s)
+\right).
+\]
+
+这里最重要的是 $x_{t_k}^{s}$ 来自 student 当前策略，而不是 target image 的加噪版本。因此训练状态与推理状态一致。
+
+\subsubsection{5.2 Teacher condition：目标图像只作为上下文，不改写轨迹}
+
+teacher 看见的是 multimodal condition $c_t=f_{\mathrm{mm}}(y,x_0)$。这让 teacher 的预测带有目标图像的信息，例如目标物体外观、角色身份、风格纹理、领域偏好等。
+
+但 teacher 不重新采样轨迹，也不把 target image 直接插入 denoising process。teacher 只在 student 已经访问到的 states 上预测 velocity：
+
+\[
+u_k^t = v_{\bar{\theta}}(x_{t_k}^{s}, t_k, c_t).
+\]
+
+这就是 D-OPSD 区别于 vanilla SFT 的核心：\key{目标图像提供监督语义，但不定义训练状态分布。}
+
+\subsubsection{5.3 Velocity self-distillation loss}
+
+student 在同一状态上预测：
+
+\[
+u_k^s = v_\theta(x_{t_k}^{s}, t_k, c_s).
+\]
+
+训练目标是：
+
+\[
+\mathcal{L}_{\mathrm{D\mbox{-}OPSD}}
+=
+\mathbb{E}_{(x_0,y)}
+\left[
+\frac{1}{K}
+\sum_{k=1}^{K}
+\left\|
+ u_k^s - \mathrm{sg}(u_k^t)
+\right\|_2^2
+\right].
+\]
+
+其中 $\mathrm{sg}(\cdot)$ 表示 stop-gradient。直觉上，teacher 在“看过答案图像”的上下文下告诉 student：如果你现在走到了这个 latent state，那么 velocity 应该往这个方向修；student 则在只看文本的条件下学习这种方向。
+
+\begin{intubox}
+\textbf{和 LLM OPSD 的对应关系：} LLM 中 student 在弱上下文 $q$ 下生成 token，teacher 在强上下文 $(q,r)$ 下给 next-token distribution；D-OPSD 中 student 在文本条件下生成 denoising trajectory，teacher 在文本+图像条件下给 velocity field。token distribution 的 KL 被替换成连续 velocity 的 MSE。
+\end{intubox}
+
+\subsubsection{5.4 Teacher 的构造：frozen base 与 EMA}
+
+论文研究了不同 teacher 构造方式：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Frozen base teacher：} 使用冻结的 base model 作为 teacher，训练稳定且有效；
+  \item \textbf{EMA teacher：} 类似自蒸馏方法，用 student 的 EMA 版本作为 teacher；
+  \item \textbf{直接 student copy：} 容易训练坍塌；
+  \item \textbf{EMA momentum 0.9999：} 论文实验中效果最好，原因可能是极高 momentum 同时平滑了高方差 target，并能缓慢跟踪 student 进展。
+\end{itemize}
+
+\subsubsection{5.5 Encoder mismatch：为什么不能直接换成 Qwen3-VL}
+
+附录里一个很重要的工程细节是：student 用原始文本 encoder，例如 Qwen3-4B；teacher 需要看图，直觉上可以直接换 Qwen3-VL-4B。但作者发现简单替换会带来高频 artifacts 和过度锐化。原因是 Qwen3-VL 与原始 diffusion training 时的 feature distribution 不完全一致。
+
+他们的解决办法是：\textbf{保留 Qwen3-VL 的 ViT 和 Connector，但把 LLM component 权重替换回 Qwen3-4B}。这相当于尽量保留多模态接入能力，同时让输出特征空间更接近原始扩散模型训练分布。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\linewidth]{d_opsd/re-weight-ab.pdf}
+\caption{teacher encoder 的权重替换消融：直接使用 Qwen3-VL 可能引入高频 artifacts；将 Qwen3-VL 的 LLM 部分替换为与原模型更匹配的 Qwen3-4B，同时保留 ViT 和 Connector，可以更好兼顾多模态上下文能力与图像质量。图源：arXiv 2605.05204 Appendix Figure。}
+\label{fig:d-opsd-reweight}
+\end{figure}
+
+\subsection{6. 算法流程：用一个定制角色走一遍}
+
+假设训练集中只有几张某个玩偶角色的图文对，目标是让 Z-Image-Turbo 以后能在新场景里生成这个角色。
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{输入训练对：} $(x_0,y)$，其中 $x_0$ 是目标角色图像，$y$ 是描述文本。
+  \item \textbf{student 编码：} 只把 $y$ 输入文本 encoder，得到 $c_s$。
+  \item \textbf{teacher 编码：} 把 $y$ 和 $x_0$ 输入 multimodal encoder，得到 $c_t$。
+  \item \textbf{student rollout：} student 按原本 4--8 步 sampler 从噪声生成自己的 latent trajectory。
+  \item \textbf{same-state teacher prediction：} teacher 不生成新轨迹，只在 student 的每个 $x_{t_k}^s$ 上预测 velocity。
+  \item \textbf{velocity matching：} student 用 text-only 条件下的 velocity 去匹配 teacher 的 multimodal velocity。
+  \item \textbf{更新后推理：} 训练完只保留 student；推理时仍然只输入文本 prompt，不需要目标图像，也不需要额外 reward 或 teacher。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{最关键的设计约束：} target image 只能进入 teacher 的 context，不能成为 student 的训练 state。否则就退回 vanilla SFT，重新引入 train-inference mismatch。
+\end{summarybox}
+
+\subsection{7. 与几类方法的区别}
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.20\linewidth}p{0.28\linewidth}p{0.12\linewidth}p{0.14\linewidth}p{0.16\linewidth}}
+\toprule
+\textbf{方法} & \textbf{监督信号} & \textbf{On-policy} & \textbf{需要 reward} & \textbf{训练/推理状态匹配} \\
+\midrule
+SFT & ground-truth velocity & 否 & 否 & 否 \\
+Offline RL / PSO & ground-truth velocity pairs & 否 & 否 & 否 \\
+Online RL / Flow-GRPO & reward function / reward model & 是 & 是 & 是 \\
+\textbf{D-OPSD} & self-distilled velocity & \textbf{是} & \textbf{否} & \textbf{是} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张对比表的核心不是说 D-OPSD 一定全面优于 RL，而是说明它占据了一个很实用的位置：\textbf{像 RL 一样 on-policy，但像 SFT 一样只需要图文对。}
+
+\subsection{8. 实验设置}
+
+论文主要评估两个场景：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{小数据 LoRA 定制：} 在 DreamBooth 风格的小规模数据上学习新 subject / style，通常只有少量图文对；
+  \item \textbf{大数据 full fine-tuning：} 在 25K 高质量 anime 内部数据上做领域偏好适配，检验是否会遗忘原始知识和破坏少步质量。
+\end{itemize}
+
+模型底座包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Z-Image-Turbo 6B：} LoRA rank 64、alpha 128；小数据训练 1K iterations / single H800；全量微调 batch size 256、10K iterations / 32 H800；
+  \item \textbf{FLUX.2-klein 4B：} LoRA rank 64、alpha 128；小数据训练 1K iterations；大数据设置中也使用 LoRA，10K iterations / 32 H800；
+  \item \textbf{EMA momentum：} 默认 0.9999。
+\end{itemize}
+
+指标分成四类：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{是否学到目标：} DINO-D、LPIPS-D、FID；
+  \item \textbf{是否能泛化：} VLM-J、CLIP-S；
+  \item \textbf{是否保持少步质量：} Quality-S、Aesthetic-S；
+  \item \textbf{是否保留旧知识：} GenEval、DPG。
+\end{itemize}
+
+\subsection{9. LoRA 定制结果怎么读}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Z-Image-Turbo} & \textbf{DINO-D}$\downarrow$ & \textbf{LPIPS-D}$\downarrow$ & \textbf{VLM-J}$\uparrow$ & \textbf{CLIP-S}$\uparrow$ & \textbf{Quality-S}$\uparrow$ & \textbf{Aesthetic-S}$\uparrow$ \\
+\midrule
+Base & 0.2373 & 0.7520 & 1.0000 & 0.3043 & 3.5088 & 2.9667 \\
+Vanilla SFT & 0.2212 & 0.6501 & 1.3293 & 0.3095 & 2.4236 & 2.3582 \\
+DreamBooth & 0.0902 & 0.6424 & 3.0625 & 0.3328 & 2.5582 & 2.3755 \\
+PSO & \textbf{0.0570} & \textbf{0.4974} & \textbf{3.3333} & 0.2893 & 3.3422 & 3.0820 \\
+\textbf{D-OPSD} & 0.0823 & 0.5803 & \textbf{3.3333} & \textbf{0.3664} & \textbf{3.7965} & \textbf{3.1710} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这组结果有一个很重要的取舍：PSO 在 DINO-D / LPIPS-D 上最低，说明它更贴近训练图像；但它的 CLIP-S 降到 0.2893，说明对新 prompt 的遵循变差，可能过拟合训练集。D-OPSD 的 DINO/LPIPS 不是最低，但 VLM-J 并列最好，CLIP-S、Quality-S、Aesthetic-S 都最好，说明它更像是在学习“可泛化的概念/风格”，而不是简单复刻训练图。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\linewidth]{d_opsd/lora_compare.pdf}
+\caption{小数据 LoRA 定性对比：Vanilla SFT 牺牲原始少步生成质量；PSO 更容易过拟合训练集；D-OPSD 能在新场景中保留定制概念，同时维持少步图像质量。图源：arXiv 2605.05204 Figure 3。}
+\label{fig:d-opsd-lora}
+\end{figure}
+
+\begin{summarybox}
+\textbf{我的读法：} D-OPSD 在定制任务中的目标不是“训练集最近邻复刻”，而是“把目标图像提供的概念/风格变成 text-only 推理时可调用的条件能力”。所以它应该同时看概念一致性、prompt 泛化和质量，而不能只看 DINO/LPIPS。
+\end{summarybox}
+
+\subsection{10. 大规模领域微调结果怎么读}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Z-Image-Turbo} & \textbf{FID}$\downarrow$ & \textbf{DINO-D}$\downarrow$ & \textbf{LPIPS-D}$\downarrow$ & \textbf{Quality-S}$\uparrow$ & \textbf{Aesthetic-S}$\uparrow$ & \textbf{GenEval}$\uparrow$ & \textbf{DPG}$\uparrow$ \\
+\midrule
+Base & 48.6858 & 0.1274 & 0.7036 & 3.7624 & 3.5218 & \textbf{0.7543} & \textbf{84.7645} \\
+Vanilla SFT & 82.2036 & 0.1896 & 0.6787 & 2.6121 & 2.4852 & 0.1588 & 69.9746 \\
+PSO & 88.4343 & 0.1716 & 0.6530 & 2.8653 & 2.6424 & 0.2475 & 72.7363 \\
+\textbf{D-OPSD} & \textbf{40.4938} & \textbf{0.1088} & \textbf{0.6419} & \textbf{3.8438} & \textbf{3.6195} & 0.7170 & 84.1116 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+在大规模 anime 领域适配里，D-OPSD 同时拿到最低 FID、最低 DINO-D / LPIPS-D 和最高质量分，同时 GenEval / DPG 只比 base 小幅下降。Vanilla SFT 和 PSO 则出现明显灾难：FID 大幅变差，Quality/Aesthetic 掉很多，GenEval 也明显下降。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{d_opsd/full_compare.pdf}
+\caption{全量微调定性对比：SFT 和 PSO 虽然尝试适配目标领域，但会牺牲少步推理质量；D-OPSD 更好地把模型偏向目标领域，同时保留原始领域知识和少步生成能力。图源：arXiv 2605.05204 Figure 4。}
+\label{fig:d-opsd-full}
+\end{figure}
+
+\subsection{11. 消融：on-policy self-distillation 到底贡献了什么}
+
+论文做了四组消融：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{SFT from target images：} 标准 flow-matching SFT；
+  \item \textbf{SFT from teacher samples：} 用 teacher 在 multimodal condition 下生成的样本当目标，再做 SFT；
+  \item \textbf{Off-policy distillation：} 在固定离线数据上对齐 teacher 输出；
+  \item \textbf{On-policy distillation：} D-OPSD，在 student 自己 rollout states 上对齐 teacher。
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\linewidth]{d_opsd/ablation.pdf}
+\caption{D-OPSD 关键消融：Vanilla SFT 会逐步破坏少步质量；self-distillation 类方法能缓解；on-policy distillation 收敛更快，同时保持更好的生成质量。图源：arXiv 2605.05204 Figure 5。}
+\label{fig:d-opsd-ablation}
+\end{figure}
+
+这个消融说明：D-OPSD 的收益不只是来自“teacher 看过目标图像”，也不只是来自“自蒸馏”。真正关键的是 \key{teacher supervision 被定义在 student 自己访问的 states 上}。如果 supervision 发生在固定离线状态上，仍然会有分布错位。
+
+\subsection{12. 局限和失败案例}
+
+论文明确承认 D-OPSD 依赖 base model 的 multimodal in-context 能力。如果 teacher 在 text+image condition 下也不能给出有意义的监督，那么 student 学到的就是错误或无效方向。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.78\linewidth]{d_opsd/failure_case.pdf}
+\caption{失败案例：当 base model 即便在 multimodal condition 下也无法产生有意义的目标概念/风格监督时，D-OPSD 训练会失败。图源：arXiv 2605.05204 Figure 6。}
+\label{fig:d-opsd-failure}
+\end{figure}
+
+主要限制可以归纳为：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{依赖 encoder / base model 的 in-context 能力：} 如果 VLM condition 无法让 diffusion backbone 理解目标图像，teacher supervision 没有质量保证；
+  \item \textbf{额外计算成本：} 每次迭代需要 student rollout 和 teacher inference，论文估计约为 vanilla SFT 的 $4\times$ FLOPs、$2\times$ 训练时间；
+  \item \textbf{VLM feature distribution mismatch：} teacher encoder 的工程构造比较敏感，需要权重替换等技巧；
+  \item \textbf{评测仍有限：} 主要覆盖 subject/style/domain adaptation，对复杂编辑、多对象关系、身份一致性长程保持等仍需更多验证；
+  \item \textbf{未来可扩展到 multi-expert OPD：} 论文自己也提到，可以先训练领域 experts，再用 D-OPSD-style loss 蒸馏回统一模型。
+\end{itemize}
+
+\subsection{13. 我认为它的真正贡献}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{贡献 1：重新定义少步模型持续微调的训练状态。} 它强调少步模型必须在自己的 few-step trajectory 上学习，而不是在 target image induced states 上学习。
+  \item \textbf{贡献 2：把目标图像从 denoising target 变成 teacher context。} 这一步非常关键，因为它保留了监督学习的可用性，同时避免破坏 student rollout。
+  \item \textbf{贡献 3：把 OPSD 从离散 token 推广到连续 velocity field。} LLM 的 token distribution alignment 被替换为 diffusion 的 same-state velocity matching。
+  \item \textbf{贡献 4：指出现代图像生成模型的 encoder in-context 能力可能成为后训练接口。} 未来 image/video model 可能越来越依赖“上下文条件能力”做持续学习，而不是只靠传统 loss。
+\end{itemize}
+
+\subsection{14. 和 Flow-OPD 的关系}
+
+这篇和我前面读过的 Flow-OPD 很容易混淆，因为二者都叫 OPD/OPSD，都用 on-policy trajectory 和 velocity supervision。但它们的目标不同：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+\textbf{维度} & \textbf{D-OPSD} & \textbf{Flow-OPD} \\
+\midrule
+核心任务 & 持续微调 step-distilled T2I 模型 & 统一多个 reward-specialized Flow Matching teachers \\
+teacher 来源 & 同一个模型 + target image multimodal context & 多个单 reward Flow-GRPO expert teachers \\
+是否需要 reward & 不需要 & teacher acquisition 阶段需要 reward \\
+监督对象 & student few-step rollout 上的 velocity & student flow trajectory 上的 expert velocity \\
+主要风险 & base model in-context 能力不足 & teacher 能力与 task routing 限制 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{intubox}
+\textbf{记忆钩子：} D-OPSD 是“同一个模型看答案图当老师”；Flow-OPD 是“多个专科老师合并成一个通才学生”。共同点是：都不在离线标准轨迹上训 student，而是在 student 自己走到的 states 上给 dense velocity supervision。
+\end{intubox}
+
+\subsection{15. 对我的可复用点}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{定制少步图像模型时，先问训练状态是否 on-policy。} 如果不是，SFT 再简单也可能破坏少步质量。
+  \item \textbf{把 reference image 作为 context，而不是 target state。} 这对 subject-driven customization、style transfer、品牌素材生成都很有用。
+  \item \textbf{teacher 不一定是另一个模型。} 如果模型本身有 in-context 能力，同一个模型在强上下文下就可以充当 teacher。
+  \item \textbf{未来可做多上下文 teacher。} 除目标图像外，还可以把 mask、layout、depth、editing history、video frame 当作 teacher context。
+  \item \textbf{评估不能只看相似度。} DINO/LPIPS 越低可能只是越会复制训练图；必须同时看 CLIP-S、Quality-S、Aesthetic-S 和旧知识保留。
+\end{itemize}
+
+\subsection{16. 待查问题}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item multimodal encoder 的 feature space mismatch 能否通过小规模 adapter 学习解决，而不是手动替换 LLM 权重？
+  \item teacher condition 是否可以包含多张 reference images，从而提高 subject/style 稳定性？
+  \item D-OPSD 是否适合 video diffusion 的少步蒸馏模型？如果 teacher context 是目标视频片段，会不会更强？
+  \item 对身份一致性、人脸、商品品牌等高精度定制任务，D-OPSD 与 IP-Adapter / DreamBooth / LoRA 组合的最佳方式是什么？
+  \item 如果 base model 没有明显 in-context 能力，能否先训练一个 multimodal context adapter，再做 D-OPSD？
+  \item D-OPSD 的 teacher 是不是可以从 frozen base 过渡到 multi-expert EMA teacher，从而兼顾稳定性和专长？
+\end{itemize}
+
+\subsection{17. 读完后的记忆钩子}
+
+\begin{intubox}
+\textbf{D-OPSD = 不要用目标图像的加噪状态去教少步模型；让少步模型先按自己的推理轨迹走，再让“看过目标图像”的自己在同一轨迹上告诉它 velocity 应该怎么修。}
+\end{intubox}
+
+\subsection{参考来源}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{论文页面：} \href{https://arxiv.org/abs/2605.05204}{D-OPSD: On-Policy Self-Distillation for Continuously Tuning Step-Distilled Diffusion Models}；\href{https://arxiv.org/html/2605.05204v1}{HTML}；\href{https://arxiv.org/pdf/2605.05204}{PDF}。
+  \item \textbf{项目页：} \href{https://vvvvvjdy.github.io/d-opsd}{D-OPSD Project Page}，用于核对方法概览、图示和官方外链。
+  \item \textbf{代码仓库：} \href{https://github.com/vvvvvjdy/D-OPSD}{vvvvvjdy/D-OPSD}。
+  \item \textbf{相关底座：} \href{https://github.com/Tongyi-MAI/Z-Image}{Tongyi-MAI/Z-Image}；\href{https://blackforestlabs.ai/flux-2}{FLUX.2}。
+  \item \textbf{对照阅读：} \href{https://arxiv.org/abs/2605.08063}{Flow-OPD}；\href{https://thinkingmachines.ai/blog/on-policy-distillation}{On-Policy Distillation}；\href{https://arxiv.org/abs/2505.05470}{Flow-GRPO}；\href{https://arxiv.org/abs/2208.12242}{DreamBooth}。
+\end{itemize}

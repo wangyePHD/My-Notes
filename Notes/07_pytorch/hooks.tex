@@ -1,0 +1,393 @@
+% ============================================================
+% PyTorch Hook 机制笔记
+% ============================================================
+
+\section{PyTorch Hook 机制：从用法到源码}
+
+\begin{conceptbox}
+\textbf{一句最本质的话：} Hook 就是 PyTorch 给\key{张量、模块}埋下的可注册回调点，让你在\textbf{不修改模型源码}的前提下，拦截前向输入/输出、反向梯度，做监控、可视化、特征提取或就地修改。\\
+\textbf{源码事实：} 每个 \code{nn.Module} 内部用若干个 \code{OrderedDict}（如 \code{\_forward\_hooks}, \code{\_forward\_pre\_hooks}, \code{\_backward\_hooks} 等）维护已注册的 hook，注册接口返回 \code{RemovableHandle}，由 \code{weakref} 弱引用绑定，不会反向阻止 module 被回收。
+\end{conceptbox}
+
+% -------------------- 为什么需要 Hook --------------------
+\subsection{为什么需要 Hook？——动机与第一性原理}
+
+通常我们想做下面这些事时，会遇到两难：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 想看 ResNet 第 4 个 stage 的中间特征：\textbf{改 forward}？侵入性太强。
+  \item 想监控某层梯度有没有 NaN：每次手动加 print？散乱难管理。
+  \item 想做 GradCAM、特征可视化：需要拿到中间层的激活和梯度，但模型来自第三方仓库。
+  \item 训练时想对某些层做\key{梯度裁剪、梯度修改}，又不想动 optimizer。
+\end{itemize}
+
+\begin{intubox}
+\textbf{Hook 的设计直觉：}\\
+模型本身定义的是\textbf{计算图结构}，而 hook 提供的是\textbf{在这个计算图的关键节点上挂一个可拔插的“监听 / 修改器”}。\\
+就像在管道上装压力表（监听）或加一个调压阀（修改），而不需要重造管道。
+\end{intubox}
+
+% -------------------- Hook 全景 --------------------
+\subsection{Hook 全景：到底有几种？}
+
+PyTorch 把 hook 分成两个层面：\key{Tensor 级} 和 \key{Module 级}。
+
+\begin{center}
+{\small
+\begin{tabular}{p{4.5cm}p{2.6cm}p{6cm}}
+\toprule
+\textbf{接口} & \textbf{层面} & \textbf{触发时机} \\
+\midrule
+\code{Tensor.register\_hook(fn)} & 张量 & 该张量\textbf{在反向中收到梯度时}调用\\
+\code{Tensor.register\_post\_accumulate\_grad\_hook} & 张量（叶子） & 梯度\textbf{累加进 \code{.grad} 之后} \\
+\midrule
+\code{Module.register\_forward\_pre\_hook} & 模块 & 前向\textbf{即将开始}（可改 input） \\
+\code{Module.register\_forward\_hook} & 模块 & 前向\textbf{执行完}（可改/读 output） \\
+\code{Module.register\_full\_backward\_pre\_hook} & 模块 & 反向\textbf{进入该模块前}（可改 grad\_output） \\
+\code{Module.register\_full\_backward\_hook} & 模块 & 反向\textbf{该模块算完梯度后}（可改 grad\_input） \\
+\code{Module.register\_backward\_hook} & 模块 & \bad{已 deprecated}，行为不一致，建议改 full 版本\\
+\midrule
+\code{nn.modules.module.register\_module\_*\_hook} & 全局 & 对\textbf{所有 \code{nn.Module}} 注册全局 hook \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{warnbox}
+\textbf{别再用 \code{register\_backward\_hook}！}\\
+官方明确推荐使用 \code{register\_full\_backward\_hook} 与 \code{register\_full\_backward\_pre\_hook}。旧版 \code{register\_backward\_hook} 在多输入/多输出、原地操作的情况下行为不可预测，新版本会给 warning 并要求迁移。
+\end{warnbox}
+
+% -------------------- 注册接口与签名 --------------------
+\subsection{注册接口与函数签名（以新版 API 为准）}
+
+\subsubsection{Forward 系列}
+
+\begin{lstlisting}[language=Python, caption=Module forward hooks]
+# 前向之前：可读/改输入
+def fwd_pre_hook(module, args):                       # with_kwargs=False
+    ...
+def fwd_pre_hook_kw(module, args, kwargs):            # with_kwargs=True
+    ...
+handle = m.register_forward_pre_hook(fwd_pre_hook,
+                                     prepend=False,
+                                     with_kwargs=False)
+
+# 前向之后：可读/改输出
+def fwd_hook(module, args, output):                   # with_kwargs=False
+    ...
+def fwd_hook_kw(module, args, kwargs, output):        # with_kwargs=True
+    ...
+handle = m.register_forward_hook(fwd_hook,
+                                 prepend=False,
+                                 with_kwargs=False,
+                                 always_call=False)
+\end{lstlisting}
+
+关键参数（来自 \code{torch/nn/modules/module.py} 中的源码事实）：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{prepend=True}：把当前 hook \textbf{插到列表最前面}（默认是追加到最后）。多 hook 时需要控制执行顺序时使用。
+  \item \code{with\_kwargs=True}：让 hook 也能拿到关键字参数 \code{kwargs}（很多带 kwargs 的 forward 必备）。
+  \item \code{always\_call=True}（仅 forward hook）：即使前向\textbf{抛异常}也会调用此 hook，常用于资源清理 / debug 落盘。
+\end{itemize}
+
+\subsubsection{Full backward 系列}
+
+\begin{lstlisting}[language=Python, caption=Module full backward hooks（推荐）]
+# 反向进入模块前
+def fbw_pre_hook(module, grad_output):
+    # 可以 return 一个 tuple，替换 grad_output
+    ...
+m.register_full_backward_pre_hook(fbw_pre_hook, prepend=False)
+
+# 反向算完模块的梯度后
+def fbw_hook(module, grad_input, grad_output):
+    # 可以 return 一个 tuple，替换 grad_input
+    ...
+m.register_full_backward_hook(fbw_hook, prepend=False)
+\end{lstlisting}
+
+\begin{intubox}
+\textbf{记忆口诀：}\\
+\code{forward\_pre} 看 \textbf{input}；\code{forward} 看 \textbf{output}；\\
+\code{full\_backward\_pre} 看 \textbf{grad\_output}；\code{full\_backward} 看 \textbf{grad\_input + grad\_output}。\\
+带 \code{pre} 的都在“进”这一侧，不带的都在“出”这一侧。
+\end{intubox}
+
+\subsubsection{Tensor 级 hook}
+
+\begin{lstlisting}[language=Python, caption=Tensor.register\_hook]
+x = torch.randn(4, 4, requires_grad=True)
+y = (x ** 2).sum()
+
+def tensor_grad_hook(grad):
+    # 不返回 = 只观察；返回新张量 = 替换梯度
+    print("dL/dx norm:", grad.norm().item())
+    return grad.clamp_(-1, 1)   # 例：梯度裁剪
+
+h = x.register_hook(tensor_grad_hook)
+y.backward()
+h.remove()
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{Tensor hook vs Module hook 的关键区别：}\\
+\code{Tensor.register\_hook} 只在\textbf{该张量自身的梯度被算出来那一刻}触发；\\
+\code{Module.full\_backward\_hook} 触发的是\textbf{整个 module 的反向}，看到的是 \code{grad\_input/grad\_output} 这一对“整个 op 的梯度”。两者层级完全不同，不要混用。
+\end{warnbox}
+
+% -------------------- 内部数据结构 --------------------
+\subsection{内部数据结构：模块身上挂了哪些字典}
+
+\code{nn.Module.\_\_init\_\_} 里实际给每个 module 挂了下面这些字典（节选自源码 \code{module.py}）：
+
+\begin{lstlisting}[language=Python, caption=Module 初始化时挂载的 hook 字典]
+super().__setattr__("_backward_hooks",            OrderedDict())
+super().__setattr__("_backward_pre_hooks",        OrderedDict())
+super().__setattr__("_forward_hooks",             OrderedDict())
+super().__setattr__("_forward_hooks_with_kwargs", OrderedDict())
+super().__setattr__("_forward_hooks_always_called", OrderedDict())
+super().__setattr__("_forward_pre_hooks",         OrderedDict())
+super().__setattr__("_forward_pre_hooks_with_kwargs", OrderedDict())
+\end{lstlisting}
+
+注册函数做的事情非常机械：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 创建一个 \code{RemovableHandle}（自带唯一 \code{id}）。
+  \item 把 \code{handle.id $\to$ hook} 写进对应的 \code{OrderedDict}。
+  \item 如果带 \code{with\_kwargs / always\_call}，再在两个 side dict 里登记一下。
+  \item 如果 \code{prepend=True}，调 \code{move\_to\_end(..., last=False)} 把它移到字典最前。
+  \item 返回 handle 给用户。
+\end{enumerate}
+
+\begin{summarybox}
+\textbf{设计要点：}\\
+hook 只是一个普通函数引用，PyTorch 不“魔法”，只是\textbf{在 \code{\_call\_impl} 里按字典顺序遍历调用}。理解这一点之后，hook 顺序、prepend、移除等行为都变得显然。
+\end{summarybox}
+
+% -------------------- 调用流程 --------------------
+\subsection{调用流程：\code{\_call\_impl} 里到底发生了什么}
+
+\code{Module.\_\_call\_\_} 实际指向 \code{\_call\_impl}，它在执行 \code{forward} 前后会做这些事（按源码逻辑简化）：
+
+\begin{lstlisting}[language=Python, caption=\_call\_impl 调用顺序（极简伪代码）]
+def _call_impl(self, *args, **kwargs):
+    # 0) 没有任何 hook 时，走快路径，直接调 forward
+    if no_hooks_at_all(self):
+        return self.forward(*args, **kwargs)
+
+    # 1) forward_pre_hooks（按 OrderedDict 顺序，prepend 在最前）
+    for hook in (_global_forward_pre_hooks | self._forward_pre_hooks):
+        result = hook(self, args[, kwargs])
+        if result is not None:
+            args = result               # 允许替换 input
+
+    # 2) 真正的 forward
+    result = self.forward(*args, **kwargs)
+
+    # 3) forward_hooks
+    for hook in (_global_forward_hooks | self._forward_hooks):
+        new_result = hook(self, args[, kwargs], result)
+        if new_result is not None:
+            result = new_result         # 允许替换 output
+
+    # 4) 如果有 full_backward 系列 hook，PyTorch 会在 result 上挂 BackwardHook
+    #    它会在 autograd 反向时回来调用对应的 backward / backward_pre 钩子
+    return result
+\end{lstlisting}
+
+几条很重要的事实：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{forward\_pre\_hook} 返回 \textbf{tuple} 才会替换 args；返回 \code{None} = 只观察。
+  \item \code{forward\_hook} 返回\textbf{任意非 None 值}就会替换 output——\warn{常见 bug：在 hook 里 \code{print(out)} 然后不小心 \code{return out}，看似无害，其实会替换 output}。
+  \item Backward hook 不是“当场调”，而是 PyTorch 在前向时给输出张量挂上一个 \code{BackwardHook}，等 autograd 走到这里时再触发。
+  \item \code{always\_call=True} 时，即使 forward 抛异常，对应的 forward hook 也会在 \code{finally} 路径里被调用（用户提供的资料里没有这条，源码确实存在）。
+\end{itemize}
+
+% -------------------- RemovableHandle --------------------
+\subsection{\code{RemovableHandle}：注册之后必须能干净撤销}
+
+\begin{lstlisting}[language=Python, caption=torch/utils/hooks.py 中的 RemovableHandle 节选]
+class RemovableHandle:
+    def __init__(self, hooks_dict, *, extra_dict=None):
+        self.hooks_dict_ref = weakref.ref(hooks_dict)
+        self.id = RemovableHandle.next_id
+        RemovableHandle.next_id += 1
+        ...
+    def remove(self):
+        hooks_dict = self.hooks_dict_ref()
+        if hooks_dict is not None and self.id in hooks_dict:
+            del hooks_dict[self.id]
+        for ref in self.extra_dict_ref:
+            extra_dict = ref()
+            if extra_dict is not None and self.id in extra_dict:
+                del extra_dict[self.id]
+    def __enter__(self):  return self
+    def __exit__(self, *exc):  self.remove()
+\end{lstlisting}
+
+设计上有三个细节：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \key{弱引用持有字典}：handle 不会反向把 module 钉死在内存里；module 被释放后，hook 字典也走，handle 自动失效。
+  \item \key{自带上下文管理器}：可以直接 \code{with module.register\_forward\_hook(fn): ...}，离开 \code{with} 就自动 \code{remove()}。
+  \item \key{\code{extra\_dict}}：用来同步删除 \code{\_forward\_hooks\_with\_kwargs}、\code{\_forward\_hooks\_always\_called} 这些 side dict 中对应的 \code{id}，确保不残留。
+\end{enumerate}
+
+\begin{warnbox}
+\textbf{最常见的内存坑：}\\
+\textbf{1）忘记 \code{remove()}}：训练过程中反复注册 hook 而不撤销，hook 字典越来越大；如果 hook 还闭包持有了 \code{features\_dict}，就形成内存泄漏。\\
+\textbf{2）\code{output.detach()} 必须做}：在 forward hook 里要存特征时，一定 \code{features[name] = output.detach()}，否则会把整个计算图留在显存里，反向也撤不掉。
+\end{warnbox}
+
+% -------------------- 实际场景 --------------------
+\subsection{实际工程模式}
+
+\subsubsection{1. 中间特征提取（GradCAM、特征可视化）}
+
+\begin{lstlisting}[language=Python]
+features = {}
+def make_extractor(name):
+    def hook(module, args, output):
+        features[name] = output.detach()      # 注意 detach
+    return hook
+
+handles = []
+for name, m in model.named_modules():
+    if isinstance(m, torch.nn.Conv2d) and "layer4" in name:
+        handles.append(m.register_forward_hook(make_extractor(name)))
+
+with torch.no_grad():
+    model(x)
+
+for h in handles:
+    h.remove()
+\end{lstlisting}
+
+\subsubsection{2. NaN/Inf 诊断（贴近用户给的代码）}
+
+\begin{lstlisting}[language=Python, caption=诊断哪一层最先出现 NaN/Inf]
+def diagnose_nan_in_model(model):
+    handles = []
+    def make_hook(name):
+        def hook(module, args, output):
+            if torch.is_tensor(output):
+                outs = (output,)
+            elif isinstance(output, (tuple, list)):
+                outs = tuple(o for o in output if torch.is_tensor(o))
+            else:
+                return
+            for i, o in enumerate(outs):
+                if torch.isnan(o).any() or torch.isinf(o).any():
+                    print(f"[NaN/Inf] {name} (out[{i}]) "
+                          f"shape={tuple(o.shape)} "
+                          f"dtype={o.dtype}")
+        return hook
+    for name, m in model.named_modules():
+        if len(list(m.children())) == 0:        # 只挂叶子模块
+            handles.append(m.register_forward_hook(make_hook(name)))
+    return handles                              # 用完一定要 remove
+\end{lstlisting}
+
+\subsubsection{3. 梯度监控 / 裁剪（用 full backward）}
+
+\begin{lstlisting}[language=Python]
+def grad_monitor(name):
+    def hook(module, grad_input, grad_output):
+        gout = grad_output[0]
+        if gout is not None:
+            n = gout.norm().item()
+            if n > 1e3:
+                print(f"[BIG GRAD] {name}: {n:.2e}")
+    return hook
+
+for name, m in model.named_modules():
+    if hasattr(m, "weight") and m.weight.requires_grad:
+        m.register_full_backward_hook(grad_monitor(name))
+\end{lstlisting}
+
+\subsubsection{4. 上下文管理器：自动注册/移除}
+
+\begin{lstlisting}[language=Python, caption=统一管理一批 hook]
+class HookManager:
+    def __init__(self):
+        self.handles = []
+    def register_forward(self, module, fn, **kw):
+        self.handles.append(module.register_forward_hook(fn, **kw))
+    def register_full_backward(self, module, fn, **kw):
+        self.handles.append(module.register_full_backward_hook(fn, **kw))
+    def __enter__(self): return self
+    def __exit__(self, *exc):
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+with HookManager() as hm:
+    for name, m in model.named_modules():
+        if isinstance(m, nn.LayerNorm):
+            hm.register_forward(m, lambda mod, a, o, n=name: print(n, o.std().item()))
+    out = model(x)
+# 离开 with 自动 remove，所有 hook 干净撤销
+\end{lstlisting}
+
+% -------------------- 易错点 --------------------
+\subsection{易错点与经验法则}
+
+\begin{warnbox}
+\textbf{Top-7 踩坑点：}\\
+1. \warn{不该 return 的时候 return}：在 forward hook 里返回了非 None，悄悄替换 output，下游全错。\\
+2. \warn{忘记 \code{detach()}}：保存中间特征时不 detach，显存爆炸；想要梯度时反而 detach 了，用不上。\\
+3. \warn{用 \code{register\_backward\_hook}}：行为旧、容易出错，统一改 \code{register\_full\_backward\_hook}。\\
+4. \warn{对原地操作的层装 backward hook}：如某些 ReLU(inplace=True)、原地 add\_，反向 grad\_input 可能不可靠。\\
+5. \warn{在 hook 里改 input/grad 时不返回 tuple}：必须返回 tuple（即便只有一个元素 \code{(x,)}），返回单个 tensor 会报错或被忽略。\\
+6. \warn{把 hook 装在“容器模块”上而不是叶子模块上}：得到的 input/output 是子模块组合后的整体，未必是你想监控的位置；通常按 \code{len(list(m.children())) == 0} 挑叶子。\\
+7. \warn{忘记 remove}：长训练里反复注册而不撤销，hook 链越来越长，性能下降+内存泄漏。
+\end{warnbox}
+
+\begin{intubox}
+\textbf{经验法则：}\\
+\textbullet\ 只要可能，全用 \code{with} 上下文管理 handle；\\
+\textbullet\ 写 hook 时，\textbf{默认不 return}；只有明确要修改时才 return；\\
+\textbullet\ 监控类 hook 一律 \code{detach()} 后再存；\\
+\textbullet\ 大模型上调试时，先用 \code{named\_modules()} 过滤目标层名，再注册，避免一次挂上千个 hook。
+\end{intubox}
+
+% -------------------- Hook 与其它机制 --------------------
+\subsection{Hook 与其它“扩展点”的关系}
+
+\begin{center}
+{\small
+\begin{tabular}{p{3.5cm}p{3.5cm}p{6cm}}
+\toprule
+\textbf{机制} & \textbf{定位} & \textbf{何时用} \\
+\midrule
+\code{nn.Module} hook & 非侵入观察/修改 & debug、特征提取、轻量改写\\
+\code{torch.fx} & 重写计算图 & 静态变换、量化、图优化\\
+\code{torch.autograd.Function} & 自定义 op + 自定义反向 & 写新算子、特殊梯度\\
+Monkey patch & 替换方法 & 高度侵入式 hack，最后兜底\\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+
+\begin{summarybox}
+\textbf{一句话定位：} hook 是\key{“轻侵入、可拔插”}的扩展点；如果改的内容已经多到让 hook 变成事实上的另一份 forward，就该考虑 \code{torch.fx} 或写 \code{autograd.Function} 了。
+\end{summarybox}
+
+% -------------------- 参考资料 --------------------
+\subsection{参考资料}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item PyTorch 官方文档：\\
+        \href{https://pytorch.org/docs/stable/generated/torch.nn.Module.html}{\code{torch.nn.Module}（含所有 hook 注册接口）}
+  \item \href{https://pytorch.org/docs/stable/generated/torch.Tensor.register_hook.html}{\code{torch.Tensor.register\_hook}}
+  \item \href{https://pytorch.org/docs/stable/generated/torch.nn.modules.module.register_module_forward_hook.html}{全局 \code{register\_module\_forward\_hook}}
+  \item PyTorch 源码（实现细节，本笔记主要事实来源）：\\
+        \code{torch/nn/modules/module.py}（\code{register\_*\_hook} 与 \code{\_call\_impl}）\\
+        \code{torch/utils/hooks.py}（\code{RemovableHandle}, \code{BackwardHook}）
+  \item PyTorch Forums：\href{https://discuss.pytorch.org/t/how-to-register-hook-function-for-nn-module/4979}{How to register hook function for nn.Module}
+  \item Tutorial：\href{https://pytorch.org/tutorials/beginner/former_torchies/nnft_tutorial.html}{Forward and Backward Function Hooks}
+\end{itemize}
