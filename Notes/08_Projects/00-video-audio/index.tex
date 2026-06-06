@@ -1,0 +1,528 @@
+\part*{视频音频方向：Bidirectional Causal Audio-Visual Editing 调研与 Roadmap}
+\addcontentsline{toc}{part}{视频音频方向：Bidirectional Causal Audio-Visual Editing 调研与 Roadmap}
+
+\section{一句话定位}
+
+\begin{conceptbox}
+\textbf{目标：}给定源视频帧 $V$、源音频 $A$、用户编辑指令 $I$，以及可选的视觉 mask、音频时间段、对象点击或参考声音，生成编辑后的视频 $\hat V$ 和音频 $\hat A$。系统不仅要完成用户指定的视觉或声音编辑，还要把同一个\key{因果音视频源层}中的可见对象、声音 stem、动作事件、空间位置、阴影/反射/遮挡/混响等副作用一起更新，同时尽量保留无关区域和无关声源。
+\end{conceptbox}
+
+我建议把老师给的 idea 命名为：\key{Bidirectional Causal Audio-Visual Source Editing}。它不是单纯的 video editing，也不是单纯的 Foley/audio generation，而是把一个对象及其声音看作一个可插拔、可删除、可替换的\key{causal audio-visual source layer}：
+\[
+S_i = \{M_i(t), B_i(t), z_i^{vis}, z_i^{aud}, E_i, p_i(t), r_i(t), C_i\},
+\]
+其中 $M_i(t)$ 是对象 mask/track，$B_i(t)$ 是 bounding box/trajectory，$z_i^{vis}$ 是视觉身份，$z_i^{aud}$ 是声学身份，$E_i$ 是事件时间线，$p_i(t)$ 是空间位置，$r_i(t)$ 是房间/环境响应，$C_i$ 是与其他对象、背景和声音的因果关系。编辑操作本质上是在这些 source layer 上做 insertion、removal、replacement、attribute change 或 temporal change。
+
+\section{为什么这个 idea 值得做}
+
+\subsection{当前方法的缺口}
+
+现有工作大致分成四类，但每类都只覆盖了问题的一部分：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{视频对象编辑/移除：}例如 EffectErase~\cite{effecterase2026} 能做高质量视频对象和视觉 effect erasing，强调去除对象带来的形变、阴影、反射等视觉副作用。但它默认是无声视频侧的编辑，不能处理对象消失后对应声音也应消失的问题。
+  \item \textbf{联合音视频生成：}JavisDiT~\cite{javisdit2026} 证明了 joint audio-video generation 可以从开放文本提示生成同步的声音和视频，并显式强调空间同步、时间同步和时空同步。但它主要是从零生成，不是对已有视频做局部可控编辑。
+  \item \textbf{对象级音视频编辑：}Object-AVEdit~\cite{objectavedit2026} 已经非常接近，它做 object-level audio-visual addition、replacement、removal，并提出 word-to-sounding-object aligned audio generation 与 inversion-regeneration 编辑流程。但这个方向仍有空间：它更像“对象级语义编辑”，而老师的 idea 可以进一步推进到\key{源层因果一致性}，即显式建模 visible object、sound stem、motion event、spatial audio、visual side effects 和原场景保真之间的统一约束。
+  \item \textbf{音视频源定位/分离：}The Sound of Pixels~\cite{soundofpixels2018}、Looking to Listen~\cite{lookingtolistenn2018}、Audio-Visual Segmentation~\cite{avs2022}、AudioSep~\cite{audiosep2023} 等能把“声音来自哪里”和“如何分离目标声音”做出来，但它们通常不是完整的编辑系统，也不直接生成编辑后的视频和音频。
+\end{enumerate}
+
+因此，一个明确的研究 gap 是：\key{现有方法缺少面向真实视频的、双向触发的、参考条件控制的、以因果音视频源层为单位的编辑系统}。
+
+\subsection{核心研究问题}
+
+\begin{summarybox}
+\textbf{Research Question:} 当用户编辑一个可见对象或一个可听声源时，系统如何判断另一模态是否需要被更新，并在需要时只更新同一个因果源层，同时保留无关视觉区域、无关音频 stem 和原始场景语义？
+\end{summarybox}
+
+这个问题可以拆成五个子问题：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Source grounding：}用户点击一只狗、圈出一个人、选择一段 barking 音频或输入 ``dog barking''，系统如何确定这是同一个 source？
+  \item \textbf{Source separation：}如何把目标声音 stem 从混合音频中分离出来，同时保留环境声和其他对象声音？
+  \item \textbf{Causal edit propagation：}如果删掉狗，狗叫声、脚步声、阴影、遮挡、反射、环境混响是否也要删？如果只是给狗换颜色，声音是否不应改变？
+  \item \textbf{Reference-conditioned generation：}如果插入一个 reference character 或 reference sound，如何同时保持视觉身份、声学身份、动作事件同步和空间位置一致？
+  \item \textbf{Preservation and evaluation：}如何衡量目标编辑成功、非目标内容保留、音视频同步、空间音频一致和声学自然度？
+\end{enumerate}
+
+\section{相关工作地图}
+
+\subsection{直接相关工作}
+
+\begin{longtable}{p{0.22\linewidth}p{0.32\linewidth}p{0.36\linewidth}}
+\toprule
+\textbf{工作} & \textbf{解决了什么} & \textbf{对本 idea 的启发} \\
+\midrule
+Object-AVEdit~\cite{objectavedit2026} & object-level audio-visual addition / replacement / removal；使用 inversion-regeneration paradigm，并训练 word-to-sounding-object aligned audio generation model。 & 最直接 baseline。我们的差异点应放在：显式 source-layer 表示、双向因果传播、参考声学身份、空间音频与原场景保留。 \\
+\midrule
+JavisDiT~\cite{javisdit2026} & joint audio-video diffusion transformer；从文本同时生成视频和声音，提出 hierarchical spatio-temporal synchronized prior。 & 可作为音视频同步生成 backbone 或 teacher；但它偏生成而非局部编辑。 \\
+\midrule
+JUST-DUB-IT~\cite{justdubit2026} & 用 joint audio-visual diffusion + LoRA 做视频配音，同时生成翻译音频和同步脸部运动。 & 证明“修改音频触发视觉运动变化”是可行的；但它聚焦 speech/lip dubbing，不覆盖一般对象声源。 \\
+\midrule
+EffectErase~\cite{effecterase2026} & 视频对象移除与插入互逆学习；强调 object effect erasing，如阴影、反射、形变。 & 是视觉侧 removal/insertion 强 baseline；可以接音频分离/补全模块变成 AV baseline。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{关键基础能力}
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+\textbf{能力} & \textbf{代表工作/工具} & \textbf{在本项目中的角色} \\
+\midrule
+视觉对象定位与交互 mask & Grounding DINO~\cite{groundingdino2023}、SAM~\cite{sam2023}、SAM 2~\cite{sam22024} & 文本/点击/框选对象；SAM 2 负责视频 mask propagation。 \\
+\midrule
+发声对象像素定位 & Audio-Visual Segmentation / AVSBench~\cite{avs2022} & 从音频引导视觉 segmentation，回答“当前声音来自哪个可见对象”。 \\
+\midrule
+视觉引导音频分离 & The Sound of Pixels / PixelPlayer~\cite{soundofpixels2018}、Looking to Listen~\cite{lookingtolistenn2018} & 把 mask/face/object visual embedding 用作目标声源分离条件。 \\
+\midrule
+文本查询音频分离 & AudioSep~\cite{audiosep2023} & 第一版最实用的 target sound separation baseline：输入 ``dog barking''、``violin'' 等文本 prompt。 \\
+\midrule
+通用音频 stem 分离 & Demucs~\cite{demucs2019} & 可作为工程 baseline，尤其是音乐/人声/鼓点等 stem 结构明确的场景。 \\
+\midrule
+对象视觉移除/插入 & EffectErase~\cite{effecterase2026}、video inpainting / video diffusion editing & 负责 $V \rightarrow \hat V$，尤其处理遮挡、阴影、反射、背景修复。 \\
+\midrule
+音频补全/生成 & JavisDiT~\cite{javisdit2026}、Qwen-TTS / Foley / audio diffusion models & 负责 $A \rightarrow \hat A$，生成新增对象声音、填补删除后的环境声、维持时空同步。 \\
+\bottomrule
+\end{longtable}
+
+\section{任务定义：从“编辑对象”升级为“编辑因果 AV source layer”}
+
+\subsection{输入输出}
+
+给定：
+\[
+\begin{aligned}
+&(V, A, I, U),\\
+&U \in \{\text{mask}, \text{click}, \text{bbox}, \text{audio span},\\
+&\qquad \text{text prompt}, \text{reference image}, \text{reference sound}\}.
+\end{aligned}
+\]
+输出：
+\[
+(\hat V, \hat A, \hat G, \hat R),
+\]
+其中 $\hat G$ 是目标 source 的 grounding 结果，例如 mask track、audio stem、事件边界；$\hat R$ 是可解释的 edit propagation report，例如“删除狗：删除狗 mask、狗叫 stem、狗脚步声、狗阴影，保留背景鸟叫和人声”。
+
+\subsection{编辑类型}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Visual-to-audio removal：}用户圈出一只正在叫的狗，系统移除狗的视频对象，同时删除对应 barking/footstep stem，并保留背景环境声。
+  \item \textbf{Audio-to-visual removal：}用户选择一段刺耳的鸣笛声，系统定位产生该声音的车辆；如果车辆是目标事件的一部分，则可选择移除/静音该声源，并在视频中保留车辆或删除车辆，取决于指令。
+  \item \textbf{Insertion：}用户插入一只 reference dog；系统生成视觉上身份一致的狗、合理动作、对应叫声/脚步声，并把声源位置放在画面中狗的位置附近。
+  \item \textbf{Replacement：}用户把画面中的 violin 换成 guitar；系统不仅改物体外观，还要把 violin sound 替换为 guitar sound，并让拨弦/扫弦事件与手部动作对齐。
+  \item \textbf{Attribute edit：}用户只改颜色/衣服/位置。如果该属性不改变发声机制，音频应保持；如果改动作速度，音频事件节奏应同步变化。
+\end{enumerate}
+
+\subsection{因果传播规则}
+
+可以把编辑分成三类传播强度：
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+\textbf{传播类型} & \textbf{触发条件} & \textbf{系统动作} \\
+\midrule
+No propagation & 只改变不影响发声机制的视觉属性，例如衣服颜色、背景风格。 & 只改 $V$，尽量保持 $A$ 不变。 \\
+\midrule
+Weak propagation & 改变位置、尺度、朝向、速度，但对象和声学身份不变。 & 更新 spatial audio、音量/混响/节奏；保留声学身份。 \\
+\midrule
+Strong propagation & 插入/删除/替换发声对象或事件。 & 同步更新对象 mask、声音 stem、事件时间线、视觉/音频副作用。 \\
+\bottomrule
+\end{longtable}
+
+这个 propagation classifier 可以先做成 rule-based + LLM parser，后续再训练成一个 edit planner。
+
+\section{推荐系统设计}
+
+\subsection{模块化 pipeline baseline}
+
+第一阶段不要直接训练 end-to-end 大模型，而应该先搭一个可跑通的 modular baseline。建议结构如下：
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.9cm and 1.0cm,
+  box/.style={draw=primary, rounded corners, align=center, inner sep=6pt, fill=blockbg, text width=3.0cm},
+  smallbox/.style={draw=codeborder, rounded corners, align=center, inner sep=5pt, fill=white, text width=2.5cm},
+  arrow/.style={-{Latex[length=2mm]}, thick, color=primary}
+]
+
+\node[box] (input) {Input\\$V,A,I,U$};
+\node[box, right=of input] (ground) {Source Grounding\\mask / track\\stem / event};
+\node[box, right=of ground] (planner) {Causal Edit Planner\\propagation decision};
+\node[smallbox, below left=of planner] (vedit) {Video Editor\\inpaint / insert\\replace};
+\node[smallbox, below right=of planner] (aedit) {Audio Editor\\separate / remove\\generate};
+\node[box, below=2.0cm of planner] (sync) {AV Consistency Refiner\\sync + preservation};
+\node[box, right=of sync] (output) {Output\\$\hat V,\hat A,\hat G,\hat R$};
+
+\draw[arrow] (input) -- (ground);
+\draw[arrow] (ground) -- (planner);
+\draw[arrow] (planner) -- (vedit);
+\draw[arrow] (planner) -- (aedit);
+\draw[arrow] (vedit) -- (sync);
+\draw[arrow] (aedit) -- (sync);
+\draw[arrow] (sync) -- (output);
+\draw[arrow, dashed] (sync) to[bend left=20] (planner);
+
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{Module A: Source Grounding}
+
+这是最关键的模块，因为老师材料里提到“怎么标出 video object 和语音是关键”。建议分三种入口：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{视觉入口：}用户 click/mask/bbox/text。用 Grounding DINO 找对象框，用 SAM 2 传播 mask track，得到 $M_i(t)$。
+  \item \textbf{音频入口：}用户选择 audio span 或输入 sound prompt。用 AudioSep 分离 target stem $a_i(t)$，再用 AVS/PixelPlayer 类模型把声音映射到画面区域。
+  \item \textbf{双向校验：}计算 visual event timeline 与 audio onset timeline 的一致性。如果对象运动峰值、嘴型/碰撞/敲击事件和声音 onset 对不上，说明 grounding 可能错了。
+\end{enumerate}
+
+第一版可以实现如下简化：
+
+\begin{enumerate}[leftmargin=2em]
+  \item 对视频每秒采样关键帧，用 Grounding DINO + SAM 2 得到 mask track。
+  \item 对音频跑 AudioSep 或 Demucs，得到 candidate stems。
+  \item 提取视觉 motion energy：
+  \[
+  m_i(t)=\sum_{(x,y)\in M_i(t)} \|V_t(x,y)-V_{t-1}(x,y)\|.
+  \]
+  \item 提取音频 onset energy：
+  \[
+  o_j(t)=\text{OnsetDetect}(a_j(t)).
+  \]
+  \item 用 cross-correlation 或 contrastive score 匹配 $M_i$ 与 $a_j$：
+  \[
+  \operatorname{score}(i,j)=\max_{\tau \in [-\Delta,\Delta]} \operatorname{corr}(m_i(t), o_j(t+\tau)).
+  \]
+\end{enumerate}
+
+这个简单 baseline 不一定 SOTA，但非常适合快速做 demo，并能把“对象和声音绑定”这个核心问题显式化。
+
+\subsection{Module B: Causal Edit Planner}
+
+Planner 的输入是 instruction + source grounding，输出是 edit graph：
+\[
+\mathcal{P}=\{\Delta V_{target}, \Delta A_{target}, \Delta V_{side}, \Delta A_{side}, \text{preserve constraints}\}.
+\]
+
+建议先做成规则系统：
+
+\begin{longtable}{p{0.20\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\toprule
+\textbf{指令} & \textbf{视觉动作} & \textbf{音频动作} \\
+\midrule
+remove dog & 删除狗 + 修复背景 + 删除阴影/遮挡 & 删除 dog barking/footsteps；补环境底噪。 \\
+\midrule
+mute dog barking & 保留狗视觉；不改动作 & 删除 barking stem；保留其他声音。 \\
+\midrule
+replace violin with guitar & 替换物体和动作细节 & 替换为 guitar stem；onset 对齐手部动作。 \\
+\midrule
+add speaking person & 插入人物 + lip/motion & TTS/voice cloning 生成 speech；同步嘴型和空间位置。 \\
+\midrule
+move car to left & 改轨迹/位置 & 调整声像、音量和多普勒/混响，不改变 engine identity。 \\
+\bottomrule
+\end{longtable}
+
+后续可以训练一个 VLM/LLM planner，用人工合成的 instruction--edit graph 数据做监督。
+
+\subsection{Module C: Video Editor}
+
+视频侧建议分三档：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Removal baseline：}EffectErase 或 video inpainting，输入 target mask track，输出 background-restored video。
+  \item \textbf{Insertion baseline：}reference-conditioned video diffusion / subject-driven video generation。3DreamBooth~\cite{threedreambooth2026} 可作为视觉身份一致性的相关思路，但它偏 3D-aware subject-driven generation，不直接解决声音。
+  \item \textbf{Replacement baseline：}先 remove，再 inpaint/insert 新对象；或者使用 inversion-based video editing 保留原结构。
+\end{enumerate}
+
+视觉 editor 必须输出 side-effect mask，例如被删除对象造成的阴影、反射、遮挡区域。EffectErase 的 VOR dataset 和 reciprocal insertion-removal consistency 对这点很有启发~\cite{effecterase2026}。
+
+\subsection{Module D: Audio Editor}
+
+音频侧建议分为四个操作：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Separate：}用 AudioSep 根据文本 prompt 分离 target stem；如果是 speech，可结合 face-guided separation，例如 Looking to Listen。
+  \item \textbf{Remove：}不要直接 waveform subtraction。建议用 target stem 估计 mask 后在 spectrogram 上做 soft subtraction，再用 audio inpainting/denoising 补回环境纹理。
+  \item \textbf{Generate：}插入对象时，用 Foley/audio diffusion/TTS 生成新声音。老师提到 Qwen-TTS 跑起来不错，因此 speech 类 demo 可优先用 Qwen-TTS 做语音生成，再接 lip-sync/face editing。
+  \item \textbf{Spatialize：}根据对象 screen position 和 camera motion 估计声像、距离、混响。第一版可以用简单 stereo panning：
+  \[
+  g_L(t)=\sqrt{\frac{1-x(t)}{2}},\quad g_R(t)=\sqrt{\frac{1+x(t)}{2}},
+  \]
+  其中 $x(t)\in[-1,1]$ 是对象在画面中的水平位置。
+\end{enumerate}
+
+\subsection{Module E: AV Consistency Refiner}
+
+Refiner 的目标是让最终 $\hat V$ 和 $\hat A$ 在四个层面一致：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Semantic consistency：}画面里有狗叫，音频里也应有 dog barking；没有狗时不应残留明显狗叫。
+  \item \textbf{Temporal consistency：}嘴型、敲击、碰撞、脚步、乐器演奏等 visible event 与 audio onset 对齐。
+  \item \textbf{Spatial consistency：}声音声像/响度/混响与对象位置、距离、环境相符。
+  \item \textbf{Preservation consistency：}非目标对象、背景纹理、其他说话人/乐器/环境声尽量不变。
+\end{enumerate}
+
+第一版 refiner 可以不训练大模型，而是做检测与反馈：如果同步评分低，则重新调整 audio onset；如果非目标区域 LPIPS/SSIM 变化大，则降低 video edit strength；如果非目标 stem 变化大，则回滚音频 mask。
+
+\section{数据路线}
+
+\subsection{最小可行数据集}
+
+为了先做出 demo，不建议一开始就收大规模真实标注。可以构造一个三层数据集：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Synthetic compositing set：}从透明背景对象视频、Foley 声音库、环境底噪中合成。优点是天然知道 source mask、stem、事件时间线和干净背景。
+  \item \textbf{Paired removal set：}借鉴 EffectErase 的 VOR 思路，构造 object-present / object-absent video pair；再加入 present / absent audio pair。
+  \item \textbf{Real-world weakly labeled set：}从 AudioSet/VGGSound/AVSBench 类型数据中抽取带声源类别的视频，只做弱标签和少量人工标注。
+\end{enumerate}
+
+\subsection{建议优先场景}
+
+\begin{longtable}{p{0.16\linewidth}p{0.21\linewidth}p{0.23\linewidth}p{0.25\linewidth}}
+\toprule
+\textbf{场景} & \textbf{优点} & \textbf{难点} & \textbf{适合 demo} \\
+\midrule
+狗叫/动物叫声 & 直观，声音类别清晰，适合老师提到的例子。 & 同画面多只狗时 source association 难。 & 删除某只狗及其叫声；只静音某只狗。 \\
+\midrule
+说话人 & 工具成熟：face detection、TTS、lip-sync、speaker separation。 & 身份、口型和语音内容评估严格。 & 换台词、删除某人语音、配音。 \\
+\midrule
+乐器演奏 & motion--onset 对齐明显；PixelPlayer/Sound of Pixels 有基础。 & 多乐器混音分离难，视觉动作复杂。 & violin to guitar replacement。 \\
+\midrule
+车辆/鸣笛/引擎 & 空间音频直观，移动轨迹明显。 & 车辆声音和背景交通声高度混合。 & 移动车辆后声音声像跟随。 \\
+\bottomrule
+\end{longtable}
+
+我建议第一个 demo 选\key{狗叫 removal / mute}，第二个 demo 选\key{说话人 dubbing}，第三个 demo 选\key{乐器 replacement}。这样能覆盖非语音、语音、音乐三类主流声源。
+
+\section{实验设计与评价指标}
+
+\subsection{Baseline 组合}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Video-only baseline：}EffectErase / video inpainting，只改视频不改音频。
+  \item \textbf{Audio-only baseline：}AudioSep / Demucs，只改音频不改视频。
+  \item \textbf{Naive pipeline：}video edit + audio separation/subtraction，二者无反馈。
+  \item \textbf{Object-AVEdit baseline：}直接对比 object-level AV editing。
+  \item \textbf{Ours modular：}source grounding + causal planner + video editor + audio editor + AV refiner。
+  \item \textbf{Ours learned：}在 modular pipeline 产生的 pseudo labels 上训练端到端或半端到端模型。
+\end{enumerate}
+
+\subsection{指标}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+\textbf{维度} & \textbf{可用指标} & \textbf{意义} \\
+\midrule
+目标视觉编辑 & mask-region LPIPS/FID/FVD、CLIP text-image alignment、human preference & 目标对象是否正确删除、插入或替换。 \\
+\midrule
+非目标视觉保留 & outside-mask PSNR/SSIM/LPIPS、tracking consistency & 不相关区域是否被破坏。 \\
+\midrule
+目标音频编辑 & SDR/SI-SDR、CLAP alignment、AudioLDM/AudioSet classifier score & 目标声音是否删除/生成/替换成功。 \\
+\midrule
+非目标音频保留 & background SDR、speaker similarity、stem leakage score & 其他声源是否被误伤。 \\
+\midrule
+时间同步 & onset--motion correlation、SyncNet/AV sync score、event boundary error & 声音事件是否与画面动作同步。 \\
+\midrule
+空间一致性 & audio panning error、visual position--stereo correlation、human spatial preference & 声音位置是否跟随可见对象。 \\
+\midrule
+整体质量 & MOS、pairwise human preference、artifact rating & 人类是否认为自然可信。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{关键 ablation}
+
+\begin{enumerate}[leftmargin=2em]
+  \item 去掉 source grounding，只用文本 prompt 做音频编辑。
+  \item 去掉 causal planner，所有视觉编辑都强制改音频。
+  \item 去掉 AV refiner，观察 motion--onset 同步下降。
+  \item 用 AudioSep vs 视觉引导分离 vs 二者融合。
+  \item 用硬 subtraction vs spectrogram soft mask vs audio inpainting。
+\end{enumerate}
+
+\section{Roadmap}
+
+\subsection{阶段 0：两周内复现和搭 baseline}
+
+\begin{summarybox}
+\textbf{目标：}跑通一个最小系统：用户点击/框选视频里的目标对象，系统删除该对象并删除对应声音，输出一个可展示的 demo。
+\end{summarybox}
+
+\begin{enumerate}[leftmargin=2em]
+  \item 整理 20--50 个短视频样例，优先选择单声源或双声源，时长 3--8 秒。
+  \item 接入 SAM 2 做对象 mask track；如果是文本对象，则用 Grounding DINO + SAM 2。
+  \item 接入 AudioSep，用文本 prompt 分离目标声音，例如 ``dog barking''。
+  \item 视频侧先用现成 video inpainting / EffectErase 类模型；音频侧先做 soft mask removal。
+  \item 写一个简单 UI 或脚本：输入视频、点击对象、输入 sound prompt，输出 $\hat V,\hat A$。
+\end{enumerate}
+
+\textbf{交付物：}一个 dog barking removal demo；一页 failure cases；一个 baseline 指标表。
+
+\subsection{阶段 1：1--2 个月内做出可投稿 workshop 的方法雏形}
+
+\begin{enumerate}[leftmargin=2em]
+  \item 实现 visual-to-audio 和 audio-to-visual 双向 grounding：
+  \begin{itemize}
+    \item visual click/mask $\rightarrow$ target stem；
+    \item audio span/prompt $\rightarrow$ sounding object mask。
+  \end{itemize}
+  \item 引入 motion onset 和 audio onset 的 source association score，显式解决“哪只狗在叫”。
+  \item 做 causal edit planner，至少覆盖 remove、mute、replace、insert 四类操作。
+  \item 收集/合成 500--2000 个 paired examples，包含 object mask、stem、event timestamp。
+  \item 与 video-only、audio-only、naive pipeline、Object-AVEdit 做系统对比。
+\end{enumerate}
+
+\textbf{交付物：}完整 modular pipeline；初版 benchmark；ablation；demo page。
+
+\subsection{阶段 2：3--6 个月内形成主论文贡献}
+
+\begin{enumerate}[leftmargin=2em]
+  \item 训练一个\key{Causal AV Source Adapter}：把视觉 mask track、audio stem、event timeline 编码成统一 source token。
+  \item 在 joint diffusion/video diffusion/audio diffusion backbone 上加 source-conditioned editing branch。
+  \item 设计 preservation loss：outside-mask visual preservation、non-target stem preservation、source identity preservation。
+  \item 设计 AV causal consistency loss：
+  \[
+  \mathcal{L}_{av}=\mathcal{L}_{sem}+\lambda_t\mathcal{L}_{time}+\lambda_s\mathcal{L}_{spatial}+\lambda_p\mathcal{L}_{preserve}.
+  \]
+  \item 构造更难的多源场景：两只狗、一人说话一人弹琴、车流鸣笛、多人对话。
+\end{enumerate}
+
+\textbf{交付物：}方法论文核心；强对比；用户研究；真实复杂场景 demo。
+
+\subsection{阶段 3：6--12 个月内冲击顶会主线}
+
+\begin{enumerate}[leftmargin=2em]
+  \item 构建公开 benchmark：\textit{Causal-AVEdit-Bench}，覆盖 insertion、removal、replacement、mute 和 spatial move。
+  \item 发布 source-layer annotation schema：mask track、audio stem、event boundary、source id、side-effect region。
+  \item 训练统一模型，支持 reference image + reference sound + instruction 的 multi-condition editing。
+  \item 引入人类偏好优化或 reward model，优化真实感、同步性和保真度。
+  \item 将 demo 扩展到交互式编辑器：点击对象、试听 stem、选择传播范围、预览编辑报告。
+\end{enumerate}
+
+\textbf{交付物：}
+\begin{itemize}[leftmargin=2em]
+  \item benchmark、model、project page 与 interactive demo；
+  \item 目标投稿：CVPR、ICCV、ECCV、NeurIPS 或 ICLR 的多模态生成方向。
+\end{itemize}
+
+\section{我建议的论文卖点}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{新任务定义：}Bidirectional Causal Audio-Visual Source Editing，把对象编辑和声音编辑统一到 source layer 上。
+  \item \textbf{新表示：}Causal AV source layer，包含 visible object、sound stem、motion-event timeline、spatial audio 和 visual/audio side effects。
+  \item \textbf{新 pipeline：}source grounding $\rightarrow$ causal planner $\rightarrow$ modality-specific editors $\rightarrow$ AV consistency refiner。
+  \item \textbf{新 benchmark：}多源真实视频上的 insertion/removal/replacement/mute/spatial move，评价目标编辑、非目标保留、时间同步和空间一致性。
+  \item \textbf{强 demo：}删掉一只狗及其叫声、只静音某只狗、给无声 object removal 视频补合理声音、替换乐器并同步声音。
+\end{enumerate}
+
+\section{风险与应对}
+
+\begin{longtable}{p{0.25\linewidth}p{0.35\linewidth}p{0.30\linewidth}}
+\toprule
+\textbf{风险} & \textbf{表现} & \textbf{应对} \\
+\midrule
+目标 stem 分离不干净 & 删除狗叫后有残留或背景被误删。 & 使用 AudioSep + visual-guided separation 融合；引入 audio inpainting 补背景。 \\
+\midrule
+多只同类对象 association 错误 & 用户选左边狗，系统删了右边狗的声音。 & motion--onset correlation + AVS segmentation + 人工点击确认。 \\
+\midrule
+视频编辑 artifact 明显 & 背景修复闪烁、阴影没删干净。 & 使用 EffectErase 类 effect-aware removal；加入 temporal consistency filter。 \\
+\midrule
+生成声音不贴合动作 & 狗嘴没张却有叫声，敲击声音延迟。 & event timeline 显式控制音频 onset；后处理 time-stretch/shift。 \\
+\midrule
+与 Object-AVEdit 区分不够 & 审稿人认为只是 pipeline 组合。 & 强调 bidirectional grounding、causal propagation、source-layer annotation、preservation metrics 和多源复杂场景。 \\
+\bottomrule
+\end{longtable}
+
+\section{下一步具体执行清单}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{先复现 baseline：}Object-AVEdit、EffectErase、AudioSep、SAM 2，确认哪些模型能本地跑。
+  \item \textbf{做第一个 demo：}狗叫视频中选中一只狗，删除视觉对象并删除对应 barking stem。
+  \item \textbf{补第二个 demo：}老师提到的 EffectErase 无声结果，尝试用 JavisDiT/Foley/audio diffusion 或更轻量的 sound generation 给删除/插入事件配声音。
+  \item \textbf{实现 source association：}mask motion energy 与 audio onset energy 匹配，先不用训练。
+  \item \textbf{构造小 benchmark：}每类 30--50 个样例，覆盖 dog/person/instrument/car。
+  \item \textbf{写 proposal：}用“Object-AVEdit 的下一步：从 object-level AV editing 到 causal AV source-layer editing”作为叙事。
+\end{enumerate}
+
+\section{资料来源}
+
+\begin{thebibliography}{99}
+
+\bibitem{objectavedit2026}
+Youquan Fu, Ruiyang Si, Hongfa Wang, Dongzhan Zhou, Jiacheng Sun, Ping Luo, Di Hu, Hongyuan Zhang, and Xuelong Li.
+\textit{Object-AVEdit: An Object-level Audio-Visual Editing Model}.
+OpenReview, ICLR 2026 submission.
+\url{https://openreview.net/forum?id=NCmgCSJTLm}
+
+\bibitem{javisdit2026}
+Kai Liu, Wei Li, Lai Chen, Shengqiong Wu, Yanhao Zheng, Jiayi Ji, Fan Zhou, Rongxin Jiang, Jiebo Luo, Ziwei Liu, Hao Fei, and Tat-Seng Chua.
+\textit{JavisDiT: Joint Audio-Video Diffusion Transformer with Hierarchical Spatio-Temporal Prior Synchronization}.
+Project page, accepted by ICLR 2026.
+\url{https://javisverse.github.io/JavisDiT-page/}
+
+\bibitem{effecterase2026}
+Yang Fu, Yike Zheng, Ziyun Dai, and Henghui Ding.
+\textit{EffectErase: Joint Video Object Removal and Insertion for High-Quality Effect Erasing}.
+arXiv:2603.19224, 2026.
+\url{https://arxiv.org/abs/2603.19224}
+
+\bibitem{justdubit2026}
+Anthony Chen, Naomi Ken Korem, Gal Zeevi, Tavi Halperin, Matan Ben Yosef, Urska Jelercic, Ofir Bibi, Or Patashnik, and Daniel Cohen-Or.
+\textit{JUST-DUB-IT: Video Dubbing via Joint Audio-Visual Diffusion}.
+arXiv:2601.22143, 2026.
+\url{https://arxiv.org/abs/2601.22143}
+
+\bibitem{threedreambooth2026}
+Hyun-kyu Ko, Jihyeon Park, Younghyun Kim, Dongheok Park, and Eunbyung Park.
+\textit{3DreamBooth: High-Fidelity 3D Subject-Driven Video Generation Model}.
+arXiv:2603.18524, 2026.
+\url{https://arxiv.org/abs/2603.18524}
+
+\bibitem{soundofpixels2018}
+Hang Zhao, Chuang Gan, Andrew Rouditchenko, Carl Vondrick, Josh McDermott, and Antonio Torralba.
+\textit{The Sound of Pixels}.
+arXiv:1804.03160, 2018.
+\url{https://arxiv.org/abs/1804.03160}
+
+\bibitem{lookingtolistenn2018}
+Ariel Ephrat, Inbar Mosseri, Oran Lang, Tali Dekel, Kevin Wilson, Avinatan Hassidim, William T. Freeman, and Michael Rubinstein.
+\textit{Looking to Listen at the Cocktail Party: A Speaker-Independent Audio-Visual Model for Speech Separation}.
+arXiv:1804.03619, 2018.
+\url{https://arxiv.org/abs/1804.03619}
+
+\bibitem{avs2022}
+Jinxing Zhou, Dan Guo, and Meng Wang.
+\textit{Audio-Visual Segmentation}.
+arXiv:2207.05042, 2022.
+\url{https://arxiv.org/abs/2207.05042}
+
+\bibitem{audiosep2023}
+Xuenan Xu, Zeyu Xie, Mengyue Wu, and Kai Yu.
+\textit{Separate Anything You Describe}.
+arXiv:2308.05037, 2023.
+\url{https://arxiv.org/abs/2308.05037}
+
+\bibitem{demucs2019}
+Alexandre Defossez, Nicolas Usunier, Léon Bottou, and Francis Bach.
+\textit{Music Source Separation in the Waveform Domain}.
+arXiv:1911.13254, 2019.
+\url{https://arxiv.org/abs/1911.13254}
+
+\bibitem{groundingdino2023}
+Shilong Liu, Zhaoyang Zeng, Tianhe Ren, Feng Li, Hao Zhang, Jie Yang, Chunyuan Li, Jianwei Yang, Hang Su, Jun Zhu, and Lei Zhang.
+\textit{Grounding DINO: Marrying DINO with Grounded Pre-Training for Open-Set Object Detection}.
+arXiv:2303.05499, 2023.
+\url{https://arxiv.org/abs/2303.05499}
+
+\bibitem{sam2023}
+Alexander Kirillov et al.
+\textit{Segment Anything}.
+arXiv:2304.02643, 2023.
+\url{https://arxiv.org/abs/2304.02643}
+
+\bibitem{sam22024}
+Nikhila Ravi et al.
+\textit{SAM 2: Segment Anything in Images and Videos}.
+arXiv:2408.00714, 2024.
+\url{https://arxiv.org/abs/2408.00714}
+
+\end{thebibliography}
